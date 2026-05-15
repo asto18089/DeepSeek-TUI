@@ -14,6 +14,7 @@ use serde_json::Value;
 use crate::client::DeepSeekClient;
 use crate::models::Tool;
 
+use super::pinvou3_blocklist;
 use super::schema_sanitize;
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
@@ -228,7 +229,10 @@ impl ToolRegistry {
                     description: tool.description().to_string(),
                     input_schema: schema,
                     allowed_callers: Some(vec!["direct".to_string()]),
-                    defer_loading: Some(tool.defer_loading()),
+                    defer_loading: Some(
+                        tool.defer_loading()
+                            || pinvou3_blocklist::is_pinvou3_hidden(tool.name()),
+                    ),
                     input_examples: None,
                     strict: None,
                     cache_control: None,
