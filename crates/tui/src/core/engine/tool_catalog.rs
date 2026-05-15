@@ -30,6 +30,13 @@ pub(super) fn is_tool_search_tool(name: &str) -> bool {
 }
 
 pub(super) fn should_default_defer_tool(name: &str, mode: AppMode) -> bool {
+    // pinvou3 L1.5: blocklist 优先于所有 mode-specific 逻辑，
+    // 让 Yolo 模式也能隐藏非核心工具（GUI 单 session 场景不需要 task/agent/
+    // rlm/pr/git/fim/patch 类）。详见 pinvou3/docs/工具表精简方案.md
+    if crate::tools::pinvou3_blocklist::is_pinvou3_hidden(name) {
+        return true;
+    }
+
     if mode == AppMode::Yolo {
         return false;
     }
@@ -82,9 +89,24 @@ pub(super) fn should_default_defer_tool(name: &str, mode: AppMode) -> bool {
 }
 
 pub(super) fn apply_native_tool_deferral(catalog: &mut [Tool], mode: AppMode) {
-    for tool in catalog {
+    for tool in &mut *catalog {
         tool.defer_loading = Some(should_default_defer_tool(&tool.name, mode));
     }
+    let active: Vec<&str> = catalog
+        .iter()
+        .filter(|t| !t.defer_loading.unwrap_or(false))
+        .map(|t| t.name.as_str())
+        .collect();
+    let deferred = catalog.len() - active.len();
+    tracing::info!(
+        target: "pinvou3.tool_catalog",
+        mode = ?mode,
+        active_count = active.len(),
+        deferred_count = deferred,
+        total = catalog.len(),
+        active = ?active,
+        "native tool catalog deferral applied"
+    );
 }
 
 fn should_keep_mcp_tool_loaded(name: &str) -> bool {

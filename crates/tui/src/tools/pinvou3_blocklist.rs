@@ -57,8 +57,29 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     "todo_add",
     "todo_update",
     "todo_list",
-    // Shell 后台管理（同步 exec_shell 卡住靠 GUI turn 中断按钮兜底）
+    // Shell 后台管理 + 异步交互变体（同步 exec_shell 已够）
     "exec_shell_cancel",
+    "exec_shell_wait",
+    "exec_shell_interact",
+    "exec_wait",
+    "exec_interact",
+    // Automation 持久化（pinvou3 单 session 不需要）
+    "automation_create",
+    "automation_delete",
+    "automation_list",
+    "automation_pause",
+    "automation_read",
+    "automation_resume",
+    "automation_run",
+    "automation_update",
+    // GitHub 集成（普通用户用不到，开发者用 exec_shell gh 替代）
+    "github_issue_context",
+    "github_pr_context",
+    "github_comment",
+    "github_close_issue",
+    // 杂项 - 金融数据 + 旧版 web_run（保留 fetch_url）
+    "finance",
+    "web.run",
     // 元工具（pinvou3 普通用户场景用不到）
     "multi_tool_use.parallel",
     "note",
