@@ -26,6 +26,7 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     "pr_attempt_preflight",
     // 状态管理 - subagent（留给后续 workflow 阶段，模型不应直接调）
     "agent_open",
+    "agent_spawn", // agent_open 的新版本（fork_context=true 路径）
     "agent_eval",
     "agent_result",
     "agent_cancel",
@@ -97,9 +98,22 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
 ];
 
 /// 工具名是否在 pinvou3 隐藏清单内。
+///
+/// **测试豁免**: `PINVOU3_BLOCKLIST_OVERRIDE` env var 列出的工具名(逗号分隔)
+/// 即便在 PINVOU3_HIDDEN_TOOLS 里也返回 false。供 L1 dialog harness 临时启用
+/// 特定工具评估能力(例:`PINVOU3_BLOCKLIST_OVERRIDE=agent_spawn,agent_eval`)。
+/// 生产场景不 set 这个 env,blocklist 行为不变。
 #[inline]
 pub fn is_pinvou3_hidden(name: &str) -> bool {
-    PINVOU3_HIDDEN_TOOLS.contains(&name)
+    if !PINVOU3_HIDDEN_TOOLS.contains(&name) {
+        return false;
+    }
+    if let Ok(override_list) = std::env::var("PINVOU3_BLOCKLIST_OVERRIDE") {
+        if override_list.split(',').any(|t| t.trim() == name) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -130,5 +144,33 @@ mod tests {
         assert!(is_pinvou3_hidden("todo_add"));
         assert!(!is_pinvou3_hidden("checklist_write"));
         assert!(!is_pinvou3_hidden("checklist_add"));
+    }
+
+    /// L1 harness 用 PINVOU3_BLOCKLIST_OVERRIDE 临时启用工具评估能力。
+    /// 生产场景不 set 这个 env,blocklist 行为不变。
+    #[test]
+    fn env_override_unhides_listed_tools() {
+        // SAFETY: 测试是 single-threaded(`cargo test` 单文件内串行),
+        // 且测试函数末尾 remove_var 复原。2024 edition std::env::set_var
+        // 标 unsafe 因多线程 race,本场景不 race。
+        unsafe {
+            // baseline: agent_spawn 在 blocklist 里
+            std::env::remove_var("PINVOU3_BLOCKLIST_OVERRIDE");
+            assert!(is_pinvou3_hidden("agent_spawn"));
+
+            // 设 env 解锁 agent_spawn + agent_eval
+            std::env::set_var("PINVOU3_BLOCKLIST_OVERRIDE", "agent_spawn, agent_eval");
+            assert!(!is_pinvou3_hidden("agent_spawn"), "agent_spawn 应被 env 豁免");
+            assert!(!is_pinvou3_hidden("agent_eval"), "agent_eval 应被 env 豁免");
+            // 未列出的工具仍隐藏
+            assert!(
+                is_pinvou3_hidden("task_create"),
+                "task_create 未列入 override,仍隐藏"
+            );
+            // 核心工具不受影响
+            assert!(!is_pinvou3_hidden("write_file"));
+
+            std::env::remove_var("PINVOU3_BLOCKLIST_OVERRIDE");
+        }
     }
 }
