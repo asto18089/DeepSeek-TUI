@@ -1,5 +1,8 @@
 //! DeepSeek-TUI library — pinvou-platform 复用的底层能力。
 
+#[cfg(test)]
+pub mod test_support;
+
 pub mod artifacts;
 pub mod audit;
 pub mod auto_reasoning;
