@@ -1944,8 +1944,13 @@ impl Engine {
 }
 
 fn subagent_completion_runtime_message(payload: &str) -> Message {
+    // [pinvou3-fork] role 从 "system" → "user":
+    // Qwen3.6 chat_template (其他严格 jinja template 同) 硬性要求 system message
+    // 必须 messages[0],追加到中间会 raise "System message must be at the beginning"
+    // → vLLM 返回 400 BadRequest → subagent 链路在 parent 转述阶段全部失败。
+    // visibility="internal" 标签已让 LLM 识别为内部 runtime 事件,role 改 user 不丢语义。
     Message {
-        role: "system".to_string(),
+        role: "user".to_string(),
         content: vec![ContentBlock::Text {
             text: format!(
                 "<deepseek:runtime_event kind=\"subagent_completion\" visibility=\"internal\">\n\
