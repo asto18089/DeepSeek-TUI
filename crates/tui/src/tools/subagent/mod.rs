@@ -62,7 +62,12 @@ fn release_resident_leases_for(agent_id: &str) {
     }
 }
 
-const DEFAULT_MAX_STEPS: u32 = 100;
+// [pinvou3-fork] C+: 100→20。参考 CrewAI Agent(max_iter=15) / OpenHands max_iterations=30 折中。
+// 100 步太宽,弱模型可能死磕 17+ 分钟。20 步足够 single-task subagent,且 cargo test 内可结束。
+const DEFAULT_MAX_STEPS: u32 = 20;
+// [pinvou3-fork] C: 单 subagent 内部 elapsed 硬上限 300s (5min)。参考 CrewAI Task(max_execution_time=300)。
+// 防 subagent 内部死磕反复重试任何场景 (web_search 失败 / LLM verbose / tool 卡死)。
+const DEFAULT_SUBAGENT_ELAPSED_MAX: Duration = Duration::from_secs(300);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Per-step LLM API call timeout. Each `create_message` request must complete
 /// within this window or the step is treated as timed out. Prevents a single
@@ -3347,6 +3352,34 @@ async fn run_subagent(
     let mut pending_inputs: VecDeque<SubAgentInput> = VecDeque::new();
 
     for _step in 0..max_steps {
+        // [pinvou3-fork] C: elapsed hard cap. 防 subagent 内部死磕重试拖垮整个任务。
+        // started_at 是 spawn 时的 Instant,5 分钟内必须完结 (或返回 partial result)。
+        if started_at.elapsed() > DEFAULT_SUBAGENT_ELAPSED_MAX {
+            emit_agent_progress(
+                runtime.event_tx.as_ref(),
+                runtime.mailbox.as_ref(),
+                &agent_id,
+                format!(
+                    "step {steps}/{max_steps}: elapsed cap {}s exceeded, aborting",
+                    DEFAULT_SUBAGENT_ELAPSED_MAX.as_secs()
+                ),
+            );
+            // 走跟 cancel 一样的退出路径,不构造完整 SubAgentResult (字段太多)
+            if let Some(mb) = runtime.mailbox.as_ref() {
+                let _ = mb.send(MailboxMessage::Failed {
+                    agent_id: agent_id.clone(),
+                    error: format!(
+                        "subagent elapsed cap {}s exceeded after {steps} steps",
+                        DEFAULT_SUBAGENT_ELAPSED_MAX.as_secs()
+                    ),
+                });
+            }
+            anyhow::bail!(
+                "subagent {} elapsed cap {}s exceeded after {steps} steps",
+                agent_id,
+                DEFAULT_SUBAGENT_ELAPSED_MAX.as_secs()
+            );
+        }
         // Cooperative cancellation: bail if the parent (or root) cancelled
         // us while we were between steps. Children derive their token from
         // the parent's via `child_token()` so this propagates the whole tree.
