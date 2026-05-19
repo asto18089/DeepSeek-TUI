@@ -4509,7 +4509,11 @@ const SUBAGENT_OUTPUT_FORMAT: &str = include_str!("../../prompts/subagent_output
 const GENERAL_AGENT_INTRO: &str = concat!(
     "You are a general-purpose sub-agent spawned to handle a specific task autonomously.\n",
     "Stay inside the assigned scope; put adjacent work under RISKS/BLOCKERS.\n",
-    "Plan multi-step work with `checklist_write`; add `update_plan` for complex strategy.\n\n"
+    "Plan multi-step work with `checklist_write`; add `update_plan` for complex strategy.\n",
+    // [pinvou3-fork] 加 stop-on-failure 条款,防止弱模型在外部 API 不可达 / 工具失败时
+    // 死磕反复重试(observed:Qwen3.6 子 agent 反复 retry web_search Bing 直到 5+ 分钟超时)。
+    "**Stop quickly on failure**: if the same tool call fails 2 times in a row, stop retrying and return what you have so far with a one-line note explaining what's missing. Do not loop on impossible queries (e.g. external API unreachable, rate-limited, or returning empty).\n",
+    "**Bounded effort**: prefer one focused attempt over many speculative retries. If you cannot complete the task with available data within 3-5 tool calls, return your current partial findings — the parent agent can compensate with its own knowledge.\n\n"
 );
 
 const EXPLORE_AGENT_INTRO: &str = concat!(
