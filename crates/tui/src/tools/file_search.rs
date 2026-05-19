@@ -2,11 +2,17 @@
 
 use std::cmp::Ordering;
 use std::path::Path;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use serde::Serialize;
 use serde_json::{Value, json};
+
+// [pinvou3-fork] file_search hard timeout 防 walker 在大目录 ($HOME 等) 跑数分钟。
+// 同步 walker 不响应 cancel_token,timeout 是 cancel button 唯一能 unblock turn loop
+// 的机制。30s 足够覆盖正常 workspace 搜索,大目录则直接返回 timeout error 让 LLM fallback。
+const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::tools::search::matches_glob;
 
@@ -87,7 +93,36 @@ impl ToolSpec for FileSearchTool {
 
         let extensions = parse_extensions(&input);
         let exclude_patterns = parse_exclude_patterns(&input);
-        let matches = search_files(query, &base_path, extensions, exclude_patterns, limit)?;
+
+        // [pinvou3-fork] spawn_blocking + timeout 让同步 walker 不阻塞 turn loop,
+        // cancel button 最多 30s 后能 unblock。query/base_path 必须 owned 才能 move 进 task。
+        let query_owned = query.to_string();
+        let base_path_owned = base_path.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            search_files(
+                &query_owned,
+                &base_path_owned,
+                extensions,
+                exclude_patterns,
+                limit,
+            )
+        });
+        let matches = match tokio::time::timeout(FILE_SEARCH_TIMEOUT, task).await {
+            Ok(Ok(Ok(matches))) => matches,
+            Ok(Ok(Err(e))) => return Err(e),
+            Ok(Err(join_err)) => {
+                return Err(ToolError::execution_failed(format!(
+                    "file_search task panicked: {join_err}"
+                )));
+            }
+            Err(_) => {
+                return Err(ToolError::execution_failed(format!(
+                    "file_search timed out after {}s (base_path={}). Try narrower 'path' or specific 'extensions'.",
+                    FILE_SEARCH_TIMEOUT.as_secs(),
+                    base_path.display()
+                )));
+            }
+        };
         ToolResult::json(&matches).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
 }
