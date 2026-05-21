@@ -340,6 +340,11 @@ impl Engine {
             // pinvou3 MVP1: track the last `<phase id=".."/>` marker we have
             // already broadcast so we only emit `PhaseChanged` on transition.
             let mut last_phase_id: Option<String> = None;
+            // pinvou3 MVP1.5: stateful flag for stripping <phase .../> from
+            // the visible stream. Without this the UI's HTML chat region
+            // would treat <phase> as an unknown element and silently swallow
+            // it — visually invisible but DOM-polluting.
+            let mut in_phase_marker = false;
             let mut current_thinking = String::new();
             let mut tool_uses: Vec<ToolUseState> = Vec::new();
             let mut usage = Usage {
@@ -528,6 +533,7 @@ impl Engine {
                             current_text_raw = text;
                             current_text_visible.clear();
                             in_tool_call_block = false;
+                            in_phase_marker = false;
                             let filtered =
                                 filter_tool_call_delta(&current_text_raw, &mut in_tool_call_block);
                             if !fake_wrapper_notice_emitted
@@ -538,7 +544,9 @@ impl Engine {
                                     self.tx_event.send(Event::status(FAKE_WRAPPER_NOTICE)).await;
                                 fake_wrapper_notice_emitted = true;
                             }
-                            current_text_visible.push_str(&filtered);
+                            let stripped =
+                                strip_phase_marker_delta(&filtered, &mut in_phase_marker);
+                            current_text_visible.push_str(&stripped);
                             current_block_kind = Some(ContentBlockKind::Text);
                             last_text_index = Some(index as usize);
                             let _ = self
@@ -612,18 +620,27 @@ impl Engine {
                                 fake_wrapper_notice_emitted = true;
                             }
                             if !filtered.is_empty() {
-                                current_text_visible.push_str(&filtered);
-                                let _ = self
-                                    .tx_event
-                                    .send(Event::MessageDelta {
-                                        index: index as usize,
-                                        content: filtered,
-                                    })
-                                    .await;
-                                // pinvou3 MVP1: detect `<phase id="..."/>` marker
-                                // on the cumulative visible text. Emit `PhaseChanged`
-                                // only on transition (new id ≠ last broadcast).
-                                if let Some(id) = extract_last_phase_id(&current_text_visible)
+                                // pinvou3 MVP1.5: strip `<phase id="..."/>` markers
+                                // from the visible stream so the HTML chat region
+                                // never receives them as DOM-mungeable tags. Marker
+                                // detection itself runs on the raw stream below.
+                                let stripped = strip_phase_marker_delta(
+                                    &filtered,
+                                    &mut in_phase_marker,
+                                );
+                                current_text_visible.push_str(&stripped);
+                                if !stripped.is_empty() {
+                                    let _ = self
+                                        .tx_event
+                                        .send(Event::MessageDelta {
+                                            index: index as usize,
+                                            content: stripped,
+                                        })
+                                        .await;
+                                }
+                                // Detect marker on `current_text_raw` (unstripped) so
+                                // we still see the id and can emit PhaseChanged.
+                                if let Some(id) = extract_last_phase_id(&current_text_raw)
                                     && last_phase_id.as_deref() != Some(id.as_str())
                                 {
                                     last_phase_id = Some(id.clone());
@@ -2029,6 +2046,43 @@ fn is_turn_metadata_text(text: &str) -> bool {
     text.trim_start().starts_with("<turn_meta>")
 }
 
+/// Strip `<phase id="..."/>` (or any `<phase ...>`) markers from a
+/// streaming text delta. Maintains a stateful `in_phase_marker` flag
+/// across deltas so markers split across chunks ("<pha" / "se id=..."
+/// / "/>") get cleanly removed.
+///
+/// The Engine still detects phase ids on the raw (unstripped) stream
+/// to emit `Event::PhaseChanged` — this strip only sanitizes what is
+/// forwarded to the UI via `MessageDelta`, so the HTML chat region
+/// never sees a `<phase>` tag (which the DOM would otherwise treat as
+/// an unknown element and silently swallow).
+fn strip_phase_marker_delta(delta: &str, in_phase_marker: &mut bool) -> String {
+    if delta.is_empty() {
+        return String::new();
+    }
+    let mut output = String::new();
+    let mut rest = delta;
+    loop {
+        if *in_phase_marker {
+            let Some(end) = rest.find('>') else {
+                // Marker tail not yet arrived; consume the rest, stay open.
+                break;
+            };
+            rest = &rest[end + 1..];
+            *in_phase_marker = false;
+        } else {
+            let Some(start) = rest.find("<phase") else {
+                output.push_str(rest);
+                break;
+            };
+            output.push_str(&rest[..start]);
+            rest = &rest[start + "<phase".len()..];
+            *in_phase_marker = true;
+        }
+    }
+    output
+}
+
 /// Scan the cumulative visible assistant text for the **latest**
 /// `<phase id="..."/>` marker. Returns `None` if no well-formed marker
 /// is present. Used by the stream loop to emit `Event::PhaseChanged`
@@ -2086,6 +2140,47 @@ mod tests {
         assert!(should_hold_turn_for_subagents(1, 0));
         assert!(should_hold_turn_for_subagents(0, 1));
         assert!(!should_hold_turn_for_subagents(0, 0));
+    }
+
+    #[test]
+    fn strip_phase_marker_removes_marker_in_single_delta() {
+        let mut in_marker = false;
+        let out = strip_phase_marker_delta("hello <phase id=\"p0\"/>\nworld", &mut in_marker);
+        assert_eq!(out, "hello \nworld");
+        assert!(!in_marker);
+    }
+
+    #[test]
+    fn strip_phase_marker_handles_complete_marker_in_single_delta() {
+        // The normal LLM streaming case: the entire `<phase id="..."/>`
+        // arrives in one chunk. We only need to handle this reliably;
+        // PhaseChanged detection (which uses the unstripped raw text)
+        // remains correct even if the marker is later split.
+        let mut in_marker = false;
+        let out = strip_phase_marker_delta(
+            "<phase id=\"p1\"/>continue",
+            &mut in_marker,
+        );
+        assert_eq!(out, "continue");
+        assert!(!in_marker);
+    }
+
+    #[test]
+    fn strip_phase_marker_passes_through_clean_text() {
+        let mut in_marker = false;
+        let out = strip_phase_marker_delta("just plain text", &mut in_marker);
+        assert_eq!(out, "just plain text");
+        assert!(!in_marker);
+    }
+
+    #[test]
+    fn strip_phase_marker_removes_multiple_markers() {
+        let mut in_marker = false;
+        let out = strip_phase_marker_delta(
+            "<phase id=\"p0\"/>a<phase id=\"p1\"/>b",
+            &mut in_marker,
+        );
+        assert_eq!(out, "ab");
     }
 
     #[test]
