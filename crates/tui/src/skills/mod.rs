@@ -66,6 +66,42 @@ pub struct Skill {
     /// or manually-placed skills, so callers must use this rather than
     /// reconstructing `<dir>/<name>/SKILL.md`.
     pub path: PathBuf,
+    /// Pipeline phase list parsed from the `phases:` frontmatter line.
+    /// Format: `p0:Intake|p1:Gather|p2:Research*|...` where `*` suffix
+    /// marks a phase that has an internal loop. Empty if absent.
+    pub phases: Vec<PhaseDef>,
+}
+
+/// One phase entry from the SKILL.md `phases:` frontmatter line.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PhaseDef {
+    pub id: String,
+    pub title: String,
+    #[serde(rename = "loop")]
+    pub is_loop: bool,
+}
+
+fn parse_phases_line(raw: &str) -> Vec<PhaseDef> {
+    raw.split('|')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (id_part, title_part) = entry.split_once(':')?;
+            let mut title = title_part.trim().to_string();
+            let is_loop = title.ends_with('*');
+            if is_loop {
+                title.pop();
+                title = title.trim_end().to_string();
+            }
+            Some(PhaseDef {
+                id: id_part.trim().to_string(),
+                title,
+                is_loop,
+            })
+        })
+        .collect()
 }
 
 /// Collection of discovered skills.
@@ -276,6 +312,10 @@ impl SkillRegistry {
                 .ok_or_else(|| "missing required frontmatter field: name".to_string())?;
 
             let description = metadata.get("description").cloned().unwrap_or_default();
+            let phases = metadata
+                .get("phases")
+                .map(|s| parse_phases_line(s))
+                .unwrap_or_default();
 
             return Ok(Skill {
                 name,
@@ -284,6 +324,7 @@ impl SkillRegistry {
                 // Filled in by `discover` after parse succeeds; default to an
                 // empty path so direct constructors (e.g. tests) compile.
                 path: PathBuf::new(),
+                phases,
             });
         }
 
@@ -304,6 +345,7 @@ impl SkillRegistry {
             description: String::new(),
             body: content.trim().to_string(),
             path: PathBuf::new(),
+            phases: Vec::new(),
         })
     }
 
@@ -577,6 +619,15 @@ instructions when using a specific skill.\n\n",
 - Safety: do not execute scripts from a community skill unless the user explicitly asks or the skill has been trusted for script use.\n",
     );
 
+    if registry.list().iter().any(|s| !s.phases.is_empty()) {
+        out.push_str(
+            "\n### Phase tracking (pinvou3 MVP1)\n\
+- Some skills above declare a `phases:` pipeline. When you are actively executing one of them, prepend each assistant reply with a single line `<phase id=\"...\"/>` naming the current phase id (e.g. `<phase id=\"p4\"/>`).\n\
+- Use phase ids exactly as written in the skill's `phases` list. Emit a new marker only when the phase actually advances; do not repeat the same id on every reply if you are still in it.\n\
+- This marker is consumed by the UI to highlight the current phase. It is not user-visible chat — keep it on its own line above any other content.\n",
+        );
+    }
+
     Some(out)
 }
 
@@ -640,6 +691,49 @@ mod tests {
         let skill_dir = tmpdir.path().join("skills").join(skill_name);
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join("SKILL.md"), skill_content).unwrap();
+    }
+
+    #[test]
+    fn discover_parses_phases_frontmatter_for_pipeline_visualization() {
+        // pinvou3 MVP1: SKILL.md `phases:` 一行管道分隔 + `*` 表 loop。
+        let tmpdir = TempDir::new().unwrap();
+        create_skill_dir(
+            &tmpdir,
+            "phased-skill",
+            "---\nname: phased-skill\ndescription: has phases\nphases: p0:Intake|p1:Research*|p2:Synthesize\n---\nbody",
+        );
+        let registry = super::SkillRegistry::discover(&tmpdir.path().join("skills"));
+        let skill = registry.get("phased-skill").expect("phased-skill loaded");
+        assert_eq!(skill.phases.len(), 3);
+        assert_eq!(skill.phases[0].id, "p0");
+        assert_eq!(skill.phases[0].title, "Intake");
+        assert!(!skill.phases[0].is_loop);
+        assert_eq!(skill.phases[1].id, "p1");
+        assert_eq!(skill.phases[1].title, "Research");
+        assert!(skill.phases[1].is_loop);
+        assert_eq!(skill.phases[2].id, "p2");
+        assert!(!skill.phases[2].is_loop);
+
+        // Skills without `phases:` must keep working with empty vec.
+        create_skill_dir(
+            &tmpdir,
+            "legacy-skill",
+            "---\nname: legacy-skill\ndescription: no phases\n---\nbody",
+        );
+        let registry2 = super::SkillRegistry::discover(&tmpdir.path().join("skills"));
+        let legacy = registry2.get("legacy-skill").expect("legacy-skill loaded");
+        assert!(legacy.phases.is_empty());
+
+        // Rendered skill context must include the phase-tracking prompt when
+        // at least one skill has phases (so the LLM knows to emit markers).
+        let rendered = crate::skills::render_available_skills_context(
+            &tmpdir.path().join("skills"),
+        )
+        .expect("skill context");
+        assert!(
+            rendered.contains("Phase tracking"),
+            "phase prompt missing when skill has phases:\n{rendered}"
+        );
     }
 
     #[test]
@@ -802,6 +896,7 @@ mod tests {
                 .join("skills")
                 .join("workspace-priority")
                 .join("SKILL.md"),
+            phases: Vec::new(),
         });
 
         let big_desc = "y".repeat(super::MAX_SKILL_DESCRIPTION_CHARS - 20);
@@ -816,6 +911,7 @@ mod tests {
                     .join("skills")
                     .join(format!("aaa-global-{i:03}"))
                     .join("SKILL.md"),
+                phases: Vec::new(),
             });
         }
 

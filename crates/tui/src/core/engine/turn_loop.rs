@@ -337,6 +337,9 @@ impl Engine {
             let mut content_blocks: Vec<ContentBlock> = Vec::new();
             let mut current_text_raw = String::new();
             let mut current_text_visible = String::new();
+            // pinvou3 MVP1: track the last `<phase id=".."/>` marker we have
+            // already broadcast so we only emit `PhaseChanged` on transition.
+            let mut last_phase_id: Option<String> = None;
             let mut current_thinking = String::new();
             let mut tool_uses: Vec<ToolUseState> = Vec::new();
             let mut usage = Usage {
@@ -617,6 +620,18 @@ impl Engine {
                                         content: filtered,
                                     })
                                     .await;
+                                // pinvou3 MVP1: detect `<phase id="..."/>` marker
+                                // on the cumulative visible text. Emit `PhaseChanged`
+                                // only on transition (new id ≠ last broadcast).
+                                if let Some(id) = extract_last_phase_id(&current_text_visible)
+                                    && last_phase_id.as_deref() != Some(id.as_str())
+                                {
+                                    last_phase_id = Some(id.clone());
+                                    let _ = self
+                                        .tx_event
+                                        .send(Event::PhaseChanged { phase_id: id })
+                                        .await;
+                                }
                             }
                         }
                         Delta::ThinkingDelta { thinking } => {
@@ -2014,6 +2029,37 @@ fn is_turn_metadata_text(text: &str) -> bool {
     text.trim_start().starts_with("<turn_meta>")
 }
 
+/// Scan the cumulative visible assistant text for the **latest**
+/// `<phase id="..."/>` marker. Returns `None` if no well-formed marker
+/// is present. Used by the stream loop to emit `Event::PhaseChanged`
+/// only when the LLM crosses into a new phase (pinvou3 MVP1).
+///
+/// Tolerant to whitespace inside the tag but requires the canonical
+/// `id="..."` attribute and an explicit `>` close. Self-closing slash
+/// is optional.
+fn extract_last_phase_id(text: &str) -> Option<String> {
+    let mut last: Option<String> = None;
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find("<phase") {
+        let tag_start = search_from + rel + "<phase".len();
+        let Some(end_rel) = text[tag_start..].find('>') else {
+            break;
+        };
+        let inner = &text[tag_start..tag_start + end_rel];
+        if let Some(id_rel) = inner.find("id=\"") {
+            let after = &inner[id_rel + 4..];
+            if let Some(close_rel) = after.find('"') {
+                let id = after[..close_rel].trim();
+                if !id.is_empty() {
+                    last = Some(id.to_string());
+                }
+            }
+        }
+        search_from = tag_start + end_rel + 1;
+    }
+    last
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2040,6 +2086,36 @@ mod tests {
         assert!(should_hold_turn_for_subagents(1, 0));
         assert!(should_hold_turn_for_subagents(0, 1));
         assert!(!should_hold_turn_for_subagents(0, 0));
+    }
+
+    #[test]
+    fn extract_last_phase_id_returns_latest_marker() {
+        // No marker
+        assert_eq!(extract_last_phase_id("hello world"), None);
+        // Single marker, self-closing
+        assert_eq!(
+            extract_last_phase_id("<phase id=\"p4\"/>\nworking on outline"),
+            Some("p4".to_string())
+        );
+        // Single marker, no slash
+        assert_eq!(
+            extract_last_phase_id("<phase id=\"p2\">"),
+            Some("p2".to_string())
+        );
+        // Multiple markers across a turn — must return the latest
+        assert_eq!(
+            extract_last_phase_id("<phase id=\"p0\"/>\n...\n<phase id=\"p1\"/>\n..."),
+            Some("p1".to_string())
+        );
+        // Tolerates extra whitespace
+        assert_eq!(
+            extract_last_phase_id("<phase  id=\"p8_5\" />"),
+            Some("p8_5".to_string())
+        );
+        // Empty id ignored
+        assert_eq!(extract_last_phase_id("<phase id=\"\"/>"), None);
+        // Malformed (no closing >) ignored
+        assert_eq!(extract_last_phase_id("<phase id=\"px"), None);
     }
 
     /// Regression test for the OpenAI streaming batch tool_calls bug.

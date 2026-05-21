@@ -265,6 +265,15 @@ pub enum Event {
         blocked_write: bool,
     },
 
+    // === Skill Phase Tracking (pinvou3 MVP1) ===
+    /// The assistant emitted a `<phase id="..."/>` marker indicating it
+    /// moved to a new phase of a phased skill. Carried verbatim so the
+    /// UI (pinvou3-app WorkFlow pipeline view) can highlight the chip.
+    PhaseChanged {
+        /// Phase id as written in the skill's `phases:` frontmatter.
+        phase_id: String,
+    },
+
     // === Prefix-Cache Stability Events ===
     /// The prefix (system prompt + tool specs) changed between turns,
     /// which invalidates DeepSeek's KV prefix cache. Carries diagnostics

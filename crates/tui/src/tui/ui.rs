@@ -1834,6 +1834,11 @@ async fn run_event_loop(
                                 Some(format!("Sandbox blocked {tool_name}: {denial_reason}"));
                         }
                     }
+                    EngineEvent::PhaseChanged { phase_id: _ } => {
+                        // pinvou3 MVP1: phase tracking is rendered by pinvou3-app's
+                        // WorkFlow pipeline view. The native TUI does not display
+                        // a phase strip yet — emit is silently consumed.
+                    }
                 }
             }
         }
