@@ -11,11 +11,11 @@ use super::*;
 
 /// #136: derive the file path(s) edited by a tool call. Returns the empty
 /// vec for tools that don't modify files. We intentionally only handle the
-/// three known edit tools — adding more (e.g. specialized refactor tools)
+/// known edit tools — adding more (e.g. specialized refactor tools)
 /// is a one-line change here.
 pub(super) fn edited_paths_for_tool(tool_name: &str, input: &serde_json::Value) -> Vec<PathBuf> {
     match tool_name {
-        "edit_file" | "write_file" => {
+        "edit_file" | "write_file" | "append_file" => {
             if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
                 vec![PathBuf::from(path)]
             } else {

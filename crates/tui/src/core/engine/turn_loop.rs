@@ -1684,11 +1684,11 @@ impl Engine {
 
                         // Per-tool snapshot for surgical undo (#384): capture workspace
                         // state before file-modifying tools execute so `/undo` can
-                        // revert the most recent write_file/edit_file/apply_patch.
+                        // revert the most recent write_file/append_file/edit_file/apply_patch.
                         if result_override.is_none()
                             && matches!(
                                 tool_name.as_str(),
-                                "write_file" | "edit_file" | "apply_patch"
+                                "write_file" | "append_file" | "edit_file" | "apply_patch"
                             )
                         {
                             let ws = self.session.workspace.clone();

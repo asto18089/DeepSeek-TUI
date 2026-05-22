@@ -694,6 +694,7 @@ fn turn_tool_registry_builder_keeps_plan_mode_read_only_for_files() {
     assert!(registry.contains("read_file"));
     assert!(registry.contains("list_dir"));
     assert!(!registry.contains("write_file"));
+    assert!(!registry.contains("append_file"));
     assert!(!registry.contains("edit_file"));
     assert!(!registry.contains("exec_shell"));
     assert!(!registry.contains("exec_shell_wait"));
@@ -946,8 +947,8 @@ fn internal_context_budget_unaffected_by_api_request_cap() {
     // must still use the full TURN_MAX_OUTPUT_TOKENS headroom for V4-class
     // models (window ≥ 500K), NOT the smaller API request cap. This ensures
     // long-context V4 sessions don't compact prematurely.
-    let internal_budget = context_input_budget("deepseek-v4-pro")
-        .expect("V4 should have a known context window");
+    let internal_budget =
+        context_input_budget("deepseek-v4-pro").expect("V4 should have a known context window");
 
     // Verify the V4 internal budget reserves the full 262K thinking headroom.
     let v4_window: usize = 1_000_000;
@@ -2225,6 +2226,13 @@ fn edited_paths_for_write_file_returns_path() {
     let input = json!({ "path": "src/bar.rs", "content": "fn main() {}" });
     let paths = edited_paths_for_tool("write_file", &input);
     assert_eq!(paths, vec![PathBuf::from("src/bar.rs")]);
+}
+
+#[test]
+fn edited_paths_for_append_file_returns_path() {
+    let input = json!({ "path": "src/deck.html", "content": "<section></section>" });
+    let paths = edited_paths_for_tool("append_file", &input);
+    assert_eq!(paths, vec![PathBuf::from("src/deck.html")]);
 }
 
 #[test]

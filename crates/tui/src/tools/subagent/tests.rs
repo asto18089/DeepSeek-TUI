@@ -225,6 +225,7 @@ fn test_implementer_allowed_tools_include_writes() {
     #[allow(deprecated)]
     let tools = SubAgentType::Implementer.allowed_tools();
     assert!(tools.contains(&"write_file"));
+    assert!(tools.contains(&"append_file"));
     assert!(tools.contains(&"edit_file"));
     assert!(tools.contains(&"apply_patch"));
 }
@@ -239,6 +240,7 @@ fn test_verifier_allowed_tools_include_test_runner_but_no_writes() {
     assert!(tools.contains(&"run_tests"));
     assert!(tools.contains(&"diagnostics"));
     assert!(!tools.contains(&"write_file"));
+    assert!(!tools.contains(&"append_file"));
     assert!(!tools.contains(&"apply_patch"));
 }
 

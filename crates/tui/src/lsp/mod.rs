@@ -1,7 +1,7 @@
 //! LSP integration: post-edit diagnostics injection (#136).
 //!
 //! After the agent performs a successful file edit (`edit_file`,
-//! `apply_patch`, or `write_file`) the engine asks the [`LspManager`] for
+//! `apply_patch`, `write_file`, or `append_file`) the engine asks the [`LspManager`] for
 //! diagnostics on that file. The manager spawns the appropriate LSP server
 //! lazily on first use, sends `didOpen`/`didChange`, waits up to a bounded
 //! timeout for `publishDiagnostics`, normalizes the result, and returns it

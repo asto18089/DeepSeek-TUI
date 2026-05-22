@@ -132,6 +132,7 @@ mod tests {
     fn keeps_core_tools_visible() {
         assert!(!is_pinvou3_hidden("read_file"));
         assert!(!is_pinvou3_hidden("write_file"));
+        assert!(!is_pinvou3_hidden("append_file"));
         assert!(!is_pinvou3_hidden("exec_shell"));
         assert!(!is_pinvou3_hidden("web_search"));
         assert!(!is_pinvou3_hidden("checklist_write"));
@@ -160,7 +161,10 @@ mod tests {
 
             // 设 env 解锁 agent_spawn + agent_eval
             std::env::set_var("PINVOU3_BLOCKLIST_OVERRIDE", "agent_spawn, agent_eval");
-            assert!(!is_pinvou3_hidden("agent_spawn"), "agent_spawn 应被 env 豁免");
+            assert!(
+                !is_pinvou3_hidden("agent_spawn"),
+                "agent_spawn 应被 env 豁免"
+            );
             assert!(!is_pinvou3_hidden("agent_eval"), "agent_eval 应被 env 豁免");
             // 未列出的工具仍隐藏
             assert!(

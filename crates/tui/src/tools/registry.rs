@@ -230,8 +230,7 @@ impl ToolRegistry {
                     input_schema: schema,
                     allowed_callers: Some(vec!["direct".to_string()]),
                     defer_loading: Some(
-                        tool.defer_loading()
-                            || pinvou3_blocklist::is_pinvou3_hidden(tool.name()),
+                        tool.defer_loading() || pinvou3_blocklist::is_pinvou3_hidden(tool.name()),
                     ),
                     input_examples: None,
                     strict: None,
@@ -413,12 +412,13 @@ impl ToolRegistryBuilder {
         self
     }
 
-    /// Include file tools (read, write, edit, list).
+    /// Include file tools (read, write, append, edit, list).
     #[must_use]
     pub fn with_file_tools(self) -> Self {
-        use super::file::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
+        use super::file::{AppendFileTool, EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
         self.with_tool(Arc::new(ReadFileTool))
             .with_tool(Arc::new(WriteFileTool))
+            .with_tool(Arc::new(AppendFileTool))
             .with_tool(Arc::new(EditFileTool))
             .with_tool(Arc::new(ListDirTool))
     }
