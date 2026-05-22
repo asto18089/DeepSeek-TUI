@@ -377,7 +377,7 @@ impl ToolSpec for WriteFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Write content to a UTF-8 file in the workspace. Use this instead of heredocs (`cat <<EOF > file`) or `echo > file` in `exec_shell` — diffs render inline for reasonably sized files and approval is handled cleanly. Creates or overwrites; parent directories are auto-created. For large generated files, create a skeleton with write_file and add later chunks with append_file."
+        "Write content to a UTF-8 file in the workspace. Use this instead of heredocs (`cat <<EOF > file`) or `echo > file` in `exec_shell` — diffs render inline for reasonably sized files and approval is handled cleanly. Creates or overwrites; parent directories are auto-created. **Recommended for files ≤ 32KB.** For larger artifacts (HTML decks / long reports / complete web pages), write a small skeleton here (≤ 8KB, placeholder markers only, no inline CSS/JS), then call append_file for chunked additions."
     }
 
     fn input_schema(&self) -> Value {
@@ -498,7 +498,7 @@ impl ToolSpec for AppendFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Append UTF-8 content to a file in the workspace. Use this for large generated artifacts after creating a small skeleton with write_file, instead of trying to send one huge write_file content argument. Creates parent directories and the target file if needed. Returns a compact byte-count summary, not a full diff."
+        "Append UTF-8 content to a file in the workspace. Use this for large generated artifacts after creating a small skeleton with write_file, instead of trying to send one huge write_file content argument. **Recommended chunk size ≤ 16KB** to keep tool-arg size small and avoid SSE-timeout-on-slow-decoders failures. Creates parent directories and the target file if needed. Returns a compact byte-count summary, not a full diff."
     }
 
     fn input_schema(&self) -> Value {
