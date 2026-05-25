@@ -129,6 +129,18 @@ pub enum AppMode {
     Plan,
 }
 
+#[derive(Debug, Clone)]
+pub struct VoiceInputState {
+    pub started_at: Instant,
+}
+
+impl VoiceInputState {
+    #[must_use]
+    pub fn new(started_at: Instant) -> Self {
+        Self { started_at }
+    }
+}
+
 /// One row in the per-turn cache-telemetry ring (`/cache` debug surface, #263).
 #[derive(Debug, Clone)]
 pub struct TurnCacheRecord {
@@ -395,7 +407,7 @@ fn remove_char_at(text: &mut String, char_index: usize) -> bool {
 
 fn normalize_paste_text(text: &str) -> String {
     if text.contains('\r') {
-        text.replace("\r\n", "\n").replace('\r', "")
+        text.replace("\r\n", "\n").replace('\r', "\n")
     } else {
         text.to_string()
     }
@@ -406,10 +418,23 @@ fn sanitize_api_key_text(text: &str) -> String {
 }
 
 fn strip_raw_mouse_report_runs(input: &str, cursor: usize) -> Option<(String, usize)> {
-    let chars: Vec<char> = input.chars().collect();
-    let mut output = String::with_capacity(input.len());
+    // First pass: strip the well-defined control-sequence fragment
+    // shapes that crossterm sometimes hands us as `Char(c)` keystrokes
+    // when its event reader is interrupted mid-sequence during dense
+    // streaming output (#1915). This covers OSC 8 hyperlink fragments
+    // (`]8;;URL`, including the closing `]8;;`) and Kitty keyboard
+    // protocol fragments (`[?…u`, `[>…u`, `[?u`).
+    let (after_fragments, after_fragments_cursor, fragments_changed) =
+        strip_control_sequence_fragments(input, cursor);
+
+    // Second pass: the existing run-based filter handles SGR mouse
+    // reports (`[<35;44;18M`) and the multi-terminator burst shape
+    // (`5;46;18M;48;18M`) introduced in e63a4ba4a. It operates on a
+    // narrow char set so it can't be confused with user-typed text.
+    let chars: Vec<char> = after_fragments.chars().collect();
+    let mut output = String::with_capacity(after_fragments.len());
     let mut new_cursor = 0usize;
-    let mut changed = false;
+    let mut changed = fragments_changed;
     let mut index = 0usize;
 
     while index < chars.len() {
@@ -419,12 +444,21 @@ fn strip_raw_mouse_report_runs(input: &str, cursor: usize) -> Option<(String, us
                 index += 1;
             }
             let run = &chars[start..index];
-            if looks_like_raw_mouse_report_run(run) {
+            if let Some(keep) = raw_mouse_report_keep_mask(run) {
                 changed = true;
+                for (offset, ch) in run.iter().copied().enumerate() {
+                    if !keep[offset] {
+                        continue;
+                    }
+                    if start + offset < cursor {
+                        new_cursor += 1;
+                    }
+                    output.push(ch);
+                }
                 continue;
             }
             for (offset, ch) in run.iter().copied().enumerate() {
-                if start + offset < cursor {
+                if start + offset < after_fragments_cursor {
                     new_cursor += 1;
                 }
                 output.push(ch);
@@ -432,7 +466,7 @@ fn strip_raw_mouse_report_runs(input: &str, cursor: usize) -> Option<(String, us
             continue;
         }
 
-        if index < cursor {
+        if index < after_fragments_cursor {
             new_cursor += 1;
         }
         output.push(chars[index]);
@@ -463,6 +497,247 @@ fn looks_like_raw_mouse_report_run(run: &[char]) -> bool {
 
 fn has_sgr_mouse_marker(run: &[char]) -> bool {
     run.windows(2).any(|window| window == ['[', '<'])
+}
+
+fn raw_mouse_report_keep_mask(run: &[char]) -> Option<Vec<bool>> {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut index = 0usize;
+
+    while index < run.len() {
+        let (start, body_start) = if run[index] == '\x1b'
+            && run.get(index + 1) == Some(&'[')
+            && run.get(index + 2) == Some(&'<')
+        {
+            (index, index + 3)
+        } else if run[index] == '[' && run.get(index + 1) == Some(&'<') {
+            (index, index + 2)
+        } else {
+            index += 1;
+            continue;
+        };
+
+        let mut end = body_start;
+        let mut has_digit = false;
+        let mut has_separator = false;
+        let mut matched = false;
+        while end < run.len() {
+            match run[end] {
+                '0'..='9' => {
+                    has_digit = true;
+                    end += 1;
+                }
+                ';' | ':' => {
+                    has_separator = true;
+                    end += 1;
+                }
+                'M' | 'm' if has_digit && has_separator => {
+                    ranges.push((start, end + 1));
+                    index = end + 1;
+                    matched = true;
+                    break;
+                }
+                _ => break,
+            }
+        }
+        if !matched {
+            index = index.saturating_add(1);
+        }
+    }
+
+    if ranges.is_empty() {
+        if looks_like_raw_mouse_report_run(run) {
+            return Some(vec![false; run.len()]);
+        }
+        return None;
+    }
+
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    let first_start = ranges[0].0;
+    let mut prefix_start = first_start;
+    while prefix_start > 0 && is_raw_mouse_report_fragment_char(run[prefix_start - 1]) {
+        prefix_start -= 1;
+    }
+    if prefix_start < first_start
+        && looks_like_raw_mouse_report_fragment(&run[prefix_start..first_start])
+    {
+        ranges.push((prefix_start, first_start));
+    }
+
+    let last_end = ranges.iter().map(|(_, end)| *end).max().unwrap_or_default();
+    if last_end < run.len() && looks_like_raw_mouse_report_fragment(&run[last_end..]) {
+        ranges.push((last_end, run.len()));
+    }
+
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    let mut keep = vec![true; run.len()];
+    for (start, end) in ranges {
+        for slot in keep.iter_mut().take(end.min(run.len())).skip(start) {
+            *slot = false;
+        }
+    }
+    Some(keep)
+}
+
+fn is_raw_mouse_report_fragment_char(ch: char) -> bool {
+    matches!(ch, ';' | ':' | 'M' | 'm') || ch.is_ascii_digit()
+}
+
+fn looks_like_raw_mouse_report_fragment(run: &[char]) -> bool {
+    if run.len() < 4 {
+        return false;
+    }
+    run.iter().any(|ch| ch.is_ascii_digit())
+        && run.iter().any(|ch| matches!(ch, ';' | ':'))
+        && run.iter().any(|ch| matches!(ch, 'M' | 'm'))
+}
+
+/// Scan `input` for control-sequence fragment shapes (#1915) — OSC 8
+/// hyperlinks and Kitty keyboard protocol responses — and excise each
+/// match. Returns `(output, new_cursor, changed)`. Cursor positions
+/// inside an excised fragment are moved to the fragment's start.
+///
+/// The match shapes are deliberately narrow so legitimate text like
+/// `[is this ok?]` or a typed URL survives untouched:
+///
+/// - **OSC 8**: `(\x1b?)] 8 ; ...` consuming everything up to the
+///   first BEL (`\x07`), `\x1b\\`, lone `\\`, or the next `\x1b]8;`
+///   block — terminator characters are optional because crossterm may
+///   have already consumed them.
+/// - **Kitty CSI**: `(\x1b?) [ (? | > | =) ... u` — the `?`/`>`/`=`
+///   private-parameter prefix is what distinguishes a Kitty response
+///   from a user-typed `[…u` (which is exceedingly rare and would
+///   need an explicit private-parameter byte to be a real CSI).
+fn strip_control_sequence_fragments(input: &str, cursor: usize) -> (String, usize, bool) {
+    let chars: Vec<char> = input.chars().collect();
+    let mut output = String::with_capacity(input.len());
+    let mut new_cursor = 0usize;
+    let mut changed = false;
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if let Some(end) = match_osc8_fragment(&chars, index) {
+            // The excised span contributes nothing to `output`, so
+            // `new_cursor` simply doesn't tick for any of those
+            // characters. A cursor that was inside the span ends up at
+            // the fragment's start position in the rewritten input,
+            // which matches the existing run-stripper's behavior.
+            index = end;
+            changed = true;
+            continue;
+        }
+
+        if let Some(end) = match_kitty_csi_fragment(&chars, index) {
+            index = end;
+            changed = true;
+            continue;
+        }
+
+        if index < cursor {
+            new_cursor += 1;
+        }
+        output.push(chars[index]);
+        index += 1;
+    }
+
+    let cursor = new_cursor.min(char_count(&output));
+    (output, cursor, changed)
+}
+
+/// If an OSC 8 hyperlink fragment starts at `chars[start]`, return its
+/// end index (exclusive). The leading `ESC` is optional because
+/// crossterm's event parser often consumes it before reclassifying the
+/// tail as keystrokes.
+fn match_osc8_fragment(chars: &[char], start: usize) -> Option<usize> {
+    let body_start = if chars.get(start) == Some(&'\x1b')
+        && chars.get(start + 1) == Some(&']')
+        && chars.get(start + 2) == Some(&'8')
+        && chars.get(start + 3) == Some(&';')
+    {
+        start + 4
+    } else if chars.get(start) == Some(&']')
+        && chars.get(start + 1) == Some(&'8')
+        && chars.get(start + 2) == Some(&';')
+    {
+        start + 3
+    } else {
+        return None;
+    };
+
+    // After `]8;` we expect the OSC 8 payload: an optional second `;`
+    // (params separator), then the URL (or empty for the closing
+    // wrapper), then a terminator. We deliberately stop at the first
+    // ASCII whitespace so a typed `]8;` followed by real prose can't
+    // swallow the user's words — real OSC 8 URLs don't contain spaces.
+    let mut end = body_start;
+    while end < chars.len() {
+        let ch = chars[end];
+        // BEL terminator.
+        if ch == '\x07' {
+            return Some(end + 1);
+        }
+        // `ESC \\` string terminator (ST).
+        if ch == '\x1b' && chars.get(end + 1) == Some(&'\\') {
+            return Some(end + 2);
+        }
+        // Lone `\\` — crossterm sometimes delivers ST with the leading
+        // ESC already consumed, leaving just `\\` as a Char keystroke.
+        if ch == '\\' {
+            return Some(end + 1);
+        }
+        // Start of the next OSC 8 wrapper (closing `]8;;` glued to the
+        // body) — close the current fragment here so the next iteration
+        // matches that one separately.
+        if ch == '\x1b' && chars.get(end + 1) == Some(&']') {
+            return Some(end);
+        }
+        if ch == ']' && chars.get(end + 1) == Some(&'8') && chars.get(end + 2) == Some(&';') {
+            return Some(end);
+        }
+        if ch.is_whitespace() {
+            // We never crossed a terminator, so this isn't a real
+            // fragment — give up rather than eat user prose.
+            return None;
+        }
+        end += 1;
+    }
+
+    // Reached end of input without a terminator or whitespace. Treat as
+    // a fragment in flight (its tail will arrive on a later keystroke
+    // and get filtered then).
+    Some(end)
+}
+
+/// If a Kitty keyboard protocol CSI fragment starts at `chars[start]`,
+/// return its end index (exclusive). Shape: `(ESC)? [ (? | > | =)
+/// [0-9;:]* u`. The private-parameter byte (`?`, `>`, `=`) is what
+/// keeps this distinct from text the user might plausibly type.
+fn match_kitty_csi_fragment(chars: &[char], start: usize) -> Option<usize> {
+    let after_csi = if chars.get(start) == Some(&'\x1b') && chars.get(start + 1) == Some(&'[') {
+        start + 2
+    } else if chars.get(start) == Some(&'[') {
+        start + 1
+    } else {
+        return None;
+    };
+
+    let priv_byte = chars.get(after_csi)?;
+    if !matches!(priv_byte, '?' | '>' | '=') {
+        return None;
+    }
+
+    let mut end = after_csi + 1;
+    while end < chars.len() {
+        let ch = chars[end];
+        if ch == 'u' {
+            return Some(end + 1);
+        }
+        if ch.is_ascii_digit() || ch == ';' || ch == ':' {
+            end += 1;
+            continue;
+        }
+        return None;
+    }
+    None
 }
 
 const MAX_SUBMITTED_INPUT_CHARS: usize = 16_000;
@@ -618,6 +893,7 @@ pub struct ComposerState {
     pub paste_burst: PasteBurst,
     pub input_history: Vec<String>,
     pub draft_history: VecDeque<String>,
+    pub clear_undo_buffer: Option<String>,
     pub history_index: Option<usize>,
     pub(crate) history_navigation_draft: Option<InputHistoryDraft>,
     pub composer_history_search: Option<ComposerHistorySearch>,
@@ -649,6 +925,7 @@ impl Default for ComposerState {
             paste_burst: PasteBurst::default(),
             input_history: Vec::new(),
             draft_history: VecDeque::new(),
+            clear_undo_buffer: None,
             history_index: None,
             history_navigation_draft: None,
             composer_history_search: None,
@@ -702,12 +979,13 @@ impl Default for ViewportState {
     }
 }
 
-/// Goal mode state (#397).
+/// Goal tracking state (#397).
 #[derive(Debug, Clone, Default)]
 pub struct GoalState {
     pub goal_objective: Option<String>,
     pub goal_token_budget: Option<u32>,
     pub goal_started_at: Option<Instant>,
+    pub goal_completed: bool,
 }
 
 /// Session cost and token telemetry state.
@@ -754,6 +1032,13 @@ impl Default for SessionState {
     }
 }
 
+/// Evidence collected during a turn for the post-turn receipt.
+#[derive(Debug, Clone)]
+pub struct ToolEvidence {
+    pub tool_name: String,
+    pub summary: String,
+}
+
 /// Global UI state for the TUI.
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
@@ -789,6 +1074,8 @@ pub struct App {
     pub sticky_status: Option<StatusToast>,
     /// Last status text already promoted from `status_message` into toast state.
     pub last_status_message_seen: Option<String>,
+    /// Active external speech-to-text helper launched from the command palette.
+    pub voice_input_state: Option<VoiceInputState>,
     pub model: String,
     /// When true, the model is auto-selected based on request complexity
     /// rather than using a fixed model. The `/model auto` command sets this.
@@ -873,6 +1160,9 @@ pub struct App {
     pub context_panel: bool,
     /// File-tree pane state. `None` when hidden; `Some` when visible.
     pub file_tree: Option<crate::tui::file_tree::FileTreeState>,
+    /// Whether the file-tree pane was actually rendered in the last frame.
+    /// Set false when the terminal is too narrow to show the tree.
+    pub file_tree_visible: bool,
     #[allow(dead_code)]
     pub compact_threshold: usize,
     pub max_input_history: usize,
@@ -1018,6 +1308,11 @@ pub struct App {
     pub last_exec_wait_command: Option<String>,
     /// Current streaming assistant cell
     pub streaming_message_index: Option<usize>,
+    /// True after a local cancel key has been handled and before the engine's
+    /// authoritative TurnComplete arrives. Stream events already queued for
+    /// the cancelled turn are ignored so text does not keep appearing after
+    /// Ctrl+C/Esc returns focus to the composer.
+    pub suppress_stream_events_until_turn_complete: bool,
     /// Index into `active_cell.entries` of the thinking entry currently being
     /// streamed. `None` when no thinking block is in flight. P2.3 routes
     /// thinking into the active cell so it groups visually with tool calls
@@ -1072,6 +1367,13 @@ pub struct App {
     pub workspace_context_refreshed_at: Option<Instant>,
     /// Cached background tasks for sidebar rendering.
     pub task_panel: Vec<TaskPanelEntry>,
+    /// Active decision card (v0.8.43 truth-surface). When set, keyboard input
+    /// is routed through the card navigation instead of the composer.
+    pub decision_card: Option<crate::tui::widgets::decision_card::DecisionCard>,
+    /// Wall-clock time when this TUI session started. Used by the Work
+    /// sidebar projection to hide completed durable tasks that finished
+    /// before the current session (bug #1913).
+    pub session_started_at: chrono::DateTime<chrono::Utc>,
     /// Whether the UI needs to be redrawn.
     pub needs_redraw: bool,
     /// When the current thinking block started (for duration tracking).
@@ -1086,6 +1388,9 @@ pub struct App {
     pub coherence_state: CoherenceState,
     /// Timestamp of the last user message send (for brief visual feedback).
     pub last_send_at: Option<Instant>,
+    /// Most recent user prompt accepted for an active engine turn. Ctrl+C can
+    /// restore this into an empty composer after cancelling that turn.
+    pub last_submitted_prompt: Option<String>,
     /// Two-tap quit confirmation. When set, a prior Ctrl+C in idle state has
     /// armed the quit shortcut; a second Ctrl+C before this `Instant` exits
     /// the app, while expiry silently re-arms the prompt for next time.
@@ -1116,7 +1421,7 @@ pub struct App {
     /// overrides). Loaded from config and forwarded to the engine.
     pub cycle: CycleConfig,
 
-    // === Goal Mode (#397) ===
+    // === Transcript filtering (#397) ===
     /// Transcript cells the user has collapsed (hidden from view).
     /// Stores **original** virtual cell indices (pre-filtering).
     pub collapsed_cells: HashSet<usize>,
@@ -1136,6 +1441,13 @@ pub struct App {
     /// Derived title for the current session shown in the composer border.
     /// Updated when `EngineEvent::SessionUpdated` fires or a saved session is loaded.
     pub session_title: Option<String>,
+
+    /// Post-turn receipt rendered as transient composer chrome.
+    /// Set when a turn completes; cleared when a new turn starts or after expiry.
+    pub receipt_text: Option<String>,
+    pub receipt_started_at: Option<Instant>,
+    /// Tool evidence collected during the current turn for the receipt.
+    pub tool_evidence: Vec<ToolEvidence>,
 }
 
 /// Message queued while the engine is busy.
@@ -1363,21 +1675,23 @@ impl App {
             })
             .unwrap_or(model);
         let auto_model = model.trim().eq_ignore_ascii_case("auto");
+        let configured_reasoning_effort = settings
+            .reasoning_effort
+            .as_deref()
+            .or_else(|| config.reasoning_effort());
         let threshold_model = if auto_model {
             DEFAULT_TEXT_MODEL
         } else {
             model.as_str()
         };
         let compact_threshold =
-            compaction_threshold_for_model_and_effort(threshold_model, config.reasoning_effort());
+            compaction_threshold_for_model_and_effort(threshold_model, configured_reasoning_effort);
         let reasoning_effort = if auto_model {
             ReasoningEffort::Auto
         } else {
-            config
-                .reasoning_effort()
-                .map_or_else(ReasoningEffort::default, |s| {
-                    ReasoningEffort::from_setting(s)
-                })
+            configured_reasoning_effort.map_or_else(ReasoningEffort::default, |s| {
+                ReasoningEffort::from_setting(s)
+            })
         };
 
         // Start in YOLO mode if --yolo flag was passed
@@ -1428,7 +1742,7 @@ impl App {
         let plan_state = new_shared_plan_state();
 
         let skills_dir = resolve_skills_dir(&workspace, &global_skills_dir, config);
-        let cached_skills = Self::discover_cached_skills(&workspace);
+        let cached_skills = Self::discover_cached_skills(&workspace, &skills_dir);
 
         let input_history = crate::composer_history::load_history();
         let (initial_input_text, initial_input_cursor) = match initial_input {
@@ -1451,6 +1765,7 @@ impl App {
                 paste_burst: PasteBurst::default(),
                 input_history,
                 draft_history: VecDeque::new(),
+                clear_undo_buffer: None,
                 history_index: None,
                 history_navigation_draft: None,
                 composer_history_search: None,
@@ -1479,6 +1794,7 @@ impl App {
             status_toasts: VecDeque::new(),
             sticky_status: None,
             last_status_message_seen: None,
+            voice_input_state: None,
             model,
             auto_model,
             last_effective_model: None,
@@ -1516,6 +1832,7 @@ impl App {
             sidebar_focus,
             context_panel: settings.context_panel,
             file_tree: None,
+            file_tree_visible: false,
             compact_threshold,
             max_input_history,
             allow_shell,
@@ -1595,6 +1912,7 @@ impl App {
             ignored_tool_calls: HashSet::new(),
             last_exec_wait_command: None,
             streaming_message_index: None,
+            suppress_stream_events_until_turn_complete: false,
             streaming_thinking_active_entry: None,
             streaming_state: StreamingState::new(),
             reasoning_buffer: String::new(),
@@ -1615,12 +1933,15 @@ impl App {
             workspace_context_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             workspace_context_refreshed_at: None,
             task_panel: Vec::new(),
+            decision_card: None,
+            session_started_at: chrono::Utc::now(),
             needs_redraw: true,
             thinking_started_at: None,
             is_compacting: false,
             user_scrolled_during_stream: false,
             coherence_state: CoherenceState::default(),
             last_send_at: None,
+            last_submitted_prompt: None,
             quit_armed_until: None,
             cycle_count: 0,
             cycle_briefings: Vec::new(),
@@ -1639,11 +1960,17 @@ impl App {
                 .and_then(|tui| tui.composer_arrows_scroll)
                 .unwrap_or_else(|| default_composer_arrows_scroll(use_mouse_capture)),
             session_title: None,
+            receipt_text: None,
+            receipt_started_at: None,
+            tool_evidence: Vec::new(),
         }
     }
 
-    fn discover_cached_skills(workspace: &std::path::Path) -> Vec<(String, String)> {
-        crate::skills::discover_in_workspace(workspace)
+    fn discover_cached_skills(
+        workspace: &std::path::Path,
+        skills_dir: &std::path::Path,
+    ) -> Vec<(String, String)> {
+        crate::skills::discover_for_workspace_and_dir(workspace, skills_dir)
             .list()
             .iter()
             .map(|s| (s.name.clone(), s.description.clone()))
@@ -1651,7 +1978,8 @@ impl App {
     }
 
     pub fn refresh_skill_cache(&mut self) {
-        self.cached_skills = Self::discover_cached_skills(&self.workspace);
+        let skills_dir = self.skills_dir.clone();
+        self.cached_skills = Self::discover_cached_skills(&self.workspace, &skills_dir);
     }
 
     pub fn submit_api_key(&mut self) -> Result<SavedCredential, ApiKeyError> {
@@ -2247,7 +2575,8 @@ impl App {
     }
 
     /// Whether a virtual transcript cell can open a meaningful Alt+V detail
-    /// view.
+    /// view. Thinking cells render their own raw text inline so there is no
+    /// separate "raw" target — only tool / sub-agent cells get the hint.
     #[must_use]
     pub fn cell_has_detail_target(&self, index: usize) -> bool {
         self.tool_detail_record_for_cell(index).is_some()
@@ -2499,6 +2828,39 @@ impl App {
         }
     }
 
+    pub const RECEIPT_VISIBLE_DURATION: Duration = Duration::from_secs(8);
+
+    pub fn set_receipt_text(&mut self, text: impl Into<String>) {
+        self.receipt_text = Some(text.into());
+        self.receipt_started_at = Some(Instant::now());
+        self.needs_redraw = true;
+    }
+
+    pub fn clear_receipt(&mut self) {
+        if self.receipt_text.is_some() || self.receipt_started_at.is_some() {
+            self.receipt_text = None;
+            self.receipt_started_at = None;
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn active_receipt_text(&self) -> Option<&str> {
+        let receipt = self.receipt_text.as_deref()?;
+        let started = self.receipt_started_at?;
+        (started.elapsed() <= Self::RECEIPT_VISIBLE_DURATION).then_some(receipt)
+    }
+
+    /// Tick called from the redraw loop so transient receipts leave the UI
+    /// without waiting for the next keypress.
+    pub fn tick_receipt(&mut self) {
+        if self
+            .receipt_started_at
+            .is_some_and(|started| started.elapsed() > Self::RECEIPT_VISIBLE_DURATION)
+        {
+            self.clear_receipt();
+        }
+    }
+
     pub fn set_sticky_status(
         &mut self,
         text: impl Into<String>,
@@ -2554,6 +2916,10 @@ impl App {
         (StatusToastLevel::Info, Some(4_000), false)
     }
 
+    fn is_mode_switch_status_message(message: &str) -> bool {
+        message.starts_with("Switched to ") && message.ends_with(" mode")
+    }
+
     pub fn sync_status_message_to_toasts(&mut self) {
         let current = self.status_message.clone();
         if self.last_status_message_seen == current {
@@ -2579,6 +2945,10 @@ impl App {
                     .is_some_and(|toast| matches!(toast.level, StatusToastLevel::Error))
             {
                 self.clear_sticky_status();
+            }
+            if Self::is_mode_switch_status_message(&message) {
+                self.status_toasts
+                    .retain(|toast| !Self::is_mode_switch_status_message(&toast.text));
             }
             self.push_status_toast(message, level, ttl_ms);
         }
@@ -3218,6 +3588,33 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// In a multiline composer, jump to the start of the current line.
+    /// On single-line input this is equivalent to `move_cursor_start`.
+    pub fn move_cursor_line_start(&mut self) {
+        let byte_pos = byte_index_at_char(&self.input, self.cursor_position);
+        let before = &self.input[..byte_pos];
+        if let Some(last_nl_byte) = before.rfind('\n') {
+            // Position after the '\n' (start of the current line).
+            self.cursor_position = char_count(&self.input[..=last_nl_byte]);
+        } else {
+            self.cursor_position = 0;
+        }
+        self.needs_redraw = true;
+    }
+
+    /// In a multiline composer, jump to the end of the current line
+    /// (just before the next `\n` or at the end of input).
+    /// On single-line input this is equivalent to `move_cursor_end`.
+    pub fn move_cursor_line_end(&mut self) {
+        let search_start = byte_index_at_char(&self.input, self.cursor_position);
+        if let Some(offset) = self.input[search_start..].find('\n') {
+            self.cursor_position = char_count(&self.input[..search_start + offset]);
+        } else {
+            self.cursor_position = char_count(&self.input);
+        }
+        self.needs_redraw = true;
+    }
+
     /// Move forward one word. Skips over the current word then any trailing
     /// whitespace to land on the first character of the next word.
     pub fn move_cursor_word_forward(&mut self) {
@@ -3477,6 +3874,11 @@ impl App {
 
     pub fn stash_current_input_for_recovery(&mut self) {
         let draft = self.input.clone();
+        if draft.trim().is_empty() {
+            self.clear_undo_buffer = None;
+            return;
+        }
+        self.clear_undo_buffer = Some(draft.clone());
         self.remember_draft_for_recovery(draft);
     }
 
@@ -3693,6 +4095,49 @@ impl App {
         Some(input)
     }
 
+    pub fn restore_last_submitted_prompt_if_empty(&mut self) -> bool {
+        if !self.input.is_empty() {
+            return false;
+        }
+        let Some(prompt) = self
+            .last_submitted_prompt
+            .as_deref()
+            .filter(|prompt| !prompt.is_empty())
+        else {
+            return false;
+        };
+
+        self.input = prompt.to_string();
+        self.cursor_position = char_count(&self.input);
+        self.history_index = None;
+        self.history_navigation_draft = None;
+        self.selected_attachment_index = None;
+        self.needs_redraw = true;
+        true
+    }
+
+    /// Restore the last cleared input if the composer is empty.
+    /// Returns `true` if the input was restored.
+    pub fn restore_last_cleared_input_if_empty(&mut self) -> bool {
+        if !self.input.is_empty() {
+            return false;
+        }
+        let Some(saved) = self.clear_undo_buffer.take().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+
+        self.input = saved;
+        self.cursor_position = char_count(&self.input);
+        self.history_index = None;
+        self.history_navigation_draft = None;
+        self.selected_attachment_index = None;
+        self.slash_menu_selected = 0;
+        self.slash_menu_hidden = false;
+        self.needs_redraw = true;
+        self.clear_undo_buffer = None;
+        true
+    }
+
     /// Composer-Enter dispatch. Returns `Some(input)` when the press should
     /// fire a submit; `None` when Enter was absorbed (paste-burst Enter
     /// suppression — see #1073).
@@ -3852,13 +4297,17 @@ impl App {
 
     /// Decide how to route a fresh composer submit.
     ///
-    /// #382: default to Queue when busy — the user shouldn't have to distinguish
-    /// "streaming" from "tool execution". Ctrl+Enter overrides to Steer.
+    /// #382 / v0.8.44: when the model is busy but not actively streaming
+    /// (waiting on tool results, sub-agents, or shell commands), Enter tries
+    /// to steer into the current turn. If steering fails, the message queues.
+    /// During active streaming, Enter always queues to avoid interrupting
+    /// in-flight reasoning. Ctrl+Enter forces Steer in all busy states.
     ///
     /// Truth table:
-    ///   offline=F, busy=F → Immediate
-    ///   offline=F, busy=T → Queue  (was Steer for non-streaming; now unified)
-    ///   offline=T, busy=* → Queue
+    ///   offline=F, busy=F           → Immediate
+    ///   offline=F, busy=T+streaming → Queue
+    ///   offline=F, busy=T+waiting   → Steer (fallback Queue)
+    ///   offline=T, busy=*           → Queue
     #[must_use]
     pub fn decide_submit_disposition(&self) -> SubmitDisposition {
         if self.offline_mode {
@@ -3867,7 +4316,13 @@ impl App {
         if !self.is_loading {
             return SubmitDisposition::Immediate;
         }
-        // Busy: always queue. Ctrl+Enter routes through steer_user_message directly.
+        // Busy but not streaming text: model is waiting on tool results or
+        // sub-agents — steer so the new message reaches the engine promptly
+        // instead of sitting in the queue until the current turn finishes.
+        if self.streaming_message_index.is_none() {
+            return SubmitDisposition::Steer;
+        }
+        // Actively streaming: queue to avoid interrupting in-flight reasoning.
         SubmitDisposition::Queue
     }
 
@@ -3989,6 +4444,25 @@ impl App {
         let model = self.effective_model_for_budget().to_string();
         self.compact_threshold =
             compaction_threshold_for_model_and_effort(&model, self.reasoning_effort.api_value());
+    }
+
+    pub fn set_model_selection(&mut self, model: String) {
+        let auto_model = model.trim().eq_ignore_ascii_case("auto");
+        self.model = if auto_model {
+            "auto".to_string()
+        } else {
+            model
+        };
+        self.auto_model = auto_model;
+        self.last_effective_model = None;
+    }
+
+    pub fn model_selection_for_persistence(&self) -> String {
+        if self.auto_model || self.model.trim().eq_ignore_ascii_case("auto") {
+            "auto".to_string()
+        } else {
+            self.model.clone()
+        }
     }
 
     pub fn effective_model_for_budget(&self) -> &str {
@@ -4235,6 +4709,60 @@ mod tests {
         assert!(default_composer_arrows_scroll_for_platform(true, true));
     }
 
+    #[test]
+    fn move_cursor_line_start_multiline() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.input = "abc\ndef\nghi".to_string();
+        app.cursor_position = "abc\ndef\nghi".chars().count(); // absolute end
+        app.move_cursor_line_start();
+        assert_eq!(app.cursor_position, "abc\ndef\n".len()); // start of "ghi"
+    }
+
+    #[test]
+    fn move_cursor_line_start_singleline() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.input = "hello".to_string();
+        app.cursor_position = 3;
+        app.move_cursor_line_start();
+        assert_eq!(app.cursor_position, 0);
+    }
+
+    #[test]
+    fn move_cursor_line_end_multiline() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.input = "abc\ndef\nghi".to_string();
+        app.cursor_position = 0; // start of first line
+        app.move_cursor_line_end();
+        assert_eq!(app.cursor_position, "abc".len()); // before first '\n'
+    }
+
+    #[test]
+    fn move_cursor_line_end_at_newline_stays_at_line_end() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.input = "abc\ndef\nghi".to_string();
+        app.cursor_position = "abc".len(); // on the '\n'
+        app.move_cursor_line_end();
+        assert_eq!(app.cursor_position, "abc".len()); // stays at line end
+    }
+
+    #[test]
+    fn move_cursor_line_end_last_line() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.input = "abc\ndef".to_string();
+        app.cursor_position = "abc\n".len(); // start of last line
+        app.move_cursor_line_end();
+        assert_eq!(app.cursor_position, "abc\ndef".chars().count()); // absolute end
+    }
+
+    #[test]
+    fn move_cursor_line_start_already_at_start() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.input = "abc\ndef".to_string();
+        app.cursor_position = "abc\n".len(); // start of second line
+        app.move_cursor_line_start();
+        assert_eq!(app.cursor_position, "abc\n".len()); // unchanged
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
@@ -4344,6 +4872,31 @@ mod tests {
     }
 
     #[test]
+    fn restore_last_submitted_prompt_rehydrates_empty_composer() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.last_submitted_prompt = Some("fix the typo\nand retry".to_string());
+
+        assert!(app.restore_last_submitted_prompt_if_empty());
+
+        assert_eq!(app.input, "fix the typo\nand retry");
+        assert_eq!(app.cursor_position, app.input.chars().count());
+        assert!(app.needs_redraw);
+    }
+
+    #[test]
+    fn restore_last_submitted_prompt_preserves_existing_draft() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.last_submitted_prompt = Some("previous prompt".to_string());
+        app.input = "new draft".to_string();
+        app.cursor_position = app.input.chars().count();
+
+        assert!(!app.restore_last_submitted_prompt_if_empty());
+
+        assert_eq!(app.input, "new draft");
+        assert_eq!(app.cursor_position, "new draft".chars().count());
+    }
+
+    #[test]
     fn composer_strips_raw_sgr_mouse_report_when_mouse_capture_is_enabled() {
         let mut app = App::new(test_options(false), &Config::default());
         app.use_mouse_capture = true;
@@ -4365,6 +4918,30 @@ mod tests {
 
         assert_eq!(app.input, "draft ");
         assert_eq!(app.cursor_position, "draft ".chars().count());
+    }
+
+    #[test]
+    fn composer_preserves_draft_suffix_when_stripping_mouse_report() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.use_mouse_capture = true;
+        app.insert_str("commit -m");
+
+        app.insert_str("[<65;44;18M");
+
+        assert_eq!(app.input, "commit -m");
+        assert_eq!(app.cursor_position, "commit -m".chars().count());
+    }
+
+    #[test]
+    fn composer_preserves_numeric_draft_when_stripping_mouse_report() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.use_mouse_capture = true;
+        app.insert_str("123");
+
+        app.insert_str("[<65;44;18M");
+
+        assert_eq!(app.input, "123");
+        assert_eq!(app.cursor_position, 3);
     }
 
     #[test]
@@ -4394,6 +4971,112 @@ mod tests {
         app.insert_str("Size 12;34M");
 
         assert_eq!(app.input, "Size 12;34M");
+    }
+
+    // === Bug #1915: broader terminal control-sequence fragments leaking
+    // into the composer during dense streaming output. The narrow SGR
+    // mouse-report filter installed in e63a4ba4a covers `[<…M` style
+    // bursts, but not OSC 8 hyperlink fragments (`]8;;http…`) or Kitty
+    // keyboard protocol responses (`[?u`, `[>1u`). These can arrive when
+    // crossterm's event reader is mid-sequence and the unparsed tail is
+    // delivered as individual Char(c) keystrokes that land in the input.
+
+    #[test]
+    fn composer_strips_osc8_hyperlink_fragment() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.use_mouse_capture = true;
+        app.insert_str("draft ");
+
+        // OSC 8 prefix with URL body but no terminator delivered yet —
+        // exactly what crossterm hands us if its event reader is
+        // interrupted mid-sequence and the leading ESC is consumed by the
+        // parser before the rest gets reclassified as Char(c).
+        app.insert_str("]8;;https://example.com");
+
+        assert_eq!(app.input, "draft ");
+        assert_eq!(app.cursor_position, "draft ".chars().count());
+    }
+
+    #[test]
+    fn composer_strips_closing_osc8_fragment() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.use_mouse_capture = true;
+        app.insert_str("hello ");
+
+        // The closing wrapper `]8;;` (with a stray ST `\\` from a
+        // chopped escape) can arrive on its own when the parser ate
+        // the start of the sequence in a previous read but caught the
+        // tail as keystrokes.
+        app.insert_str("]8;;\\");
+
+        assert_eq!(app.input, "hello ");
+        assert_eq!(app.cursor_position, "hello ".chars().count());
+    }
+
+    #[test]
+    fn composer_strips_kitty_keyboard_protocol_fragment() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.use_mouse_capture = true;
+        app.insert_str("ready ");
+
+        // Kitty keyboard protocol responses look like `\x1b[?1u`,
+        // `\x1b[>1u`, or `\x1b[?u`. With the ESC consumed, the tail
+        // shape is `[?…u` or `[>…u`.
+        app.insert_str("[?1u[>1u[?u");
+
+        assert_eq!(app.input, "ready ");
+        assert_eq!(app.cursor_position, "ready ".chars().count());
+    }
+
+    #[test]
+    fn composer_strips_mixed_control_sequence_burst() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.use_mouse_capture = true;
+        app.insert_str("hi");
+
+        // Mixed dense burst combining all three fragment families
+        // described in #1915.
+        app.insert_str("[<35;44;18M]8;;https://example.com[?1u");
+
+        assert_eq!(app.input, "hi");
+        assert_eq!(app.cursor_position, 2);
+    }
+
+    #[test]
+    fn composer_keeps_legitimate_url_text_with_mouse_capture_enabled() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.use_mouse_capture = true;
+
+        // URLs typed by the user must survive the filter — only
+        // recognized control-sequence shapes are stripped.
+        app.insert_str("see https://example.com/path?a=1&b=2 for info");
+
+        assert_eq!(app.input, "see https://example.com/path?a=1&b=2 for info");
+    }
+
+    #[test]
+    fn composer_keeps_legitimate_bracket_question_text() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.use_mouse_capture = true;
+
+        // Text that uses brackets, question marks, and lowercase `u` —
+        // shapes that overlap Kitty fragments — must not be eaten.
+        app.insert_str("[is this ok?] sure");
+
+        assert_eq!(app.input, "[is this ok?] sure");
+    }
+
+    #[test]
+    fn composer_keeps_legitimate_closing_bracket_digit_text() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.use_mouse_capture = true;
+
+        // Plain `]8` followed by spaces and words must survive — only
+        // the OSC 8 shape `]8;` (with the mandatory `;` separator)
+        // should be treated as a fragment.
+        app.insert_str("array[]8 elements");
+
+        assert_eq!(app.input, "array[]8 elements");
     }
 
     // initial_onboarding_state tests
@@ -4550,6 +5233,39 @@ mod tests {
                 .any(|(name, description)| name == "foo" && description == "Real foo skill"),
             "cached_skills should fall through to lower-precedence dir when higher-precedence one has an empty stub: {:?}",
             app.cached_skills,
+        );
+    }
+
+    #[test]
+    fn cached_skills_include_configured_directory() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+
+        let configured_dir = tmp.path().join("configured-skills");
+        let configured_skill_dir = configured_dir.join("configured-skill");
+        std::fs::create_dir_all(&configured_skill_dir).expect("configured skill dir");
+        std::fs::write(
+            configured_skill_dir.join("SKILL.md"),
+            "---\nname: configured-skill\ndescription: Configured skill\n---\nbody\n",
+        )
+        .expect("write configured skill");
+
+        let mut options = test_options(false);
+        options.workspace = workspace.clone();
+        options.skills_dir = configured_dir.clone();
+        let config = Config {
+            skills_dir: Some(configured_dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let app = App::new(options, &config);
+
+        assert!(
+            app.cached_skills
+                .iter()
+                .any(|(name, description)| name == "configured-skill"
+                    && description == "Configured skill"),
+            "configured skill dir should be merged: {:?}",
+            app.cached_skills
         );
     }
 
@@ -4732,6 +5448,78 @@ mod tests {
         app.mode = AppMode::Agent;
         app.cycle_mode_reverse();
         assert_eq!(app.mode, AppMode::Plan);
+
+        app.mode = AppMode::Yolo;
+        app.cycle_mode_reverse();
+        assert_eq!(app.mode, AppMode::Agent);
+    }
+
+    #[test]
+    fn test_mode_switch_toasts_replace_previous_mode_switch_toast() {
+        let mut app = App::new(test_options(false), &Config::default());
+        let first_mode = match app.mode {
+            AppMode::Plan => AppMode::Agent,
+            AppMode::Agent => AppMode::Yolo,
+            AppMode::Yolo => AppMode::Plan,
+        };
+        let second_mode = match first_mode {
+            AppMode::Plan => AppMode::Agent,
+            AppMode::Agent => AppMode::Yolo,
+            AppMode::Yolo => AppMode::Plan,
+        };
+        let third_mode = match second_mode {
+            AppMode::Plan => AppMode::Agent,
+            AppMode::Agent => AppMode::Yolo,
+            AppMode::Yolo => AppMode::Plan,
+        };
+
+        app.set_mode(first_mode);
+        app.sync_status_message_to_toasts();
+        assert_eq!(app.status_toasts.len(), 1);
+        assert_eq!(
+            app.status_toasts.back().expect("mode toast").text,
+            format!("Switched to {} mode", first_mode.label())
+        );
+
+        app.set_mode(second_mode);
+        app.sync_status_message_to_toasts();
+        assert_eq!(app.status_toasts.len(), 1);
+        assert_eq!(
+            app.status_toasts.back().expect("mode toast").text,
+            format!("Switched to {} mode", second_mode.label())
+        );
+
+        app.set_mode(third_mode);
+        app.sync_status_message_to_toasts();
+        assert_eq!(app.status_toasts.len(), 1);
+        assert_eq!(
+            app.status_toasts.back().expect("mode toast").text,
+            format!("Switched to {} mode", third_mode.label())
+        );
+    }
+
+    #[test]
+    fn test_mode_switch_toasts_do_not_disrupt_non_mode_toasts() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.status_message = Some("Task queued".to_string());
+        app.sync_status_message_to_toasts();
+
+        app.set_mode(AppMode::Agent);
+        app.sync_status_message_to_toasts();
+        app.set_mode(AppMode::Yolo);
+        app.sync_status_message_to_toasts();
+
+        assert_eq!(app.status_toasts.len(), 2);
+        assert!(
+            app.status_toasts
+                .iter()
+                .any(|toast| toast.text == "Task queued")
+        );
+        assert!(
+            app.status_toasts
+                .iter()
+                .any(|toast| toast.text == "Switched to YOLO mode")
+        );
     }
 
     #[test]
@@ -5098,6 +5886,50 @@ mod tests {
     }
 
     #[test]
+    fn clear_undo_buffer_is_set_on_clear_input_recoverable() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.input = "hello".to_string();
+        app.cursor_position = 5;
+
+        app.clear_input_recoverable();
+
+        assert!(app.input.is_empty());
+        assert_eq!(app.clear_undo_buffer.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn clear_undo_buffer_is_none_when_clearing_empty_input() {
+        let mut app = App::new(test_options(false), &Config::default());
+        assert!(app.input.is_empty());
+
+        app.clear_input_recoverable();
+
+        assert!(app.clear_undo_buffer.is_none());
+    }
+
+    #[test]
+    fn restore_last_cleared_input_restores_saved_draft() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.input = "previous".to_string();
+        app.cursor_position = 8;
+        app.clear_input_recoverable();
+        assert!(app.input.is_empty());
+
+        let restored = app.restore_last_cleared_input_if_empty();
+        assert!(restored);
+        assert_eq!(app.input, "previous");
+        assert!(app.clear_undo_buffer.is_none());
+    }
+
+    #[test]
+    fn restore_last_cleared_input_does_nothing_when_composer_not_empty() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.clear_undo_buffer = Some("old".to_string());
+        app.input = "current".to_string();
+        assert!(!app.restore_last_cleared_input_if_empty());
+    }
+
+    #[test]
     fn composer_paste_flushes_pending_burst_and_normalizes_crlf() {
         let mut app = App::new(test_options(false), &Config::default());
         app.use_paste_burst_detection = true;
@@ -5117,9 +5949,22 @@ mod tests {
 
         app.insert_paste_text("a\r\nb\rc");
 
-        assert_eq!(app.input, "xa\nbc");
-        assert_eq!(app.cursor_position, "xa\nbc".chars().count());
+        assert_eq!(app.input, "xa\nb\nc");
+        assert_eq!(app.cursor_position, "xa\nb\nc".chars().count());
         assert!(!app.paste_burst.is_active());
+    }
+
+    #[test]
+    fn bracketed_paste_preserves_bare_carriage_return_line_breaks() {
+        let mut app = App::new(test_options(false), &Config::default());
+
+        app.insert_paste_text("alpha\r  indented\r# literal heading\r- literal list");
+
+        assert_eq!(
+            app.input,
+            "alpha\n  indented\n# literal heading\n- literal list"
+        );
+        assert_eq!(app.cursor_position, app.input.chars().count());
     }
 
     #[test]
@@ -5425,6 +6270,24 @@ mod tests {
     }
 
     #[test]
+    fn receipt_expires_and_requests_redraw() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.set_receipt_text("✓ turn completed");
+        app.receipt_started_at =
+            Some(Instant::now() - App::RECEIPT_VISIBLE_DURATION - Duration::from_millis(10));
+        assert_eq!(app.active_receipt_text(), None);
+
+        app.needs_redraw = false;
+        app.tick_receipt();
+        assert!(app.receipt_text.is_none());
+        assert!(app.receipt_started_at.is_none());
+        assert!(
+            app.needs_redraw,
+            "receipt expiry should repaint composer chrome"
+        );
+    }
+
+    #[test]
     fn quit_armed_tick_is_noop_within_window() {
         let mut app = App::new(test_options(false), &Config::default());
         app.arm_quit();
@@ -5462,13 +6325,14 @@ mod tests {
     }
 
     #[test]
-    fn submit_disposition_queue_when_busy_and_online_not_streaming() {
-        // #382: Busy + not streaming → Queue (was Steer; now unified)
+    fn submit_disposition_steer_when_busy_and_online_not_streaming() {
+        // v0.8.44: Busy + not streaming → Steer (Enter reaches engine during
+        // sub-agent/shell waits instead of silently queueing).
         let mut app = App::new(test_options(false), &Config::default());
         app.is_loading = true;
         app.offline_mode = false;
         // streaming_message_index is None (default) → tool execution phase
-        assert_eq!(app.decide_submit_disposition(), SubmitDisposition::Queue);
+        assert_eq!(app.decide_submit_disposition(), SubmitDisposition::Steer);
     }
 
     #[test]

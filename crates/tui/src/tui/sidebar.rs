@@ -5,7 +5,7 @@
 //! reads from `App` snapshots; mutation lives in the main app loop.
 
 use std::fmt::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::{
     Frame,
@@ -167,6 +167,8 @@ struct SidebarWorkStrategyStep {
 struct SidebarWorkSummary {
     goal_objective: Option<String>,
     goal_token_budget: Option<u32>,
+    goal_completed: bool,
+    goal_started_at: Option<Instant>,
     tokens_used: u32,
     cycle_count: u32,
     checklist_completion_pct: u8,
@@ -226,6 +228,8 @@ fn sidebar_work_summary(app: &App) -> SidebarWorkSummary {
     let mut summary = SidebarWorkSummary {
         goal_objective: app.goal.goal_objective.clone(),
         goal_token_budget: app.goal.goal_token_budget,
+        goal_completed: app.goal.goal_completed,
+        goal_started_at: app.goal.goal_started_at,
         tokens_used: app.session.total_conversation_tokens,
         cycle_count: app.cycle_count,
         ..SidebarWorkSummary::default()
@@ -328,15 +332,41 @@ fn push_work_goal_lines(
         return;
     }
 
-    lines.push(Line::from(Span::styled(
-        format!(
-            "◆ {}",
-            truncate_line_to_width(objective, content_width.saturating_sub(2).max(1))
-        ),
+    let icon = if summary.goal_completed { "✓" } else { "◆" };
+    let status_style = if summary.goal_completed {
+        Style::default()
+            .fg(palette::STATUS_SUCCESS)
+            .add_modifier(ratatui::style::Modifier::BOLD)
+    } else {
         Style::default()
             .fg(palette::STATUS_WARNING)
-            .add_modifier(ratatui::style::Modifier::BOLD),
+            .add_modifier(ratatui::style::Modifier::BOLD)
+    };
+
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{} {}",
+            icon,
+            truncate_line_to_width(objective, content_width.saturating_sub(2).max(1))
+        ),
+        status_style,
     )));
+
+    // Elapsed time
+    if let Some(started) = summary.goal_started_at
+        && lines.len() < max_rows
+    {
+        let elapsed = crate::tui::notifications::humanize_duration(started.elapsed());
+        let elapsed_str = if summary.goal_completed {
+            format!("completed in {elapsed}")
+        } else {
+            format!("elapsed: {elapsed}")
+        };
+        lines.push(Line::from(Span::styled(
+            truncate_line_to_width(&elapsed_str, content_width),
+            Style::default().fg(palette::TEXT_MUTED),
+        )));
+    }
 
     if let Some(budget) = summary.goal_token_budget
         && lines.len() < max_rows
@@ -466,7 +496,7 @@ fn push_work_strategy_lines(
         let total = pending + in_progress + completed;
         lines.push(Line::from(vec![
             Span::styled(
-                "Strategy ",
+                "Strategy metadata ",
                 Style::default().fg(theme.plan_summary_color).bold(),
             ),
             Span::styled(
@@ -480,7 +510,7 @@ fn push_work_strategy_lines(
         ]));
     } else {
         lines.push(Line::from(Span::styled(
-            "Strategy",
+            "Strategy metadata",
             Style::default().fg(theme.plan_summary_color).bold(),
         )));
     }
@@ -574,9 +604,13 @@ fn task_panel_lines(app: &App, content_width: usize, max_rows: usize) -> Vec<Lin
             .as_deref()
             .unwrap_or("unknown")
             .to_string();
+        // Show enough of the turn id prefix to identify it for
+        // task_read / task_cancel. A UUID needs ~13 chars before the
+        // first hyphen; 16 chars gives a safe prefix for disambiguation.
+        let turn_prefix = truncate_line_to_width(turn_id, 16);
         lines.push(Line::from(Span::styled(
             truncate_line_to_width(
-                &format!("turn {} ({status})", truncate_line_to_width(turn_id, 12)),
+                &format!("turn {turn_prefix} ({status})",),
                 content_width.max(1),
             ),
             Style::default().fg(palette::DEEPSEEK_SKY),
@@ -595,24 +629,18 @@ fn task_panel_lines(app: &App, content_width: usize, max_rows: usize) -> Vec<Lin
             .iter()
             .filter(|task| task.status == "running")
             .count();
-        lines.push(Line::from(vec![
-            Span::styled(
-                if running == background_rows.len() {
-                    format!("Background jobs: {running} running")
-                } else {
-                    format!("Background jobs: {} active", background_rows.len())
-                },
-                Style::default().fg(palette::DEEPSEEK_SKY).bold(),
-            ),
-            Span::styled(
-                if running == background_rows.len() {
-                    String::new()
-                } else {
-                    format!(" ({running} running)")
-                },
-                Style::default().fg(palette::TEXT_MUTED),
-            ),
-        ]));
+        let done = background_rows.len().saturating_sub(running);
+        let label = if running == 0 {
+            format!("Background commands: {done} completed")
+        } else if done == 0 {
+            format!("Background commands: {running} running")
+        } else {
+            format!("Background commands: {running} running, {done} completed")
+        };
+        lines.push(Line::from(Span::styled(
+            label,
+            Style::default().fg(palette::DEEPSEEK_SKY).bold(),
+        )));
 
         let max_items = max_rows.saturating_sub(lines.len());
         for task in background_rows.iter().take(max_items) {
@@ -628,12 +656,7 @@ fn task_panel_lines(app: &App, content_width: usize, max_rows: usize) -> Vec<Lin
                 .duration_ms
                 .map(format_duration_ms)
                 .unwrap_or_else(|| "-".to_string());
-            let label = format!(
-                "{} {} {}",
-                truncate_line_to_width(&task.id, 10),
-                task.status,
-                duration
-            );
+            let (label, detail) = background_task_labels(task, &duration);
             lines.push(Line::from(Span::styled(
                 truncate_line_to_width(&label, content_width.max(1)),
                 Style::default().fg(color),
@@ -641,10 +664,7 @@ fn task_panel_lines(app: &App, content_width: usize, max_rows: usize) -> Vec<Lin
             lines.push(Line::from(Span::styled(
                 format!(
                     "  {}",
-                    truncate_line_to_width(
-                        &task.prompt_summary,
-                        content_width.saturating_sub(2).max(1)
-                    )
+                    truncate_line_to_width(&detail, content_width.saturating_sub(2).max(1))
                 ),
                 Style::default().fg(palette::TEXT_DIM),
             )));
@@ -672,6 +692,19 @@ fn task_panel_lines(app: &App, content_width: usize, max_rows: usize) -> Vec<Lin
         }
     }
 
+    // Yank hint: surface the keyboard path for copying the focused task/turn ID.
+    if lines.len() + 1 < max_rows
+        && app.runtime_turn_id.is_some()
+        && app.sidebar_focus == SidebarFocus::Tasks
+    {
+        lines.push(Line::from(Span::styled(
+            "y → copy turn id  ·  Y → copy full status",
+            Style::default()
+                .fg(palette::TEXT_DIM)
+                .add_modifier(ratatui::style::Modifier::ITALIC),
+        )));
+    }
+
     if lines.is_empty()
         || (lines.len() == 1
             && app.runtime_turn_id.is_some()
@@ -692,6 +725,26 @@ fn push_sidebar_label(lines: &mut Vec<Line<'static>>, label: &str, color: ratatu
         label.to_string(),
         Style::default().fg(color).bold(),
     )));
+}
+
+fn background_task_labels(task: &TaskPanelEntry, duration: &str) -> (String, String) {
+    if let Some(command) = task.prompt_summary.strip_prefix("shell: ") {
+        let command = concise_shell_command_label(command, 96);
+        return (
+            format!("{} {} {}", task.status, command, duration),
+            format!("{} \u{00B7} command", task.id),
+        );
+    }
+
+    (
+        format!(
+            "{} {} {}",
+            truncate_line_to_width(&task.id, 10),
+            task.status,
+            duration
+        ),
+        task.prompt_summary.clone(),
+    )
 }
 
 fn active_tool_rows(app: &App) -> Vec<SidebarToolRow> {
@@ -1019,9 +1072,9 @@ fn failure_summary_with_hint(summary: &str) -> String {
 
 fn friendly_generic_tool_name(name: &str) -> &str {
     match name {
-        "task_shell_start" => "start shell job",
-        "task_shell_wait" => "wait shell job",
-        "task_shell_write" => "write shell job",
+        "task_shell_start" => "start command",
+        "task_shell_wait" => "wait command",
+        "task_shell_write" => "write command",
         _ => name,
     }
 }
@@ -1030,7 +1083,7 @@ fn generic_tool_sidebar_summary(generic: &GenericToolCell) -> String {
     match generic.name.as_str() {
         "task_shell_start" => compact_join([
             generic.input_summary.clone().unwrap_or_default(),
-            "background shell job".to_string(),
+            "background command".to_string(),
         ]),
         "task_shell_wait" => compact_join([
             generic.input_summary.clone().unwrap_or_default(),
@@ -1096,6 +1149,7 @@ fn editorial_tool_rows(rows: Vec<SidebarToolRow>, limit: usize) -> Vec<SidebarTo
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut low_value_groups: Vec<(usize, SidebarToolRow, usize)> = Vec::new();
     let mut ci_poll_groups: Vec<(usize, SidebarToolRow, usize)> = Vec::new();
+    let mut shell_wait_groups: Vec<(usize, SidebarToolRow, usize, String)> = Vec::new();
     let mut seen_success: Vec<String> = Vec::new();
 
     for (order, mut row) in rows.into_iter().enumerate() {
@@ -1114,6 +1168,22 @@ fn editorial_tool_rows(rows: Vec<SidebarToolRow>, limit: usize) -> Vec<SidebarTo
                 }
             } else {
                 ci_poll_groups.push((order, row, 1));
+            }
+            continue;
+        }
+
+        if is_shell_wait_poll_row(&row) {
+            let key = shell_wait_poll_key(&row);
+            if let Some((_, grouped, count, _)) = shell_wait_groups
+                .iter_mut()
+                .find(|(_, _, _, existing_key)| existing_key == &key)
+            {
+                *count += 1;
+                if !row.summary.trim().is_empty() {
+                    grouped.summary = row.summary;
+                }
+            } else {
+                shell_wait_groups.push((order, row, 1, key));
             }
             continue;
         }
@@ -1165,6 +1235,20 @@ fn editorial_tool_rows(rows: Vec<SidebarToolRow>, limit: usize) -> Vec<SidebarTo
         });
     }
 
+    for (order, mut row, count, key) in shell_wait_groups {
+        if count > 1 {
+            row.summary = compact_join([
+                format!("{key} \u{00B7} {count} waits collapsed"),
+                row.summary.clone(),
+            ]);
+        }
+        candidates.push(Candidate {
+            rank: tool_row_rank(&row),
+            order,
+            row,
+        });
+    }
+
     for (order, mut row, count) in low_value_groups {
         if count > 1 {
             row.name = format!("{} x{count}", row.name);
@@ -1197,6 +1281,27 @@ fn sidebar_row_identity(row: &SidebarToolRow) -> String {
 
 fn is_ci_poll_row(row: &SidebarToolRow) -> bool {
     row.name.starts_with("gh pr checks") || row.name.starts_with("gh run watch")
+}
+
+fn is_shell_wait_poll_row(row: &SidebarToolRow) -> bool {
+    row.status == ToolStatus::Running && row.name == "wait command"
+}
+
+fn shell_wait_poll_key(row: &SidebarToolRow) -> String {
+    const MARKER: &str = "task_id:";
+    if let Some((_, rest)) = row.summary.split_once(MARKER) {
+        let task_id = rest
+            .trim_start()
+            .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '\u{00B7}')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if !task_id.is_empty() {
+            return task_id.to_string();
+        }
+    }
+
+    normalize_activity_text(&row.summary)
 }
 
 fn normalize_activity_text(text: &str) -> String {
@@ -1648,7 +1753,7 @@ fn render_context_panel(f: &mut Frame, area: Rect, app: &App) {
     // ── LSP ──────────────────────────────────────────────────────
     let lsp_label = if app.lsp_enabled { "on" } else { "off" };
     lines.push(Line::from(Span::styled(
-        format!("lsp: {}", lsp_label),
+        format!("lsp: {lsp_label}"),
         Style::default().fg(palette::TEXT_MUTED),
     )));
 
@@ -1674,7 +1779,7 @@ fn render_context_panel(f: &mut Frame, area: Rect, app: &App) {
                 } else if bytes >= 1024 {
                     format!("{:.1} KB", bytes as f64 / 1024.0)
                 } else {
-                    format!("{} B", bytes)
+                    format!("{bytes} B")
                 }
             })
             .unwrap_or_else(|_| "—".to_string());
@@ -1943,7 +2048,7 @@ mod tests {
         };
         let text = lines_to_text(&work_panel_lines(&summary, 80, 16, PaletteMode::Dark));
         assert!(
-            text.iter().any(|line| line == "Strategy"),
+            text.iter().any(|line| line == "Strategy metadata"),
             "non-empty plan should show strategy label: {text:?}"
         );
         assert!(
@@ -1999,7 +2104,7 @@ mod tests {
             .push(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
                 name: "read_file".to_string(),
                 status: ToolStatus::Success,
-                input_summary: Some("deepseek-tui/CHANGELOG.md".to_string()),
+                input_summary: Some("codewhale-tui/CHANGELOG.md".to_string()),
                 output: Some("done".to_string()),
                 prompts: None,
                 spillover_path: None,
@@ -2159,8 +2264,32 @@ mod tests {
             "running shell command should not render as both live and background: {text:?}"
         );
         assert!(
-            !text.iter().any(|line| line.contains("Background jobs")),
+            !text.iter().any(|line| line.contains("Background commands")),
             "duplicate background shell row should be hidden: {text:?}"
+        );
+    }
+
+    #[test]
+    fn tasks_panel_puts_background_shell_command_on_primary_row() {
+        let mut app = create_test_app();
+        app.task_panel.push(TaskPanelEntry {
+            id: "shell_33a08c3c".to_string(),
+            status: "running".to_string(),
+            prompt_summary: "shell: cd /tmp/repo && cargo test --workspace --all-features"
+                .to_string(),
+            duration_ms: Some(178_000),
+        });
+
+        let text = lines_to_text(&task_panel_lines(&app, 96, 8));
+
+        assert!(
+            text.iter()
+                .any(|line| line.contains("running cargo test --workspace --all-features")),
+            "background shell headline should show the command, not only the shell id: {text:?}"
+        );
+        assert!(
+            text.iter().any(|line| line.contains("shell_33a08c3c")),
+            "shell id should remain available as detail: {text:?}"
         );
     }
 
@@ -2235,7 +2364,7 @@ mod tests {
         let mut app = create_test_app();
         for _ in 0..3 {
             app.history.push(HistoryCell::Tool(ToolCell::Exec(ExecCell {
-                command: "cd /tmp/repo && sleep 15 && gh pr checks 1616 --repo Hmbown/DeepSeek-TUI"
+                command: "cd /tmp/repo && sleep 15 && gh pr checks 1616 --repo Hmbown/CodeWhale"
                     .to_string(),
                 status: ToolStatus::Failed,
                 output: Some("Lint pending\nTest pending".to_string()),
@@ -2276,7 +2405,7 @@ mod tests {
     fn tasks_panel_failed_shell_rows_point_to_activity_details() {
         let mut app = create_test_app();
         app.history.push(HistoryCell::Tool(ToolCell::Exec(ExecCell {
-            command: "cargo test -p deepseek-tui".to_string(),
+            command: "cargo test -p codewhale-tui".to_string(),
             status: ToolStatus::Failed,
             output: Some("test failed".to_string()),
             started_at: None,
@@ -2350,12 +2479,48 @@ mod tests {
         let text = lines_to_text(&task_panel_lines(&app, 80, 6));
 
         assert!(
-            text.iter().any(|line| line.contains("[~] wait shell job")),
+            text.iter().any(|line| line.contains("[~] wait command")),
             "shell helper should render as a user-facing activity: {text:?}"
         );
         assert!(
             !text.iter().any(|line| line.contains("task_shell_wait")),
             "internal helper name should not leak into sidebar: {text:?}"
+        );
+    }
+
+    #[test]
+    fn tasks_panel_collapses_repeated_shell_waits_for_same_job() {
+        let mut app = create_test_app();
+        let mut active = ActiveCell::new();
+        for id in ["shell-wait-1", "shell-wait-2"] {
+            active.push_tool(
+                id,
+                HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                    name: "task_shell_wait".to_string(),
+                    status: ToolStatus::Running,
+                    input_summary: Some("task_id: shell_33a08c3c".to_string()),
+                    output: None,
+                    prompts: None,
+                    spillover_path: None,
+                    output_summary: Some("Background task running (no new output).".to_string()),
+                    is_diff: false,
+                })),
+            );
+        }
+        app.active_cell = Some(active);
+
+        let text = lines_to_text(&task_panel_lines(&app, 100, 8));
+
+        assert_eq!(
+            text.iter()
+                .filter(|line| line.contains("[~] wait command"))
+                .count(),
+            1,
+            "duplicate waits for the same shell job should collapse: {text:?}"
+        );
+        assert!(
+            text.iter().any(|line| line.contains("2 waits collapsed")),
+            "collapsed row should explain why only one wait is visible: {text:?}"
         );
     }
 
@@ -2492,7 +2657,7 @@ mod tests {
         };
         let text = lines_to_text(&subagent_panel_lines(&summary, &[], 64, 8));
 
-        assert!(!text[0].contains("No agents"), "header: {:?}", text);
+        assert!(!text[0].contains("No agents"), "header: {text:?}");
         assert!(
             text.iter()
                 .any(|line| line.contains("RLM foreground work active")),

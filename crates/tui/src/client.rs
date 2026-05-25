@@ -337,8 +337,7 @@ fn validate_base_url_security(base_url: &str) -> Result<()> {
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     {
         logging::warn(format!(
-            "Using insecure HTTP base URL because {} is set",
-            ALLOW_INSECURE_HTTP_ENV
+            "Using insecure HTTP base URL because {ALLOW_INSECURE_HTTP_ENV} is set"
         ));
         return Ok(());
     }
@@ -349,17 +348,14 @@ fn validate_base_url_security(base_url: &str) -> Result<()> {
              \n\
              Loopback hosts (localhost, 127.0.0.1, [::1]) are auto-allowed.\n\
              For other trusted local hosts (LAN, llama.cpp on a private IP, etc.)\n\
-             set the env var `{env}=1` in the shell that runs deepseek and re-run.\n\
+             set the env var `{ALLOW_INSECURE_HTTP_ENV}=1` in the shell that runs deepseek and re-run.\n\
              \n\
-             Example: `{env}=1 deepseek` (note the underscores).",
-            base_url = base_url,
-            env = ALLOW_INSECURE_HTTP_ENV,
+             Example: `{ALLOW_INSECURE_HTTP_ENV}=1 deepseek` (note the underscores).",
         );
     }
 
     anyhow::bail!(
-        "Refusing base URL '{}': only HTTPS (or explicitly allowed HTTP) URLs are supported.",
-        base_url,
+        "Refusing base URL '{base_url}': only HTTPS (or explicitly allowed HTTP) URLs are supported.",
     )
 }
 
@@ -514,9 +510,9 @@ impl DeepSeekClient {
         let mut builder = reqwest::Client::builder()
             .default_headers(headers)
             .user_agent(concat!(
-                "Mozilla/5.0 (compatible; deepseek-tui/",
+                "Mozilla/5.0 (compatible; codewhale/",
                 env!("CARGO_PKG_VERSION"),
-                "; +https://github.com/Hmbown/DeepSeek-TUI)"
+                "; +https://github.com/Hmbown/CodeWhale)"
             ))
             .connect_timeout(Duration::from_secs(30))
             .tcp_keepalive(Some(Duration::from_secs(30)))
@@ -905,7 +901,10 @@ pub(super) fn apply_reasoning_effort(
                     "enable_thinking": false,
                 });
             }
-            ApiProvider::Openai | ApiProvider::Atlascloud | ApiProvider::Ollama => {}
+            ApiProvider::Openai
+            | ApiProvider::Atlascloud
+            | ApiProvider::WanjieArk
+            | ApiProvider::Ollama => {}
             ApiProvider::NvidiaNim => {
                 body["chat_template_kwargs"] = json!({
                     "thinking": false,
@@ -913,12 +912,21 @@ pub(super) fn apply_reasoning_effort(
             }
         },
         "low" | "minimal" | "medium" | "mid" | "high" | "" => match provider {
-            ApiProvider::Deepseek
-            | ApiProvider::DeepseekCN
-            | ApiProvider::Openrouter
-            | ApiProvider::Novita
-            | ApiProvider::Sglang => {
+            // DeepSeek compatibility: low/medium both map to high
+            ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::Sglang => {
                 body["reasoning_effort"] = json!("high");
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+            // OpenRouter/Novita: pass through the actual user-chosen value.
+            // OpenRouter's unified scale is none/minimal/low/medium/high/xhigh;
+            // DeepSeek models hosted there accept those directly.
+            ApiProvider::Openrouter | ApiProvider::Novita => {
+                let value = match normalized.as_str() {
+                    "low" | "minimal" => "low",
+                    "medium" | "mid" => "medium",
+                    _ => "high",
+                };
+                body["reasoning_effort"] = json!(value);
                 body["thinking"] = json!({ "type": "enabled" });
             }
             ApiProvider::Fireworks => {
@@ -930,7 +938,10 @@ pub(super) fn apply_reasoning_effort(
                 });
                 body["reasoning_effort"] = json!("high");
             }
-            ApiProvider::Openai | ApiProvider::Atlascloud | ApiProvider::Ollama => {}
+            ApiProvider::Openai
+            | ApiProvider::Atlascloud
+            | ApiProvider::WanjieArk
+            | ApiProvider::Ollama => {}
             ApiProvider::NvidiaNim => {
                 body["chat_template_kwargs"] = json!({
                     "thinking": true,
@@ -939,12 +950,12 @@ pub(super) fn apply_reasoning_effort(
             }
         },
         "xhigh" | "max" | "highest" => match provider {
-            ApiProvider::Deepseek
-            | ApiProvider::DeepseekCN
-            | ApiProvider::Openrouter
-            | ApiProvider::Novita
-            | ApiProvider::Sglang => {
+            ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::Sglang => {
                 body["reasoning_effort"] = json!("max");
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+            ApiProvider::Openrouter | ApiProvider::Novita => {
+                body["reasoning_effort"] = json!("xhigh");
                 body["thinking"] = json!({ "type": "enabled" });
             }
             ApiProvider::Fireworks => {
@@ -956,7 +967,10 @@ pub(super) fn apply_reasoning_effort(
                 });
                 body["reasoning_effort"] = json!("max");
             }
-            ApiProvider::Openai | ApiProvider::Atlascloud | ApiProvider::Ollama => {}
+            ApiProvider::Openai
+            | ApiProvider::Atlascloud
+            | ApiProvider::WanjieArk
+            | ApiProvider::Ollama => {}
             ApiProvider::NvidiaNim => {
                 body["chat_template_kwargs"] = json!({
                     "thinking": true,
@@ -1264,9 +1278,15 @@ mod tests {
     }
 
     #[test]
-    fn generic_openai_provider_drops_deepseek_reasoning_content() {
+    fn generic_openai_provider_drops_reasoning_content_for_non_deepseek_models() {
+        // #1542 intent (narrowed by #1739/#1694): a *genuine non-DeepSeek*
+        // model on the generic openai provider must not carry DeepSeek-only
+        // `reasoning_content`. A DeepSeek reasoning model on the openai
+        // provider (DeepSeek-compatible endpoint) is now covered separately
+        // and DOES replay reasoning_content — see
+        // `deepseek_model_on_openai_provider_still_replays_reasoning_content`.
         let request = MessageRequest {
-            model: "deepseek-v4-pro".to_string(),
+            model: "gpt-4o".to_string(),
             messages: vec![Message {
                 role: "assistant".to_string(),
                 content: vec![
@@ -1290,19 +1310,6 @@ mod tests {
             temperature: None,
             top_p: None,
         };
-
-        let deepseek =
-            build_chat_messages_for_request_and_provider(&request, ApiProvider::Deepseek);
-        let native_assistant = deepseek
-            .iter()
-            .find(|value| value.get("role").and_then(Value::as_str) == Some("assistant"))
-            .expect("assistant message");
-        assert_eq!(
-            native_assistant
-                .get("reasoning_content")
-                .and_then(Value::as_str),
-            Some("plan")
-        );
 
         let openai = build_chat_messages_for_request_and_provider(&request, ApiProvider::Openai);
         let generic_assistant = openai
@@ -1935,6 +1942,32 @@ mod tests {
             body.get("thinking").is_none(),
             "Fireworks strict-validates OpenAI-compatible requests and rejects top-level thinking"
         );
+    }
+
+    #[test]
+    fn reasoning_effort_maps_openrouter_scale_without_deepseek_max_label() {
+        for (input, expected) in [
+            ("low", "low"),
+            ("minimal", "low"),
+            ("medium", "medium"),
+            ("mid", "medium"),
+            ("high", "high"),
+            ("max", "xhigh"),
+            ("xhigh", "xhigh"),
+        ] {
+            let mut body = json!({});
+            apply_reasoning_effort(&mut body, Some(input), ApiProvider::Openrouter);
+
+            assert_eq!(
+                body.get("reasoning_effort").and_then(Value::as_str),
+                Some(expected),
+                "OpenRouter effort mapping for {input}"
+            );
+            assert_eq!(
+                body.pointer("/thinking/type").and_then(Value::as_str),
+                Some("enabled")
+            );
+        }
     }
 
     #[test]
@@ -2707,8 +2740,12 @@ mod tests {
 
     #[test]
     fn sanitize_thinking_mode_skips_generic_openai_provider() {
+        // #1542 intent (narrowed by #1739/#1694): the sanitizer only skips for
+        // a *genuine non-DeepSeek* model on the generic openai provider. A
+        // DeepSeek reasoning model on the openai provider still gets sanitized
+        // (see chat.rs `deepseek_model_on_openai_provider_still_replays_*`).
         let mut body = json!({
-            "model": "deepseek-v4-pro",
+            "model": "gpt-4o",
             "messages": [
                 { "role": "user", "content": "hi" },
                 {
@@ -2719,12 +2756,8 @@ mod tests {
             ]
         });
 
-        let result = sanitize_thinking_mode_messages(
-            &mut body,
-            "deepseek-v4-pro",
-            Some("max"),
-            ApiProvider::Openai,
-        );
+        let result =
+            sanitize_thinking_mode_messages(&mut body, "gpt-4o", Some("max"), ApiProvider::Openai);
 
         assert!(result.is_none());
         let assistant = body["messages"]

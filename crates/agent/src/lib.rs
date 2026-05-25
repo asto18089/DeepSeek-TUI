@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use deepseek_config::ProviderKind;
+use codewhale_config::ProviderKind;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +86,16 @@ impl Default for ModelRegistry {
                 aliases: vec!["gpt-4o-mini".to_string()],
                 supports_tools: true,
                 supports_reasoning: false,
+            },
+            ModelInfo {
+                id: "deepseek-reasoner".to_string(),
+                provider: ProviderKind::WanjieArk,
+                aliases: vec![
+                    "wanjie-deepseek-reasoner".to_string(),
+                    "ark-wanjie-deepseek-reasoner".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
             },
             ModelInfo {
                 id: "deepseek/deepseek-v4-pro".to_string(),
@@ -359,6 +369,16 @@ mod tests {
 
         assert_eq!(resolved.resolved.provider, ProviderKind::Openrouter);
         assert_eq!(resolved.resolved.id, "deepseek/deepseek-v4-pro");
+    }
+
+    #[test]
+    fn wanjie_ark_default_uses_reasoner_model_id() {
+        let registry = ModelRegistry::default();
+        let resolved = registry.resolve(None, Some(ProviderKind::WanjieArk));
+
+        assert_eq!(resolved.resolved.provider, ProviderKind::WanjieArk);
+        assert_eq!(resolved.resolved.id, "deepseek-reasoner");
+        assert!(resolved.resolved.supports_reasoning);
     }
 
     #[test]

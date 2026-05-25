@@ -57,6 +57,10 @@ class ThreadStore {
     return this.data.chats[chatId] || null;
   }
 
+  listChats() {
+    return Object.entries(this.data.chats || {});
+  }
+
   async setChat(chatId, state) {
     this.data.chats[chatId] = state;
     await this.save();
@@ -95,7 +99,7 @@ const config = {
   allowUnlisted: parseBool(process.env.DEEPSEEK_ALLOW_UNLISTED, false),
   threadMapPath:
     process.env.FEISHU_THREAD_MAP_PATH ||
-    "/var/lib/deepseek-feishu-bridge/thread-map.json",
+    "/var/lib/codewhale-feishu-bridge/thread-map.json",
   allowGroups: parseBool(process.env.FEISHU_ALLOW_GROUPS, false),
   requirePrefixInGroup: parseBool(process.env.FEISHU_REQUIRE_PREFIX_IN_GROUP, true),
   groupPrefix: process.env.FEISHU_GROUP_PREFIX || "/ds",
@@ -133,6 +137,9 @@ if (!config.allowlist.length && !config.allowUnlisted) {
 }
 
 wsClient.start({ eventDispatcher: dispatcher });
+void reattachActiveTurns().catch((error) => {
+  console.error("failed to reattach active Feishu bridge turns", error);
+});
 
 async function handleIncomingMessage(event) {
   const identity = incomingIdentity(event);
@@ -290,6 +297,43 @@ async function runPrompt(chatId, prompt) {
       activeTurnId: null,
       updatedAt: new Date().toISOString()
     });
+  }
+}
+
+async function reattachActiveTurns() {
+  for (const [chatId, state] of threadStore.listChats()) {
+    if (!state?.threadId || !state.activeTurnId) continue;
+
+    const detail = await runtimeJson(`/v1/threads/${encodeURIComponent(state.threadId)}`);
+    const runningTurn = latestRunningTurn(detail);
+    if (!runningTurn) {
+      await threadStore.patchChat(chatId, {
+        activeTurnId: null,
+        lastSeq: Number(detail.latest_seq || state.lastSeq || 0),
+        updatedAt: new Date().toISOString()
+      });
+      await sendText(chatId, `Bridge restarted. No active turn remains for ${state.threadId}.`);
+      continue;
+    }
+
+    const turnId = runningTurn.id || state.activeTurnId;
+    const sinceSeq = Number(state.lastSeq || 0);
+    await threadStore.patchChat(chatId, {
+      activeTurnId: turnId,
+      updatedAt: new Date().toISOString()
+    });
+    await sendText(
+      chatId,
+      `Bridge restarted. Reattaching to active turn ${turnId} from seq ${sinceSeq}.`
+    );
+    try {
+      await streamTurnEvents(chatId, state.threadId, turnId, sinceSeq);
+    } finally {
+      await threadStore.patchChat(chatId, {
+        activeTurnId: null,
+        updatedAt: new Date().toISOString()
+      });
+    }
   }
 }
 

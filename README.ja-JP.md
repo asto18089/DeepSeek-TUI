@@ -1,40 +1,48 @@
-# 🐳 DeepSeek TUI
+# 🐳 CodeWhale
 
-> **このターミナルネイティブのコーディングエージェントは、DeepSeek V4 の 100 万トークンのコンテキストウィンドウとプレフィックスキャッシュ機能を中心に構築されています。単一のバイナリとして配布され、Node.js や Python のランタイムは不要です。MCP クライアント、サンドボックス、永続的なタスクキューも標準で同梱されています。**
+> **DeepSeek ファーストで、オープンソースおよびオープンウェイトのコーディングモデルに向けたターミナルネイティブのコーディングエージェントです。DeepSeek V4 の 100 万トークンのコンテキストウィンドウとプレフィックスキャッシュ機能を中心に構築されています。単一のバイナリとして配布され、Node.js や Python のランタイムは不要です。MCP クライアント、サンドボックス、永続的なタスクキューも標準で同梱されています。**
+
+[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/codewhale)](https://www.npmjs.com/package/codewhale)
+[![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
+[![Sponsor](https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/Hmbown)
+[![DeepWiki](https://img.shields.io/badge/DeepWiki-Ask_AI-_.svg?style=flat&color=0052D9&labelColor=000000&logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACwAAAAyCAYAAAAnWDnqAAAAAXNSR0IArs4c6QAAA05JREFUaEPtmUtyEzEQhtWTQyQLHNak2AB7ZnyXZMEjXMGeK/AIi+QuHrMnbChYY7MIh8g01fJoopFb0uhhEqqcbWTp06/uv1saEDv4O3n3dV60RfP947Mm9/SQc0ICFQgzfc4CYZoTPAswgSJCCUJUnAAoRHOAUOcATwbmVLWdGoH//PB8mnKqScAhsD0kYP3j/Yt5LPQe2KvcXmGvRHcDnpxfL2zOYJ1mFwrryWTz0advv1Ut4CJgf5uhDuDj5eUcAUoahrdY/56ebRWeraTjMt/00Sh3UDtjgHtQNHwcRGOC98BJEAEymycmYcWwOprTgcB6VZ5JK5TAJ+fXGLBm3FDAmn6oPPjR4rKCAoJCal2eAiQp2x0vxTPB3ALO2CRkwmDy5WohzBDwSEFKRwPbknEggCPB/imwrycgxX2NzoMCHhPkDwqYMr9tRcP5qNrMZHkVnOjRMWwLCcr8ohBVb1OMjxLwGCvjTikrsBOiA6fNyCrm8V1rP93iVPpwaE+gO0SsWmPiXB+jikdf6SizrT5qKasx5j8ABbHpFTx+vFXp9EnYQmLx02h1QTTrl6eDqxLnGjporxl3NL3agEvXdT0WmEost648sQOYAeJS9Q7bfUVoMGnjo4AZdUMQku50McDcMWcBPvr0SzbTAFDfvJqwLzgxwATnCgnp4wDl6Aa+Ax283gghmj+vj7feE2KBBRMW3FzOpLOADl0Isb5587h/U4gGvkt5v60Z1VLG8BhYjbzRwyQZemwAd6cCR5/XFWLYZRIMpX39AR0tjaGGiGzLVyhse5C9RKC6ai42ppWPKiBagOvaYk8lO7DajerabOZP46Lby5wKjw1HCRx7p9sVMOWGzb/vA1hwiWc6jm3MvQDTogQkiqIhJV0nBQBTU+3okKCFDy9WwferkHjtxib7t3xIUQtHxnIwtx4mpg26/HfwVNVDb4oI9RHmx5WGelRVlrtiw43zboCLaxv46AZeB3IlTkwouebTr1y2NjSpHz68WNFjHvupy3q8TFn3Hos2IAk4Ju5dCo8B3wP7VPr/FGaKiG+T+v+TQqIrOqMTL1VdWV1DdmcbO8KXBz6esmYWYKPwDL5b5FA1a0hwapHiom0r/cKaoqr+27/XcrS5UwSMbQAAAABJRU5ErkJggg==)](https://deepwiki.com/Hmbown/CodeWhale)
 
 [English README](README.md)
 [简体中文 README](README.zh-CN.md)
 
+[インストール](#インストール) · [クイックスタート](#クイックスタート) · [ドキュメント](#ドキュメント) · [コントリビューション](#コントリビューション) · [サポート](#サポート)
+
 ## インストール
 
-`deepseek` は自己完結型の Rust バイナリとして提供されており、**実行に Node.js や Python のランタイムは必要ありません。** すでにマシンにインストールされているものを選んでください。いずれの方法でも同じバイナリが `PATH` に配置されます。
+`codewhale` は自己完結型の Rust バイナリとして提供されており、**実行に Node.js や Python のランタイムは必要ありません。** すでにマシンにインストールされているものを選んでください。いずれの方法でも同じバイナリが `PATH` に配置されます。
 
 ```bash
 # 1. npm — すでに Node を使っているなら最も簡単。npm パッケージは
 #    GitHub Releases から対応するビルド済みバイナリをダウンロードする
-#    薄いインストーラーであり、deepseek 本体に Node ランタイム依存を加えるものではありません。
-npm install -g deepseek-tui
+#    薄いインストーラーであり、codewhale 本体に Node ランタイム依存を加えるものではありません。
+npm install -g codewhale
 
 # 2. Cargo — Node 不要。
-cargo install deepseek-tui-cli --locked   # `deepseek` (エントリーポイント)
-cargo install deepseek-tui     --locked   # `deepseek-tui` (TUI バイナリ)
+cargo install codewhale-cli --locked   # `codewhale` (エントリーポイント)
+cargo install codewhale-tui     --locked   # `codewhale-tui` (TUI バイナリ)
 
 # 3. Homebrew — macOS パッケージマネージャ。
 brew tap Hmbown/deepseek-tui
 brew install deepseek-tui
 
 # 4. 直接ダウンロード — Node もツールチェーンも不要。
-#    https://github.com/Hmbown/DeepSeek-TUI/releases
+#    https://github.com/Hmbown/CodeWhale/releases
 #    Linux x64/ARM64、macOS x64/ARM64、Windows x64 向けのビルド済みバイナリがあります。
 
 # 5. Docker — ビルド済みリリースイメージ。
-docker volume create deepseek-tui-home
+docker volume create codewhale-home
 docker run --rm -it \
   -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
-  -v deepseek-tui-home:/home/deepseek/.deepseek \
+  -v codewhale-home:/home/codewhale/.deepseek \
   -v "$PWD:/workspace" \
   -w /workspace \
-  ghcr.io/hmbown/deepseek-tui:latest
+  ghcr.io/hmbown/codewhale:latest
 ```
 
 > 中国本土では、`--registry=https://registry.npmmirror.com` を指定して npm 経由のダウンロードを高速化するか、下記の[Cargo ミラー](#中国--ミラーフレンドリーなインストール)を利用してください。
@@ -42,34 +50,28 @@ docker run --rm -it \
 既にインストール済みの場合は、インストール方法に合わせて更新してください:
 
 ```bash
-deepseek update
-npm install -g deepseek-tui@latest
+codewhale update
+npm install -g codewhale@latest
 brew update && brew upgrade deepseek-tui
-cargo install deepseek-tui-cli --locked --force
-cargo install deepseek-tui     --locked --force
+cargo install codewhale-cli --locked --force
+cargo install codewhale-tui     --locked --force
 ```
 
-[![CI](https://github.com/Hmbown/DeepSeek-TUI/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/DeepSeek-TUI/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/deepseek-tui)](https://www.npmjs.com/package/deepseek-tui)
-[![crates.io](https://img.shields.io/crates/v/deepseek-tui-cli?label=crates.io)](https://crates.io/crates/deepseek-tui-cli)
-[![DeepWiki](https://img.shields.io/badge/DeepWiki-Ask_AI-_.svg?style=flat&color=0052D9&labelColor=000000&logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACwAAAAyCAYAAAAnWDnqAAAAAXNSR0IArs4c6QAAA05JREFUaEPtmUtyEzEQhtWTQyQLHNak2AB7ZnyXZMEjXMGeK/AIi+QuHrMnbChYY7MIh8g01fJoopFb0uhhEqqcbWTp06/uv1saEDv4O3n3dV60RfP947Mm9/SQc0ICFQgzfc4CYZoTPAswgSJCCUJUnAAoRHOAUOcATwbmVLWdGoH//PB8mnKqScAhsD0kYP3j/Yt5LPQe2KvcXmGvRHcDnpxfL2zOYJ1mFwrryWTz0advv1Ut4CJgf5uhDuDj5eUcAUoahrdY/56ebRWeraTjMt/00Sh3UDtjgHtQNHwcRGOC98BJEAEymycmYcWwOprTgcB6VZ5JK5TAJ+fXGLBm3FDAmn6oPPjR4rKCAoJCal2eAiQp2x0vxTPB3ALO2CRkwmDy5WohzBDwSEFKRwPbknEggCPB/imwrycgxX2NzoMCHhPkDwqYMr9tRcP5qNrMZHkVnOjRMWwLCcr8ohBVb1OMjxLwGCvjTikrsBOiA6fNyCrm8V1rP93iVPpwaE+gO0SsWmPiXB+jikdf6SizrT5qKasx5j8ABbHpFTx+vFXp9EnYQmLx02h1QTTrl6eDqxLnGjporxl3NL3agEvXdT0WmEost648sQOYAeJS9Q7bfUVoMGnjo4AZdUMQku50McDcMWcBPvr0SzbTAFDfvJqwLzgxwATnCgnp4wDl6Aa+Ax283gghmj+vj7feE2KBBRMW3FzOpLOADl0Isb5587h/U4gGvkt5v60Z1VLG8BhYjbzRwyQZemwAd6cCR5/XFWLYZRIMpX39AR0tjaGGiGzLVyhse5C9RKC6ai42ppWPKiBagOvaYk8lO7DajerabOZP46Lby5wKjw1HCRx7p9sVMOWGzb/vA1hwiWc6jm3MvQDTogQkiqIhJV0nBQBTU+3okKCFDy9WwferkHjtxib7t3xIUQtHxnIwtx4mpg26/HfwVNVDb4oI9RHmx5WGelRVlrtiw43zboCLaxv46AZeB3IlTkwouebTr1y2NjSpHz68WNFjHvupy3q8TFn3Hos2IAk4Ju5dCo8B3wP7VPr/FGaKiG+T+v+TQqIrOqMTL1VdWV1DdmcbO8KXBz6esmYWYKPwDL5b5FA1a0hwapHiom0r/cKaoqr+27/XcrS5UwSMbQAAAABJRU5ErkJggg==)](https://deepwiki.com/Hmbown/DeepSeek-TUI)
-
-<a href="https://www.buymeacoffee.com/hmbown" target="_blank"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-5F7FFF?style=for-the-badge&logo=buymeacoffee&logoColor=white" alt="Buy me a coffee" /></a>
-
-![DeepSeek TUI スクリーンショット](assets/screenshot.png)
+![codewhale スクリーンショット](assets/screenshot.png)
 
 ---
 
-## DeepSeek TUI とは？
+## codewhale とは？
 
-DeepSeek TUI は、ターミナル内で完結するコーディングエージェントです。DeepSeek のフロンティアモデルがあなたのワークスペースに直接アクセスできるようにし、ファイルの読み取り・編集、シェルコマンドの実行、Web 検索、Git 管理、サブエージェントの統制などを、すべて高速でキーボード駆動の TUI を通じて行えます。
+codewhale は、ターミナル内で完結するコーディングエージェントです。DeepSeek のフロンティアモデルがあなたのワークスペースに直接アクセスできるようにし、ファイルの読み取り・編集、シェルコマンドの実行、Web 検索、Git 管理、サブエージェントの統制などを、すべて高速でキーボード駆動の TUI を通じて行えます。
 
 **DeepSeek V4 向けに構築** (`deepseek-v4-pro` / `deepseek-v4-flash`)。100 万トークンのコンテキストウィンドウとネイティブの thinking-mode（思考連鎖）ストリーミングをサポートします。
 
 ### 主な機能
 
-- **Auto モード** — `--model auto` / `/model auto` がターンごとにモデルと推論強度を選択
-- **ネイティブ RLM** (`rlm_open`/`rlm_eval`) — 永続 REPL セッションでバッチ解析を行い、`peek`、`search`、`chunk`、`sub_query_batch` などの補助関数で低コストな `deepseek-v4-flash` 子タスクを実行
+- **モデル自動ルーティング** — `--model auto` / `/model auto` がターンごとにモデルと推論強度を選択
+- **Fin の高速経路** — thinking off の低コストな `deepseek-v4-flash` がルーティング、RLM 子呼び出し、要約、調整作業を担当
+- **ネイティブ RLM** (`rlm_open`/`rlm_eval`) — 永続 REPL セッションでバッチ解析を行い、`peek`、`search`、`chunk`、`sub_query_batch` などの補助関数を利用
 - **Thinking-mode ストリーミング** — モデルがタスクに取り組む様子をリアルタイムで観察し、思考連鎖の展開を追える
 - **完全なツールスイート** — ファイル操作、シェル実行、Git、Web 検索／ブラウズ、apply-patch、サブエージェント、MCP サーバー
 - **100 万トークンコンテキスト** — コンテキスト追跡、手動または設定ベースのコンパクション、プレフィックスキャッシュのテレメトリ
@@ -78,7 +80,7 @@ DeepSeek TUI は、ターミナル内で完結するコーディングエージ�
 - **セッション保存／再開** — 長時間実行のセッションをチェックポイント化して再開可能
 - **ワークスペースのロールバック** — リポジトリの `.git` には触れずに、サイド Git によるターン前後のスナップショットを `/restore` と `revert_turn` で扱える
 - **永続的タスクキュー** — 再起動を超えて生き残るバックグラウンドタスク。スケジュール自動化や長時間レビューなどに
-- **HTTP/SSE ランタイム API** — `deepseek serve --http` でヘッドレスエージェントワークフローを実現
+- **HTTP/SSE ランタイム API** — `codewhale serve --http` でヘッドレスエージェントワークフローを実現
 - **MCP プロトコル** — Model Context Protocol サーバーに接続して拡張ツールを利用可能。詳細は [docs/MCP.md](docs/MCP.md) を参照
 - **LSP 診断** — rust-analyzer、pyright、typescript-language-server、gopls、clangd により、編集ごとにエラー／警告をインライン表示
 - **ユーザーメモリ** — クロスセッションの嗜好をシステムプロンプトに注入できる、オプションの永続メモファイル
@@ -90,7 +92,7 @@ DeepSeek TUI は、ターミナル内で完結するコーディングエージ�
 
 ## 仕組み
 
-`deepseek`（ディスパッチャー CLI）→ `deepseek-tui`（コンパニオンバイナリ）→ ratatui インターフェース ↔ 非同期エンジン ↔ OpenAI 互換のストリーミングクライアント。ツール呼び出しは型付きレジストリ（シェル、ファイル操作、Git、Web、サブエージェント、MCP、RLM）を経由してルーティングされ、結果はトランスクリプトへとストリーム返送されます。エンジンはセッション状態、ターン管理、永続タスクキューを管理し、LSP サブシステムは編集後の診断を次の推論ステップ前にモデルのコンテキストへ供給します。
+`codewhale`（ディスパッチャー CLI）→ `codewhale-tui`（コンパニオンバイナリ）→ ratatui インターフェース ↔ 非同期エンジン ↔ OpenAI 互換のストリーミングクライアント。ツール呼び出しは型付きレジストリ（シェル、ファイル操作、Git、Web、サブエージェント、MCP、RLM）を経由してルーティングされ、結果はトランスクリプトへとストリーム返送されます。エンジンはセッション状態、ターン管理、永続タスクキューを管理し、LSP サブシステムは編集後の診断を次の推論ステップ前にモデルのコンテキストへ供給します。
 
 詳しくは [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) を参照してください。
 
@@ -99,9 +101,9 @@ DeepSeek TUI は、ターミナル内で完結するコーディングエージ�
 ## クイックスタート
 
 ```bash
-npm install -g deepseek-tui
-deepseek --version
-deepseek --model auto
+npm install -g codewhale
+codewhale --version
+codewhale --model auto
 ```
 
 ビルド済みバイナリは **Linux x64**、**Linux ARM64**（v0.8.8 以降）、**macOS x64**、**macOS ARM64**、**Windows x64** 向けに公開されています。その他のターゲット（musl、riscv64、FreeBSD など）は [ソースからのインストール](#install-from-source) または [docs/INSTALL.md](docs/INSTALL.md) を参照してください。
@@ -111,19 +113,19 @@ deepseek --model auto
 事前に設定することもできます:
 
 ```bash
-deepseek auth set --provider deepseek   # ~/.deepseek/config.toml に保存
+codewhale auth set --provider deepseek   # ~/.deepseek/config.toml に保存
 
 export DEEPSEEK_API_KEY="YOUR_KEY"      # 環境変数による代替方法。非対話シェルでは ~/.zshenv を使用
-deepseek
+codewhale
 
-deepseek doctor                         # セットアップを検証
+codewhale doctor                         # セットアップを検証
 ```
 
-> 保存済みキーをローテーション／削除するには: `deepseek auth clear --provider deepseek`。
+> 保存済みキーをローテーション／削除するには: `codewhale auth clear --provider deepseek`。
 
 ### Linux ARM64（Raspberry Pi、Asahi、Graviton、HarmonyOS PC）
 
-`npm i -g deepseek-tui` は v0.8.8 以降、glibc ベースの ARM64 Linux で動作します。[Releases ページ](https://github.com/Hmbown/DeepSeek-TUI/releases) からビルド済みバイナリをダウンロードし、`PATH` 上に並べて配置することもできます。
+`npm i -g codewhale` は v0.8.8 以降、glibc ベースの ARM64 Linux で動作します。[Releases ページ](https://github.com/Hmbown/CodeWhale/releases) からビルド済みバイナリをダウンロードし、`PATH` 上に並べて配置することもできます。
 
 ### 中国 / ミラーフレンドリーなインストール
 
@@ -141,12 +143,12 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
 その後、両方のバイナリをインストールしてください（ディスパッチャーは実行時に TUI へ委譲します）:
 
 ```bash
-cargo install deepseek-tui-cli --locked   # `deepseek` を提供
-cargo install deepseek-tui     --locked   # `deepseek-tui` を提供
-deepseek --version
+cargo install codewhale-cli --locked   # `codewhale` を提供
+cargo install codewhale-tui     --locked   # `codewhale-tui` を提供
+codewhale --version
 ```
 
-ビルド済みバイナリは [GitHub Releases](https://github.com/Hmbown/DeepSeek-TUI/releases) からもダウンロードできます。ミラーされたリリースアセットには `DEEPSEEK_TUI_RELEASE_BASE_URL` を使ってください。
+ビルド済みバイナリは [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases) からもダウンロードできます。ミラーされたリリースアセットには `DEEPSEEK_TUI_RELEASE_BASE_URL` を使ってください。
 
 ### Windows（Scoop）
 
@@ -167,11 +169,11 @@ scoop install deepseek-tui
 #   sudo apt-get install -y build-essential pkg-config libdbus-1-dev
 #   sudo dnf install -y gcc make pkgconf-pkg-config dbus-devel
 
-git clone https://github.com/Hmbown/DeepSeek-TUI.git
-cd DeepSeek-TUI
+git clone https://github.com/Hmbown/CodeWhale.git
+cd CodeWhale
 
-cargo install --path crates/cli --locked   # Rust 1.88+ が必要。`deepseek` を提供
-cargo install --path crates/tui --locked   # `deepseek-tui` を提供
+cargo install --path crates/cli --locked   # Rust 1.88+ が必要。`codewhale` を提供
+cargo install --path crates/tui --locked   # `codewhale-tui` を提供
 ```
 
 両方のバイナリが必要です。クロスコンパイルとプラットフォーム固有の注意事項: [docs/INSTALL.md](docs/INSTALL.md)。
@@ -182,41 +184,45 @@ cargo install --path crates/tui --locked   # `deepseek-tui` を提供
 
 ```bash
 # NVIDIA NIM
-deepseek auth set --provider nvidia-nim --api-key "YOUR_NVIDIA_API_KEY"
-deepseek --provider nvidia-nim
+codewhale auth set --provider nvidia-nim --api-key "YOUR_NVIDIA_API_KEY"
+codewhale --provider nvidia-nim
 
 # AtlasCloud
-deepseek auth set --provider atlascloud --api-key "YOUR_ATLASCLOUD_API_KEY"
-deepseek --provider atlascloud
+codewhale auth set --provider atlascloud --api-key "YOUR_ATLASCLOUD_API_KEY"
+codewhale --provider atlascloud
+
+# Wanjie Ark
+codewhale auth set --provider wanjie-ark --api-key "YOUR_WANJIE_API_KEY"
+codewhale --provider wanjie-ark --model deepseek-reasoner
 
 # OpenRouter
-deepseek auth set --provider openrouter --api-key "YOUR_OPENROUTER_API_KEY"
-deepseek --provider openrouter --model deepseek/deepseek-v4-pro
+codewhale auth set --provider openrouter --api-key "YOUR_OPENROUTER_API_KEY"
+codewhale --provider openrouter --model deepseek/deepseek-v4-pro
 
 # Novita
-deepseek auth set --provider novita --api-key "YOUR_NOVITA_API_KEY"
-deepseek --provider novita --model deepseek/deepseek-v4-pro
+codewhale auth set --provider novita --api-key "YOUR_NOVITA_API_KEY"
+codewhale --provider novita --model deepseek/deepseek-v4-pro
 
 # Fireworks
-deepseek auth set --provider fireworks --api-key "YOUR_FIREWORKS_API_KEY"
-deepseek --provider fireworks --model deepseek-v4-pro
+codewhale auth set --provider fireworks --api-key "YOUR_FIREWORKS_API_KEY"
+codewhale --provider fireworks --model deepseek-v4-pro
 
 # 汎用 OpenAI 互換エンドポイント
-deepseek auth set --provider openai --api-key "YOUR_OPENAI_COMPATIBLE_API_KEY"
-OPENAI_BASE_URL="https://openai-compatible.example/v4" deepseek --provider openai --model glm-5
+codewhale auth set --provider openai --api-key "YOUR_OPENAI_COMPATIBLE_API_KEY"
+OPENAI_BASE_URL="https://openai-compatible.example/v4" codewhale --provider openai --model glm-5
 
 # セルフホスト SGLang
-SGLANG_BASE_URL="http://localhost:30000/v1" deepseek --provider sglang --model deepseek-v4-flash
+SGLANG_BASE_URL="http://localhost:30000/v1" codewhale --provider sglang --model deepseek-v4-flash
 
 # セルフホスト vLLM
-VLLM_BASE_URL="http://localhost:8000/v1" deepseek --provider vllm --model deepseek-v4-flash
+VLLM_BASE_URL="http://localhost:8000/v1" codewhale --provider vllm --model deepseek-v4-flash
 
 # セルフホスト Ollama
-ollama pull deepseek-coder:1.3b
-deepseek --provider ollama --model deepseek-coder:1.3b
+ollama pull codewhale-coder:1.3b
+codewhale --provider ollama --model codewhale-coder:1.3b
 ```
 
-TUI 内では `/provider` でプロバイダーピッカー、`/model` でモデルピッカーを開けます。`/provider openrouter` や `/model <id>` で直接切り替え、`/models` で API から返るライブモデル一覧を確認できます。`/model` ピッカーは、利用可能な場合は現在のプロバイダーのライブモデルカタログを使い、ない場合はプロバイダー別の既定モデルにフォールバックします。
+TUI 内では `/provider` でプロバイダーピッカー、`/model` でローカルのモデル/思考モードピッカーを開けます。`/provider openrouter` や `/model <id>` で直接切り替え、`/models` で対応プロバイダーのライブモデル一覧を明示的に取得できます。
 
 ---
 
@@ -229,30 +235,30 @@ TUI 内では `/provider` でプロバイダーピッカー、`/model` でモデ
 ## 使い方
 
 ```bash
-deepseek                                         # インタラクティブ TUI
-deepseek "explain this function"                 # ワンショットプロンプト
-deepseek exec --auto --output-format stream-json "fix this bug"  # NDJSON バックエンドストリーム
-deepseek exec --resume <SESSION_ID> "follow up"  # 非対話セッションを継続
-deepseek --model deepseek-v4-flash "summarize"   # モデルの上書き
-deepseek --model auto "fix this bug"             # モデルと推論強度を自動選択
-deepseek --yolo                                  # ツールを自動承認
-deepseek auth set --provider deepseek            # API キーの保存
-deepseek doctor                                  # セットアップと接続性のチェック
-deepseek doctor --json                           # 機械可読の診断
-deepseek setup --status                          # 読み取り専用のセットアップ状態
-deepseek setup --tools --plugins                 # ツール／プラグインディレクトリの雛形作成
-deepseek models                                  # ライブ API モデル一覧
-deepseek sessions                                # 保存済みセッション一覧
-deepseek resume --last                           # 最新セッションを再開
-deepseek resume <SESSION_ID>                     # UUID 指定で特定セッションを再開
-deepseek fork <SESSION_ID>                       # 任意のターンでセッションを fork
-deepseek serve --http                            # HTTP/SSE API サーバー
-deepseek serve --acp                             # Zed/カスタムエージェント向け ACP stdio アダプター
-deepseek run pr <N>                              # PR を取得しレビュープロンプトに先行投入
-deepseek mcp list                                # 設定された MCP サーバー一覧
-deepseek mcp validate                            # MCP の設定／接続性を検証
-deepseek mcp-server                              # ディスパッチャー MCP stdio サーバーを実行
-deepseek update                                  # バイナリ更新の確認と適用
+codewhale                                         # インタラクティブ TUI
+codewhale "explain this function"                 # ワンショットプロンプト
+codewhale exec --auto --output-format stream-json "fix this bug"  # ツール自動承認付きの agentic exec
+codewhale exec --resume <SESSION_ID> "follow up"  # 非対話セッションを継続
+codewhale --model deepseek-v4-flash "summarize"   # モデルの上書き
+codewhale --model auto "fix this bug"             # モデルと推論強度を自動ルーティング
+codewhale --yolo                                  # ツールを自動承認
+codewhale auth set --provider deepseek            # API キーの保存
+codewhale doctor                                  # セットアップと接続性のチェック
+codewhale doctor --json                           # 機械可読の診断
+codewhale setup --status                          # 読み取り専用のセットアップ状態
+codewhale setup --tools --plugins                 # ツール／プラグインディレクトリの雛形作成
+codewhale models                                  # ライブ API モデル一覧
+codewhale sessions                                # 保存済みセッション一覧
+codewhale resume --last                           # 最新セッションを再開
+codewhale resume <SESSION_ID>                     # UUID 指定で特定セッションを再開
+codewhale fork <SESSION_ID>                       # 保存済みセッションを兄弟パスに fork
+codewhale serve --http                            # HTTP/SSE API サーバー
+codewhale serve --acp                             # Zed/カスタムエージェント向け ACP stdio アダプター
+codewhale run pr <N>                              # PR を取得しレビュープロンプトに先行投入
+codewhale mcp list                                # 設定された MCP サーバー一覧
+codewhale mcp validate                            # MCP の設定／接続性を検証
+codewhale mcp-server                              # ディスパッチャー MCP stdio サーバーを実行
+codewhale update                                  # バイナリ更新の確認と適用
 ```
 
 ### キーボードショートカット
@@ -283,6 +289,11 @@ deepseek update                                  # バイナリ更新の確認�
 | **Agent** 🤖 | デフォルトのインタラクティブモード — 承認ゲート付きのマルチステップなツール利用。モデルは `checklist_write` で作業を概説 |
 | **YOLO** ⚡ | 信頼できるワークスペースですべてのツールを自動承認。可視性のための計画とチェックリストは引き続き維持 |
 
+モードとモデル自動ルーティングは別物です。`Tab` は Plan / Agent / YOLO
+を切り替え、`/model auto` はモデルと thinking レベルを選びます。`/goal`
+は現時点ではセッション目標と token 予算の追跡であり、将来の Goal
+ワークサーフェスは `--model auto` とは別に扱います。
+
 ---
 
 ## 設定
@@ -298,13 +309,14 @@ deepseek update                                  # バイナリ更新の確認�
 | `DEEPSEEK_HTTP_HEADERS` | 任意のモデルリクエストヘッダー |
 | `DEEPSEEK_MODEL` | デフォルトモデル |
 | `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` | ストリームのアイドルタイムアウト秒数 |
-| `DEEPSEEK_PROVIDER` | `deepseek`（デフォルト）、`nvidia-nim`、`openai`、`atlascloud`、`openrouter`、`novita`、`fireworks`、`sglang`、`vllm`、`ollama` |
+| `DEEPSEEK_PROVIDER` | `codewhale`（デフォルト）、`nvidia-nim`、`openai`、`atlascloud`、`wanjie-ark`、`openrouter`、`novita`、`fireworks`、`sglang`、`vllm`、`ollama` |
 | `DEEPSEEK_PROFILE` | 設定プロファイル名 |
 | `DEEPSEEK_MEMORY` | `on` に設定するとユーザーメモリを有効化 |
 | `DEEPSEEK_ALLOW_INSECURE_HTTP=1` | 信頼できるネットワークで非ローカル `http://` API ベース URL を許可 |
-| `NVIDIA_API_KEY` / `OPENAI_API_KEY` / `ATLASCLOUD_API_KEY` / `OPENROUTER_API_KEY` / `NOVITA_API_KEY` / `FIREWORKS_API_KEY` / `SGLANG_API_KEY` / `VLLM_API_KEY` / `OLLAMA_API_KEY` | プロバイダー認証 |
+| `NVIDIA_API_KEY` / `OPENAI_API_KEY` / `ATLASCLOUD_API_KEY` / `WANJIE_ARK_API_KEY` / `OPENROUTER_API_KEY` / `NOVITA_API_KEY` / `FIREWORKS_API_KEY` / `SGLANG_API_KEY` / `VLLM_API_KEY` / `OLLAMA_API_KEY` | プロバイダー認証 |
 | `OPENAI_BASE_URL` / `OPENAI_MODEL` | 汎用 OpenAI 互換エンドポイントとモデル ID |
 | `ATLASCLOUD_BASE_URL` / `ATLASCLOUD_MODEL` | AtlasCloud エンドポイントとモデル上書き |
+| `WANJIE_ARK_BASE_URL` / `WANJIE_ARK_MODEL` | Wanjie Ark エンドポイントとモデル上書き |
 | `OPENROUTER_BASE_URL` | OpenRouter エンドポイント上書き |
 | `NOVITA_BASE_URL` | Novita エンドポイント上書き |
 | `FIREWORKS_BASE_URL` | Fireworks エンドポイント上書き |
@@ -325,18 +337,19 @@ UI のロケールはモデルの言語とは別です。`settings.toml` で `lo
 
 | モデル | コンテキスト | 入力（キャッシュヒット） | 入力（キャッシュミス） | 出力 |
 |---|---|---|---|---|
-| `deepseek-v4-pro` | 1M | $0.003625 / 1M* | $0.435 / 1M* | $0.87 / 1M* |
+| `deepseek-v4-pro` | 1M | $0.003625 / 1M | $0.435 / 1M | $0.87 / 1M |
 | `deepseek-v4-flash` | 1M | $0.0028 / 1M | $0.14 / 1M | $0.28 / 1M |
 
 レガシーエイリアス `deepseek-chat` / `deepseek-reasoner` は `deepseek-v4-flash` にマップされます。NVIDIA NIM のバリアントはあなたの NVIDIA アカウント条件に従います。
 
-*DeepSeek Pro の料金は現在、期間限定で 75% の割引が適用されており、2026 年 5 月 31 日 15:59 UTC まで有効です。それ以降、TUI のコスト見積もりは Pro の通常料金に戻ります。*
+> [!Note]
+> 上記の V4 Pro レートは恒久的な料金になりました。DeepSeek は、2026 年 5 月 31 日 15:59 UTC に 75% 期間限定割引が終了するタイミングで、元の料金を 4 分の 1 に正式に調整しました。TUI のコスト見積もりはすでにこれらの値を使用しているため、コード上の変更は不要です。今後の価格変更については、公式の [DeepSeek 価格ページ](https://api-docs.deepseek.com/zh-cn/quick_start/pricing) を参照してください。
 
 ---
 
 ## 自分のスキルを公開する
 
-DeepSeek TUI はワークスペースのディレクトリ（`.agents/skills` → `skills` → `.opencode/skills` → `.claude/skills`）とグローバルな `~/.deepseek/skills` からスキルを発見します。各スキルは `SKILL.md` ファイルを持つディレクトリです:
+codewhale はワークスペースのディレクトリ（`.agents/skills` → `skills` → `.opencode/skills` → `.claude/skills`）とグローバルな `~/.deepseek/skills` からスキルを発見します。各スキルは `SKILL.md` ファイルを持つディレクトリです:
 
 ```text
 ~/.deepseek/skills/my-skill/
@@ -383,6 +396,18 @@ description: DeepSeek にカスタムワークフローを実行させたいと�
 
 ---
 
+## サポート
+
+CodeWhale は MIT ライセンスで、利用やコントリビューションにスポンサーは必要ありません。
+継続的なメンテナンスを支援する最も分かりやすい方法は
+[GitHub Sponsors](https://github.com/sponsors/Hmbown) です。単発の支援は
+[Buy Me a Coffee](https://www.buymeacoffee.com/hmbown) からも行えます。
+
+スポンサーは、リリースビルド、CI/ランタイムテスト、パッケージ公開、issue 対応とレビューに使うメンテナー時間を支えます。
+機能リクエスト、バグ報告、pull request にスポンサーは必要ありません。
+
+---
+
 ## 謝辞
 
 このプロジェクトは、増え続けるコントリビューターのコミュニティから助けを得て出荷されています:
@@ -397,7 +422,7 @@ description: DeepSeek にカスタムワークフローを実行させたいと�
 - **[toi500](https://github.com/toi500)** — Windows 貼り付け修正の報告
 - **[xsstomy](https://github.com/xsstomy)** — ターミナル起動時の再描画報告
 - **[melody0709](https://github.com/melody0709)** — スラッシュ接頭辞の Enter アクティベーション報告
-- **[lloydzhou](https://github.com/lloydzhou)** と **[jeoor](https://github.com/jeoor)** — コンパクションコストの報告
+- **[lloydzhou](https://github.com/lloydzhou)** と **[jeoor](https://github.com/jeoor)** — コンパクションコストの報告と npm インストーラのストリーム一時停止競合修正 (#1860)
 - **[Agent-Skill-007](https://github.com/Agent-Skill-007)** — README の明瞭化対応 (#685)
 - **[woyxiang](https://github.com/woyxiang)** — Windows Scoop インストールドキュメント (#696)
 - **[wangfeng](mailto:wangfengcsu@qq.com)** — 料金／割引情報の更新 (#692)
@@ -405,12 +430,114 @@ description: DeepSeek にカスタムワークフローを実行させたいと�
 - **Hafeez Pizofreude** — `fetch_url` の SSRF 保護と Star History チャート
 - **Unic (YuniqueUnic)** — スキーマ駆動の設定 UI（TUI + Web）
 - **Jason** — SSRF セキュリティの強化
+- **[dfwqdyl-ui](https://github.com/dfwqdyl-ui)** — モデル ID の大文字小文字互換性レポート (#729)
+- **[Oliver-ZPLiu](https://github.com/Oliver-ZPLiu)** — `working...` 状態のバグレポート、Windows クリップボードフォールバック、MCP Streamable HTTP セッション修正、Homebrew tap 自動化 (#738, #850, #1643, #1631)
+- **[reidliu41](https://github.com/reidliu41)** — 再開ヒント、ワークスペース信頼の永続化、Ollama プロバイダー対応、thinking-block ストリームの最終処理、CI キャッシュ強化、ストリーミングラップ、DeepSeek モデル補完、ヘルプ選択の改善 (#863, #870, #921, #1078, #1603, #1628, #1601, #1964)
+- **[cyq1017](https://github.com/cyq1017)** — Unicode `git_status` パス、ローカル/設定スキル検出、モード切替トーストの重複防止 (#1953, #1956, #1957)
+- **[xieshutao](https://github.com/xieshutao)** — プレーン Markdown スキルのフォールバック (#869)
+- **[GK012](https://github.com/GK012)** — npm ラッパー `--version` フォールバック (#885)
+- **[y0sif](https://github.com/y0sif)** — 直接子サブエージェント完了後の親ターンループ復帰 (#901)
+- **[mac119](https://github.com/mac119)** と **[leo119](https://github.com/leo119)** — `codewhale update` コマンドのドキュメント (#838, #917)
+- **[dumbjack](https://github.com/dumbjack)** — コマンド安全性の null バイト強化 (#706, #918)
+- **macworkers** — フォーク確認と新しいセッション ID (#600, #919)
+- **zero** と **[zerx-lab](https://github.com/zerx-lab)** — 通知条件設定と OSC 9 通知本文の拡充 (#820, #920)
+- **[chnjames](https://github.com/chnjames)** — @mention 補完キャッシュ、設定リカバリ改善、Windows UTF-8 シェル出力 (#849, #927, #982, #1018)
+- **[angziii](https://github.com/angziii)** — 設定安全性、非同期クリーンアップ、Docker 強化、コマンド安全性修正 (#822, #824, #827, #831, #833, #835, #837)
+- **[elowen53](https://github.com/elowen53)** — UTF-8 デコードと決定論的テストカバレッジ (#825, #840)
+- **[wdw8276](https://github.com/wdw8276)** — カスタムセッションタイトルの `/rename` コマンド (#836)
+- **[banqii](https://github.com/banqii)** — `.cursor/skills` 検出パス対応 (#817)
+- **[junskyeed](https://github.com/junskyeed)** — API リクエストの動的 `max_tokens` 計算 (#826)
+- **[axobase001](https://github.com/axobase001)** — スナップショット孤児クリーンアップ、npm インストールガード、セッションテレメトリ修正、モデルスコープキャッシュクリア、シンボリックリンクスキル対応、npm ミラー迂回ガイダンス、子タスクのプロキシ保持 (#975, #1032, #1047, #1049, #1052, #1019, #1051, #1056, #1608)
+- **[MengZ-super](https://github.com/MengZ-super)** — `/theme` コマンド基盤と SSE gzip/brotli 展開 (#1057, #1061)
+- **[DI-HUO-MING-YI](https://github.com/DI-HUO-MING-YI)** — Plan モードの読み取り専用サンドボックス安全性修正 (#1077)
+- **[bevis-wong](https://github.com/bevis-wong)** — ペースト Enter 自動送信の正確な再現 (#1073)
+- **[Duducoco](https://github.com/Duducoco)** と **[AlphaGogoo](https://github.com/AlphaGogoo)** — スキルスラッシュメニューと `/skills` 範囲修正 (#1068, #1083)
+- **[ArronAI007](https://github.com/ArronAI007)** — macOS Terminal.app と ConHost のウィンドウリサイズアーティファクト修正 (#993)
+- **[THINKER-ONLY](https://github.com/THINKER-ONLY)** — OpenRouter とカスタムエンドポイントのモデル ID 保持 (#1066)
+- **[Jefsky](https://github.com/Jefsky)** — DeepSeek エンドポイント修正レポート (#1079, #1084)
+- **[wlon](https://github.com/wlon)** — NVIDIA NIM プロバイダー API キー優先度診断 (#1081)
+- **[Horace Liu](https://github.com/liuhq)** — Nix パッケージ対応とインストールドキュメント (#1173)
+- **[jieshu666](https://github.com/jieshu666)** — ターミナル再描画のちらつき軽減 (#1563)
+- **[gordonlu](https://github.com/gordonlu)** — Windows Enter / CSI-u 入力修正 (#1612)
+- **[mdrkrg](https://github.com/mdrkrg)** — 初回起動時の API キー欠落クラッシュ修正 (#1598)
+- **[Aitensa](https://github.com/Aitensa)** — diff とページャー出力の CJK 折り返し対応 (#1622)
+- **[qiyan233](https://github.com/qiyan233)** — レガシー DeepSeek CN プロバイダーエイリアス互換性 (#1645)
+- **[zlh124](https://github.com/zlh124)** — WSL2/ヘッドレス起動レポートとクリップボード初期化修正 (#1772, #1773)
+- **[aboimpinto](https://github.com/aboimpinto)** — Windows alt-screen ログ、Home/End コンポーザー、ランタイムログフォローアップ (#1774, #1776, #1748, #1749, #1782, #1783)
+- **[LeoLin990405](https://github.com/LeoLin990405)** — プロバイダーモデル透過、推論リプレイ、thinking-only ターン、Windows 引用修正 (#1740, #1743, #1742, #1744)
+- **[nightt5879](https://github.com/nightt5879)** — Ctrl+C プロンプト復元修正 (#1764)
+- **[h3c-hexin](https://github.com/h3c-hexin)** — ストリーミングバッチツール呼び出し保存と CLI reasoning-effort 透過 (#1686, #1511)
+- **[hxy91819](https://github.com/hxy91819)** — ツール結果整理時のプレフィックスキャッシュ保持 (#1514)
+- **[JiarenWang](https://github.com/JiarenWang)** — Plan モード読み取り専用強制、承認引継ぎ最適化、Ctrl+H 削除修正、undo コンテキスト同期 (#1123, #962, #958, #1150)
+- **[Liu-Vince](https://github.com/Liu-Vince)** — MCP ページネーション、マークダウンインデント保持、zh-Hans i18n 改善、環境変数ドキュメント (#1256, #1179, #1274, #1178)
+- **[ChaceLyee2101](https://github.com/ChaceLyee2101)** — 推論トークンコスト集計と zh-Hans 自動 CNY 表示 (#1505, #1504)
+- **[laoye2020](https://github.com/laoye2020)** — Catppuccin、Tokyo Night、Dracula、Gruvbox テーマと `/theme` ピッカー (#1534)
+- **[punkcanyang](https://github.com/punkcanyang)** — Kitty (OSC 99) と Ghostty (OSC 777) デスクトップ通知対応 (#1426)
+- **[Rene-Kuhm](https://github.com/Rene-Kuhm)** — スペイン語 (es-419) ラテンアメリカローカライズ (#1452)
+- **[ComeFromTheMars](https://github.com/ComeFromTheMars)** — Shift+Up/Down トランスクリプトスクロールショートカット (#1432)
+- **[sockerch](https://github.com/sockerch)** — 全スラッシュコマンドの拼音エイリアス (#1306)
+- **[eltociear](https://github.com/eltociear)** — 日本語 README 翻訳 (#746)
+- **[Ling](https://github.com/LING71671)** — `grep_files` キャンセルトークン対応と Ctrl+Z コンポーザー下書き復元 (#1839, #1911)
+- **[Ben Younes](https://github.com/ousamabenyounes)** — Linux Wayland（非 wlroots）クリップボード対応 (#1938)
+- **[Matt Van Horn](https://github.com/mvanhorn)** — Docker 初回起動権限修正とランタイム system prompt 回帰テスト (#1699, #1702)
+- **[Kristopher Clark](https://github.com/krisclarkdev)** — compaction の user query 保持修正 (#1704)
+- **[tdccccc](https://github.com/tdccccc)** — コンポーザースクロール修正と pager マウスホイール対応 (#1715, #1716)
+- **[LittleBlacky](https://github.com/LittleBlacky)** — provider gated `reasoning_content` ストリーム修正 (#1680)
+- **[Anaheim](https://github.com/AnaheimEX)** — `rlm_open` 空 source schema 検証レポート (#1712)
+- **[THatch26](https://github.com/THatch26)** — ターミナル resize 後のページング修正 (#1724)
+- **[Alvin](https://github.com/alvin1)** — Zed ACP id 互換性レポート (#1696)
+- **[knqiufan](https://github.com/knqiufan)** — sub-agent ファイル書き込み委譲 (#1833)
+- **[IIzzaya](https://github.com/IIzzaya)** — slash 補完の exact alias 優先アイデア (#1811)
+- **[DC](https://github.com/duanchao-lab)** — ターミナル cleanup guard のアイデア (#1630)
+- **[imkingjh999](https://github.com/imkingjh999)** — provider/model 切り替え修正 (#1642)
+- **[Photo](https://github.com/eng2007)** — provider-aware `/model` picker catalog 作業 (#1201)
+- **[chennest](https://github.com/chennest)** — diagnostics schema レポート (#1685)
+- **[kunpeng-ai-lab](https://github.com/kunpeng-ai-lab)** — Windows コンポーザースクロール修正 (#1578)
+- **[WuMing](https://github.com/asdfg314284230)** — Windows PowerShell ちらつき修正 (#1591)
+- **[maker316](https://github.com/maker316)** — LoopGuard/checklist ループレポート (#1574)
+- **[lalala](https://github.com/lalala-233)** — approval denial 回帰レポート (#1617)
+- **[muyuliyan](https://github.com/muyuliyan)** — `pandoc_convert` 検証修正 (#1523)
+- **[czf0718](https://github.com/czf0718)** — resize と turn-completion のちらつき修正 (#1537)
+- **[MeAiRobot](https://github.com/MeAiRobot)** — toast がコンポーザー入力を覆う問題の修正 (#1485)
+- **[tiger-dog](https://github.com/tiger-dog)** — approval modal 折りたたみと markdown identifier 修正 (#1455)
+- **[MMMarcinho](https://github.com/MMMarcinho)** — opt-in `image_analyze` vision tool (#1467)
+- **[lucaszhu-hue](https://github.com/lucaszhu-hue)** — AtlasCloud provider 統合 (#1436)
+- **[sandofree](https://github.com/sandofree)** — Tavily と Bocha の `web_search` backend (#1294)
+- **[zhuangbiaowei](https://github.com/zhuangbiaowei)** — `/change` release notes コマンド (#1416)
+- **[NorethSea](https://github.com/NorethSea)** — updater companion binary refresh 修正 (#1492)
+- **[Jianfengwu2024](https://github.com/Jianfengwu2024)** — Windows MSVC toolchain 環境保持 (#1487)
+- **[Fire-dtx](https://github.com/Fire-dtx)** — npm postinstall recoverability 作業 (#1059)
+- **[oooyuy92](https://github.com/oooyuy92)** — 長時間セッション palette 可読性レポート (#1070, #936)
+- **[qinxianyuzou](https://github.com/qinxianyuzou)** — zh-Hans destructive approval 文言 (#1087, #1091)
+- **[tyouter](https://github.com/tyouter)** — session title/history preview クリーンアップ (#1510)
+- **[xulongzhe](https://github.com/xulongzhe)** — issue template と vision boundary follow-up (#1530, #1544)
+- **[YaYII](https://github.com/YaYII)** — trusted media path 作業 (#1462)
+- **[47Cid](https://github.com/47Cid)** と **[Jafar Akhondali](https://github.com/JafarAkhondali)** — 責任ある security disclosure と hardening レポート
+- **[linzhiqin2003](https://github.com/linzhiqin2003)** — `--model auto` コスト節約バイアス、実行規律プロンプト、宣言的事実メモリ衛生 (#1385, #1384, #1381)
+- **[lbcheng888](https://github.com/lbcheng888)** — 保存/復元間のコスト永続化とトランスクリプトスクロール修正 (#1192, #1211)
+- **[pengyou200902](https://github.com/pengyou200902)** — UTF-8 安全メモリ切り捨て、切り捨てマーカー精度、キーバインドドキュメント (#968, #1122, #1095)
+- **[CrepuscularIRIS](https://github.com/CrepuscularIRIS)** — Termius/SSH 向け低モーション検出と npx MCP サーバーサンドボックス修正 (#1479, #1346)
+- **[sternelee](https://github.com/sternelee)** — DeepSeek プレフィックスキャッシュ安定性追跡 (#1517)
+- **[Apeiron0w0](https://github.com/Apeiron0w0)** — Tabby ターミナルちらつきループの FocusGained デバウンス (#1560)
+- **[greyfreedom](https://github.com/greyfreedom)** — 最新トランスクリプトへのジャンプボタン (#969)
+- **[SamhandsomeLee](https://github.com/SamhandsomeLee)** — 明示的隠しファイルメンション補完 (#1270)
+- **[dst1213](https://github.com/dst1213)** — クォータエラー HTTP 400 リトライ (#1203)
+- **[fuleinist](https://github.com/fuleinist)** — `--yolo` フラグの CLI から TUI への転送 (#1233)
+- **[heloanc](https://github.com/heloanc)** — Home/End キーコンポーザーサポート (#1246)
+- **[jinpengxuan](https://github.com/jinpengxuan)** — オンボーディング中のアクティブプロバイダー認証情報保持 (#1265)
+- **[lixiasky-back](https://github.com/lixiasky-back)** — 検証済み npm バイナリ採用 (#1339)
+- **[J3y0r](https://github.com/J3y0r)** — ワークスペース切り替えコマンド (#1065)
+- **[KhalidAlnujaidi](https://github.com/KhalidAlnujaidi)** — delegate スキルバンドル (#1144)
+- **[Wenjunyun123](https://github.com/Wenjunyun123)** — ドキュメントアンカーオフセット保持 (#1282)
+- **[whtis](https://github.com/whtis)** — zh-CN README ディスパッチャーパス同期 (#1235)
+- **[aqilaziz](https://github.com/aqilaziz)** — memory スキルリンク修正 (#1095)
+- **[wuwuzhijing](https://github.com/wuwuzhijing)** — rsproxy rustup 回避策インストールドキュメント (#1011)
 
 ---
 
 ## コントリビューション
 
-[CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。プルリクエストを歓迎します。良い初コントリビューションは [Open Issues](https://github.com/Hmbown/DeepSeek-TUI/issues) を確認してください。
+[CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。プルリクエストを歓迎します。良い初コントリビューションは [Open Issues](https://github.com/Hmbown/CodeWhale/issues) を確認してください。
 
 > [!Note]
 > *DeepSeek Inc. とは関係ありません。*
@@ -421,4 +548,4 @@ description: DeepSeek にカスタムワークフローを実行させたいと�
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/chart?repos=Hmbown/DeepSeek-TUI&type=date&legend=top-left)](https://www.star-history.com/?repos=Hmbown%2FDeepSeek-TUI&type=date&logscale=&legend=top-left)
+[![Star History Chart](https://api.star-history.com/chart?repos=Hmbown/CodeWhale&type=date&legend=top-left)](https://www.star-history.com/?repos=Hmbown%2FCodeWhale&type=date&logscale=&legend=top-left)

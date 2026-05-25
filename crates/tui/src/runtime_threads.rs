@@ -865,6 +865,15 @@ impl RuntimeThreadManager {
                 err
             );
         }
+
+        {
+            let mut active = self.active.lock().await;
+            if let Some(state) = active.engines.get_mut(thread_id) {
+                if let Some(turn) = state.active_turn.as_mut() {
+                    turn.auto_approve = true;
+                }
+            }
+        }
     }
 
     #[must_use]
@@ -1964,6 +1973,9 @@ impl RuntimeThreadManager {
                 rlm_sessions: crate::rlm::session::new_shared_rlm_session_store(),
             },
             subagent_model_overrides: self.config.subagent_model_overrides(),
+            subagent_api_timeout: std::time::Duration::from_secs(
+                self.config.subagent_api_timeout_secs(),
+            ),
             memory_enabled: self.config.memory_enabled(),
             memory_path: self.config.memory_path(),
             vision_config: self.config.vision_model_config(),
@@ -2456,8 +2468,7 @@ impl RuntimeThreadManager {
                     ..
                 } => {
                     let message = format!(
-                        "Capacity intervention: {action} (~{before_prompt_tokens} -> ~{after_prompt_tokens}) replay={:?} replan={replan_performed}",
-                        replay_outcome
+                        "Capacity intervention: {action} (~{before_prompt_tokens} -> ~{after_prompt_tokens}) replay={replay_outcome:?} replan={replan_performed}"
                     );
                     let item = TurnItemRecord {
                         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
@@ -4468,7 +4479,7 @@ mod tests {
         assert!(!manager.store.load_thread(&thread.id)?.auto_approve);
 
         let mut harness = install_mock_engine(&manager, &thread.id).await;
-        let _turn = manager
+        let turn = manager
             .start_turn(
                 &thread.id,
                 StartTurnRequest {
@@ -4511,6 +4522,11 @@ mod tests {
         assert!(
             manager.store.load_thread(&thread.id)?.auto_approve,
             "remember=true should flip thread auto_approve"
+        );
+        assert_eq!(
+            manager.active_turn_flags(&thread.id, &turn.id).await,
+            Some((true, false)),
+            "remember=true should update the active turn used by subsequent approvals"
         );
 
         harness

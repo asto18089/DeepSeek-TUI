@@ -95,8 +95,8 @@ fn env_only_auth_error_gets_recovery_hint() {
 
     assert!(message.contains("DEEPSEEK_API_KEY"));
     assert!(message.contains("no saved config key is present"));
-    assert!(message.contains("deepseek auth status"));
-    assert!(message.contains("deepseek auth set --provider deepseek"));
+    assert!(message.contains("codewhale auth status"));
+    assert!(message.contains("codewhale auth set --provider deepseek"));
 }
 
 #[test]
@@ -402,6 +402,7 @@ fn non_yolo_mode_retains_default_defer_policy() {
     assert!(!should_default_defer_tool("exec_shell", AppMode::Agent));
     assert!(should_default_defer_tool("exec_shell", AppMode::Plan));
     assert!(!should_default_defer_tool("read_file", AppMode::Agent));
+    assert!(!should_default_defer_tool("write_file", AppMode::Agent));
     assert!(should_default_defer_tool(
         "mcp_read_resource",
         AppMode::Agent
@@ -413,6 +414,7 @@ fn model_tool_catalog_applies_native_and_mcp_deferral() {
     let catalog = build_model_tool_catalog(
         vec![
             api_tool("read_file"),
+            api_tool("write_file"),
             api_tool("exec_shell"),
             api_tool("project_map"),
         ],
@@ -428,6 +430,7 @@ fn model_tool_catalog_applies_native_and_mcp_deferral() {
     };
 
     assert_eq!(defer_loading("read_file"), Some(false));
+    assert_eq!(defer_loading("write_file"), Some(false));
     assert_eq!(defer_loading("exec_shell"), Some(false));
     assert_eq!(defer_loading("project_map"), Some(true));
     assert_eq!(defer_loading("list_mcp_resources"), Some(false));
@@ -1753,7 +1756,7 @@ async fn code_execution_runs_python_and_returns_result_payload() {
 }
 
 #[test]
-fn plan_mode_catalog_skips_code_execution_tool() {
+fn plan_mode_catalog_skips_code_execution_tool_but_agent_keeps_it() {
     let mut plan_catalog = vec![api_tool("read_file")];
     ensure_advanced_tooling(&mut plan_catalog, AppMode::Plan);
     assert!(
@@ -1870,7 +1873,7 @@ fn filter_tool_call_delta_strips_bracket_marker() {
 fn filter_tool_call_delta_strips_deepseek_xml_marker() {
     let mut in_block = false;
     let visible = filter_tool_call_delta(
-        "before <deepseek:tool_call name=\"x\">payload</deepseek:tool_call> after",
+        "before <codewhale:tool_call name=\"x\">payload</codewhale:tool_call> after",
         &mut in_block,
     );
     assert!(!in_block);

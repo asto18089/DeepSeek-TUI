@@ -1,80 +1,84 @@
-# DeepSeek TUI
+# CodeWhale
 
-> **面向 [DeepSeek V4](https://platform.deepseek.com) 的终端原生编程智能体：100 万 token 上下文、思考模式流式推理、前缀缓存感知。自包含 Rust 二进制发布——开箱即带 MCP 客户端、沙箱和持久化任务队列。**
+> **DeepSeek 优先、面向开源与开放权重编码模型的终端原生编程智能体：100 万 token 上下文、思考模式流式推理、前缀缓存感知。自包含 Rust 二进制发布——开箱即带 MCP 客户端、沙箱和持久化任务队列。**
+
+[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/codewhale)](https://www.npmjs.com/package/codewhale)
+[![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
+[![Sponsor](https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/Hmbown)
+[DeepWiki project index](https://deepwiki.com/Hmbown/CodeWhale)
 
 [English README](README.md)
 [日本語 README](README.ja-JP.md)
 
+[安装](#安装) · [快速开始](#快速开始) · [使用方式](#使用方式) · [文档](#文档) · [贡献](#贡献) · [支持](#支持)
+
 ## 安装
 
-`deepseek` 是自包含 Rust 二进制——**运行时不依赖 Node.js 或 Python**。
+`codewhale` 是自包含 Rust 二进制——**运行时不依赖 Node.js 或 Python**。
 下面几种方式装出来的是同一套二进制，按你已有的工具链选一个即可：
 
 ```bash
 # 1. npm —— 已装 Node 的最方便方式。npm 包只是一个下载器，
 #    会从 GitHub Releases 拉取对应平台的预编译二进制，
-#    并不会让 deepseek 本身依赖 Node 运行时。
-npm install -g deepseek-tui
+#    并不会让 codewhale 本身依赖 Node 运行时。
+npm install -g codewhale
 
 # 2. Cargo —— 无需 Node。
-cargo install deepseek-tui-cli --locked   # `deepseek` 入口
-cargo install deepseek-tui     --locked   # `deepseek-tui` TUI 二进制
+cargo install codewhale-cli --locked   # `codewhale` 入口
+cargo install codewhale-tui     --locked   # `codewhale-tui` TUI 二进制
 
 # 3. Homebrew —— macOS 包管理器。
 brew tap Hmbown/deepseek-tui
 brew install deepseek-tui
 
 # 4. 直接下载 —— 无需任何工具链。
-#    https://github.com/Hmbown/DeepSeek-TUI/releases
+#    https://github.com/Hmbown/CodeWhale/releases
 #    覆盖 Linux x64/ARM64、macOS x64/ARM64、Windows x64
 
 # 5. Docker —— 预构建发布镜像。
-docker volume create deepseek-tui-home
+docker volume create codewhale-home
 docker run --rm -it \
   -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
-  -v deepseek-tui-home:/home/deepseek/.deepseek \
+  -v codewhale-home:/home/codewhale/.deepseek \
   -v "$PWD:/workspace" \
   -w /workspace \
-  ghcr.io/hmbown/deepseek-tui:latest
+  ghcr.io/hmbown/codewhale:latest
 ```
 
 > 中国大陆访问较慢时，npm 可加 `--registry=https://registry.npmmirror.com`，
 > 或使用下方的 [Cargo 镜像](#中国大陆--镜像友好安装)。
 >
 > 下载安全：官方二进制只发布在
-> `https://github.com/Hmbown/DeepSeek-TUI/releases`。手动下载时请校验
+> `https://github.com/Hmbown/CodeWhale/releases`。手动下载时请校验
 > SHA-256 manifest，并避免相似仓库名或搜索结果里的镜像站。详见
 > [下载安全与校验](docs/INSTALL.md#2-download-safety-and-checksums)。
 
 已经安装过？按你的安装方式更新：
 
 ```bash
-deepseek update                         # release 二进制更新器
-npm install -g deepseek-tui@latest      # npm 包装器
+codewhale update                         # release 二进制更新器
+npm install -g codewhale@latest      # npm 包装器
 brew update && brew upgrade deepseek-tui
-cargo install deepseek-tui-cli --locked --force
-cargo install deepseek-tui     --locked --force
+cargo install codewhale-cli --locked --force
+cargo install codewhale-tui     --locked --force
 ```
 
-[![CI](https://github.com/Hmbown/DeepSeek-TUI/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/DeepSeek-TUI/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/deepseek-tui)](https://www.npmjs.com/package/deepseek-tui)
-[![crates.io](https://img.shields.io/crates/v/deepseek-tui-cli?label=crates.io)](https://crates.io/crates/deepseek-tui-cli)
-[DeepWiki project index](https://deepwiki.com/Hmbown/DeepSeek-TUI)
-
-![DeepSeek TUI 截图](assets/screenshot.png)
+![codewhale 截图](assets/screenshot.png)
 
 ---
 
 ## 这是什么？
 
-DeepSeek TUI 是一个完全运行在终端里的编程智能体。它让 DeepSeek 前沿模型直接访问你的工作区：读写文件、运行 shell 命令、搜索浏览网页、管理 git、调度子智能体——全部通过快速、键盘驱动的 TUI 完成。
+codewhale 是一个完全运行在终端里的编程智能体。它让 DeepSeek 前沿模型直接访问你的工作区：读写文件、运行 shell 命令、搜索浏览网页、管理 git、调度子智能体——全部通过快速、键盘驱动的 TUI 完成。
 
 它面向 **DeepSeek V4**（`deepseek-v4-pro` / `deepseek-v4-flash`）构建，原生支持 100 万 token 上下文窗口和思考模式流式输出。
 
 ### 主要功能
 
-- **Auto 模式** —— `--model auto` / `/model auto` 每轮自动选择模型和推理强度
-- **原生 RLM**（`rlm_open`/`rlm_eval`）—— 持久化 REPL 会话用于批量分析；使用带界面的辅助函数（`peek`、`search`、`chunk`、`sub_query_batch`）运行低成本 `deepseek-v4-flash` 子任务
+- **模型自动路由** —— `--model auto` / `/model auto` 每轮自动选择模型和推理强度
+- **Fin 快速通道** —— 使用关闭思考的低成本 `deepseek-v4-flash` 承担路由、RLM 子调用、摘要和协调工作
+- **原生 RLM**（`rlm_open`/`rlm_eval`）—— 持久化 REPL 会话用于批量分析；使用带界面的辅助函数（`peek`、`search`、`chunk`、`sub_query_batch`）
 - **思考模式流式输出** —— 实时观察模型在解决问题时的思维链展开
 - **完整工具集** —— 文件操作、shell 执行、git、网页搜索/浏览、apply-patch、子智能体、MCP 服务器
 - **100 万 token 上下文** —— 上下文跟踪、手动或配置驱动的压缩，以及前缀缓存遥测
@@ -84,7 +88,7 @@ DeepSeek TUI 是一个完全运行在终端里的编程智能体。它让 DeepSe
 - **会话保存和恢复** —— 长任务的断点续作
 - **工作区回滚** —— 通过 side-git 记录每轮前后快照，支持 `/restore` 和 `revert_turn`，不影响项目自己的 `.git`
 - **持久化任务队列** —— 后台任务在重启后仍然存在，支持计划任务和长时间运行的操作
-- **HTTP/SSE 运行时 API** —— `deepseek serve --http` 用于无界面智能体流程
+- **HTTP/SSE 运行时 API** —— `codewhale serve --http` 用于无界面智能体流程
 - **MCP 协议** —— 连接 Model Context Protocol 服务器扩展工具，见 [docs/MCP.md](docs/MCP.md)
 - **LSP 诊断** —— 每次编辑后通过 rust-analyzer、pyright、typescript-language-server、gopls、clangd 提供内联错误/警告
 - **用户记忆** —— 可选的持久化笔记文件注入系统提示，实现跨会话偏好保持
@@ -98,17 +102,17 @@ DeepSeek TUI 是一个完全运行在终端里的编程智能体。它让 DeepSe
 
 ## 架构说明
 
-`deepseek`（调度器 CLI）→ `deepseek-tui`（伴随二进制）→ ratatui 界面 ↔ 异步引擎 ↔ OpenAI 兼容流式客户端。工具调用通过类型化注册表（shell、文件操作、git、web、子智能体、MCP、RLM）路由，结果流式返回对话记录。引擎管理会话状态、轮次追踪、持久化任务队列和 LSP 子系统——它在下一步推理前将编辑后诊断反馈到模型上下文中。
+`codewhale`（调度器 CLI）→ `codewhale-tui`（伴随二进制）→ ratatui 界面 ↔ 异步引擎 ↔ OpenAI 兼容流式客户端。工具调用通过类型化注册表（shell、文件操作、git、web、子智能体、MCP、RLM）路由，结果流式返回对话记录。引擎管理会话状态、轮次追踪、持久化任务队列和 LSP 子系统——它在下一步推理前将编辑后诊断反馈到模型上下文中。
 
 详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ### 子智能体：并发后台执行
 
-DeepSeek TUI 可以同时调度多个子智能体并行运行——类似于并发任务队列：
+codewhale 可以同时调度多个子智能体并行运行——类似于并发任务队列：
 
 - **非阻塞启动。** `agent_open` 立即返回。子智能体获得独立的上下文和工具注册表，独立运行。父进程继续工作。
 - **后台执行。** 子智能体并发运行（默认上限 10，可配置至 20）。引擎管理线程池——无需轮询循环。
-- **完成通知。** 子智能体完成后，运行时发送结构化的 `<deepseek:subagent.done>` 事件，包含摘要、证据列表和执行指标。父模型读取 `summary` 字段并整合结果。
+- **完成通知。** 子智能体完成后，运行时发送结构化的 `<codewhale:subagent.done>` 事件，包含摘要、证据列表和执行指标。父模型读取 `summary` 字段并整合结果。
 - **按需读取结果。** 大型对话记录暂存为 `var_handle` 引用。模型通过 `handle_read` 按切片、范围或 JSONPath 投影读取——保持父上下文精简。
 
 详见 [docs/SUBAGENTS.md](docs/SUBAGENTS.md)。
@@ -118,9 +122,9 @@ DeepSeek TUI 可以同时调度多个子智能体并行运行——类似于并�
 ## 快速开始
 
 ```bash
-npm install -g deepseek-tui
-deepseek --version
-deepseek --model auto
+npm install -g codewhale
+codewhale --version
+codewhale --model auto
 ```
 
 预构建二进制覆盖 **Linux x64**、**Linux ARM64**（v0.8.8 起）、**macOS x64**、**macOS ARM64** 和 **Windows x64**。其他目标平台（musl、riscv64、FreeBSD 等）请见下方的[从源码安装](#从源码安装)或 [docs/INSTALL.md](docs/INSTALL.md)。
@@ -130,16 +134,16 @@ deepseek --model auto
 也可以提前配置：
 
 ```bash
-deepseek auth set --provider deepseek   # 保存到 ~/.deepseek/config.toml
+codewhale auth set --provider deepseek   # 保存到 ~/.deepseek/config.toml
 
-deepseek auth status                    # 显示当前活跃的凭证来源
+codewhale auth status                    # 显示当前活跃的凭证来源
 export DEEPSEEK_API_KEY="YOUR_KEY"      # 环境变量方式；需要在非交互式 shell 中使用请放入 ~/.zshenv
-deepseek
+codewhale
 
-deepseek doctor                          # 验证安装
+codewhale doctor                          # 验证安装
 ```
 
-> 轮换或移除密钥：`deepseek auth clear --provider deepseek`。
+> 轮换或移除密钥：`codewhale auth clear --provider deepseek`。
 
 ### 腾讯云 / CNB 远程优先路径
 
@@ -151,24 +155,24 @@ CNB 镜像/源码，腾讯云 Lighthouse 香港实例，飞书/Lark 长连接桥
 先看 [docs/TENCENT_CLOUD_REMOTE_FIRST.md](docs/TENCENT_CLOUD_REMOTE_FIRST.md)，
 再按 [docs/TENCENT_LIGHTHOUSE_HK.md](docs/TENCENT_LIGHTHOUSE_HK.md) 配置服务器。
 
-### Auto 模式
+### 模型自动路由与 Fin
 
-使用 `deepseek --model auto` 或 `/model auto` 让 DeepSeek TUI 自行决定每轮需要多少模型和推理能力。
+使用 `codewhale --model auto` 或 `/model auto` 让 codewhale 自行决定每轮需要多少模型和推理能力。
 
-Auto 模式同时控制两个设置：
+模型自动路由同时控制两个设置：
 
 - 模型：`deepseek-v4-flash` 或 `deepseek-v4-pro`
 - 推理强度：`off`、`high` 或 `max`
 
-在真实请求发出之前，应用会先用关闭推理的 `deepseek-v4-flash` 进行一次小型路由调用。路由器审视最新请求和最近的上下文，然后为真实请求选定具体的模型和推理强度。简短/简单的轮次保持在 Flash + 关闭推理；编码、调试、发布、架构、安全审查或模糊的多步骤任务可升级到 Pro 和/或更高推理强度。
+在真实请求发出之前，应用会先用关闭推理的 `deepseek-v4-flash` 进行一次小型路由调用。这条快速路径叫 **Fin**：用于模型选择、摘要、RLM 子任务、上下文维护以及其他不该消耗完整推理轮次的协调工作。Fin 审视最新请求和最近的上下文，然后为真实请求选定具体的模型和推理强度。简短/简单的轮次保持在 Flash + 关闭推理；编码、调试、发布、架构、安全审查或模糊的多步骤任务可升级到 Pro 和/或更高推理强度。
 
-`auto` 是 DeepSeek TUI 本地行为。上游 API 永远不会收到 `model: "auto"`，它只会收到为当前轮次选定的具体模型和推理强度设置。TUI 会显示选定的路由，成本跟踪按实际运行的模型计费。如果路由调用失败或返回无效答案，应用会回退到本地启发式规则。子智能体会继承 auto 模式，除非你为它们指定了显式模型。
+`--model auto` 和 `/model auto` 是 codewhale 本地行为。上游 API 永远不会收到 `model: "auto"`，它只会收到为当前轮次选定的具体模型和推理强度设置。TUI 会显示选定的路由，成本跟踪按实际运行的模型计费。如果 Fin 路由失败或返回无效答案，应用会回退到本地启发式规则。子智能体会继承模型自动路由，除非你为它们指定了显式模型。
 
 需要可重复基准测试、严格控制成本上限或特定提供商/模型映射时，请使用固定模型或固定推理强度。
 
 ### Linux ARM64（HarmonyOS 轻薄本、openEuler、Kylin、树莓派、Graviton 等）
 
-从 v0.8.8 起，`npm i -g deepseek-tui` 直接支持 glibc 系的 ARM64 Linux。你也可以从 [Releases 页面](https://github.com/Hmbown/DeepSeek-TUI/releases) 下载预编译二进制，放到 `PATH` 目录中。
+从 v0.8.8 起，`npm i -g codewhale` 直接支持 glibc 系的 ARM64 Linux。你也可以从 [Releases 页面](https://github.com/Hmbown/CodeWhale/releases) 下载预编译二进制，放到 `PATH` 目录中。
 
 ### 中国大陆 / 镜像友好安装
 
@@ -186,23 +190,23 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
 然后安装两个二进制（调度器在运行时会调用 TUI）：
 
 ```bash
-cargo install deepseek-tui-cli --locked   # 提供推荐入口 `deepseek`
-cargo install deepseek-tui     --locked   # 提供交互式 TUI 伴随二进制
-deepseek --version
+cargo install codewhale-cli --locked   # 提供推荐入口 `codewhale`
+cargo install codewhale-tui     --locked   # 提供交互式 TUI 伴随二进制
+codewhale --version
 ```
 
-也可以直接从 [GitHub Releases](https://github.com/Hmbown/DeepSeek-TUI/releases) 下载预编译二进制。`DEEPSEEK_TUI_RELEASE_BASE_URL` 可用于镜像后的 release 资产。
+也可以直接从 [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases) 下载预编译二进制。`DEEPSEEK_TUI_RELEASE_BASE_URL` 可用于镜像后的 release 资产。
 
 ### Windows (Scoop)
 
-[Scoop](https://scoop.sh) 是一个 Windows 软件包管理器。DeepSeek TUI 已进入
+[Scoop](https://scoop.sh) 是一个 Windows 软件包管理器。codewhale 已进入
 Scoop main bucket，但该 manifest 独立更新，可能滞后于 GitHub/npm/Cargo
-release。先运行 `scoop update`，安装后用 `deepseek --version` 核对版本：
+release。先运行 `scoop update`，安装后用 `codewhale --version` 核对版本：
 
 ```bash
 scoop update
 scoop install deepseek-tui
-deepseek --version
+codewhale --version
 ```
 
 如果需要最新版本，请优先使用 npm 或直接下载 GitHub Release 资产。
@@ -218,11 +222,11 @@ deepseek --version
 #   sudo apt-get install -y build-essential pkg-config libdbus-1-dev
 #   sudo dnf install -y gcc make pkgconf-pkg-config dbus-devel
 
-git clone https://github.com/Hmbown/DeepSeek-TUI.git
-cd DeepSeek-TUI
+git clone https://github.com/Hmbown/CodeWhale.git
+cd CodeWhale
 
-cargo install --path crates/cli --locked   # 需要 Rust 1.88+；提供 `deepseek`
-cargo install --path crates/tui --locked   # 提供 `deepseek-tui`
+cargo install --path crates/cli --locked   # 需要 Rust 1.88+；提供 `codewhale`
+cargo install --path crates/tui --locked   # 提供 `codewhale-tui`
 ```
 
 两个二进制都需要安装。交叉编译和平台特定说明见 [docs/INSTALL.md](docs/INSTALL.md)。
@@ -233,44 +237,47 @@ cargo install --path crates/tui --locked   # 提供 `deepseek-tui`
 
 ```bash
 # NVIDIA NIM
-deepseek auth set --provider nvidia-nim --api-key "YOUR_NVIDIA_API_KEY"
-deepseek --provider nvidia-nim
+codewhale auth set --provider nvidia-nim --api-key "YOUR_NVIDIA_API_KEY"
+codewhale --provider nvidia-nim
 
 # AtlasCloud
-deepseek auth set --provider atlascloud --api-key "YOUR_ATLASCLOUD_API_KEY"
-deepseek --provider atlascloud
+codewhale auth set --provider atlascloud --api-key "YOUR_ATLASCLOUD_API_KEY"
+codewhale --provider atlascloud
+
+# Wanjie Ark
+codewhale auth set --provider wanjie-ark --api-key "YOUR_WANJIE_API_KEY"
+codewhale --provider wanjie-ark --model deepseek-reasoner
 
 # OpenRouter
-deepseek auth set --provider openrouter --api-key "YOUR_OPENROUTER_API_KEY"
-deepseek --provider openrouter --model deepseek/deepseek-v4-pro
+codewhale auth set --provider openrouter --api-key "YOUR_OPENROUTER_API_KEY"
+codewhale --provider openrouter --model deepseek/deepseek-v4-pro
 
 # Novita
-deepseek auth set --provider novita --api-key "YOUR_NOVITA_API_KEY"
-deepseek --provider novita --model deepseek/deepseek-v4-pro
+codewhale auth set --provider novita --api-key "YOUR_NOVITA_API_KEY"
+codewhale --provider novita --model deepseek/deepseek-v4-pro
 
 # Fireworks
-deepseek auth set --provider fireworks --api-key "YOUR_FIREWORKS_API_KEY"
-deepseek --provider fireworks --model deepseek-v4-pro
+codewhale auth set --provider fireworks --api-key "YOUR_FIREWORKS_API_KEY"
+codewhale --provider fireworks --model deepseek-v4-pro
 
 # 通用 OpenAI 兼容端点
-deepseek auth set --provider openai --api-key "YOUR_OPENAI_COMPATIBLE_API_KEY"
-OPENAI_BASE_URL="https://openai-compatible.example/v4" deepseek --provider openai --model glm-5
+codewhale auth set --provider openai --api-key "YOUR_OPENAI_COMPATIBLE_API_KEY"
+OPENAI_BASE_URL="https://openai-compatible.example/v4" codewhale --provider openai --model glm-5
 
 # 自托管 SGLang
-SGLANG_BASE_URL="http://localhost:30000/v1" deepseek --provider sglang --model deepseek-v4-flash
+SGLANG_BASE_URL="http://localhost:30000/v1" codewhale --provider sglang --model deepseek-v4-flash
 
 # 自托管 vLLM
-VLLM_BASE_URL="http://localhost:8000/v1" deepseek --provider vllm --model deepseek-v4-flash
+VLLM_BASE_URL="http://localhost:8000/v1" codewhale --provider vllm --model deepseek-v4-flash
 
 # 自托管 Ollama
-ollama pull deepseek-coder:1.3b
-deepseek --provider ollama --model deepseek-coder:1.3b
+ollama pull codewhale-coder:1.3b
+codewhale --provider ollama --model codewhale-coder:1.3b
 ```
 
-在 TUI 内，`/provider` 打开提供方选择器，`/model` 打开模型选择器。
-`/provider openrouter` 和 `/model <id>` 可直接切换；`/models` 会列出
-API 返回的实时模型。`/model` 选择器会优先使用当前提供方的实时模型
-目录，不可用时再回退到 provider-aware 默认模型列表。
+在 TUI 内，`/provider` 打开提供方选择器，`/model` 打开本地模型/思考模式
+选择器。`/provider openrouter` 和 `/model <id>` 可直接切换；`/models` 会在
+当前提供方支持模型列表时显式请求并列出 API 返回的实时模型。
 
 ---
 
@@ -284,43 +291,43 @@ API 返回的实时模型。`/model` 选择器会优先使用当前提供方的�
 ## 使用方式
 
 ```bash
-deepseek                                       # 交互式 TUI
-deepseek "explain this function"              # 一次性提示
-deepseek exec --auto --output-format stream-json "fix this bug" # 面向后端集成的 NDJSON 流
-deepseek exec --resume <SESSION_ID> "follow up" # 继续非交互会话
-deepseek --model deepseek-v4-flash "summarize" # 指定模型
-deepseek --model auto "fix this bug"          # 自动选择模型 + 推理强度
-deepseek --yolo                                # 自动批准工具
-deepseek auth set --provider deepseek         # 保存 API key
-deepseek doctor                                # 检查配置和连接
-deepseek doctor --json                         # 机器可读诊断
-deepseek setup --status                        # 只读安装状态
-deepseek setup --tools --plugins               # 创建本地工具和插件目录
-deepseek models                                # 列出可用 API 模型
-deepseek sessions                              # 列出已保存会话
-deepseek resume --last                         # 恢复最近会话
-deepseek resume <SESSION_ID>                   # 按 UUID 恢复指定会话
-deepseek fork <SESSION_ID>                     # 在指定轮次分叉会话
-deepseek serve --http                          # HTTP/SSE API 服务
-deepseek serve --acp                           # Zed/自定义智能体的 ACP stdio 适配器
-deepseek run pr <N>                            # 获取 PR 并预填审查提示
-deepseek mcp list                              # 列出已配置 MCP 服务器
-deepseek mcp validate                          # 校验 MCP 配置和连接
-deepseek mcp-server                            # 启动 dispatcher MCP stdio 服务器
-deepseek update                                # 检查并应用二进制更新
+codewhale                                       # 交互式 TUI
+codewhale "explain this function"              # 一次性提示
+codewhale exec --auto --output-format stream-json "fix this bug" # 自动批准工具的 agentic exec
+codewhale exec --resume <SESSION_ID> "follow up" # 继续非交互会话
+codewhale --model deepseek-v4-flash "summarize" # 指定模型
+codewhale --model auto "fix this bug"          # 自动路由模型 + 推理强度
+codewhale --yolo                                # 自动批准工具
+codewhale auth set --provider deepseek         # 保存 API key
+codewhale doctor                                # 检查配置和连接
+codewhale doctor --json                         # 机器可读诊断
+codewhale setup --status                        # 只读安装状态
+codewhale setup --tools --plugins               # 创建本地工具和插件目录
+codewhale models                                # 列出可用 API 模型
+codewhale sessions                              # 列出已保存会话
+codewhale resume --last                         # 恢复最近会话
+codewhale resume <SESSION_ID>                   # 按 UUID 恢复指定会话
+codewhale fork <SESSION_ID>                     # 将已保存会话分叉为兄弟路径
+codewhale serve --http                          # HTTP/SSE API 服务
+codewhale serve --acp                           # Zed/自定义智能体的 ACP stdio 适配器
+codewhale run pr <N>                            # 获取 PR 并预填审查提示
+codewhale mcp list                              # 列出已配置 MCP 服务器
+codewhale mcp validate                          # 校验 MCP 配置和连接
+codewhale mcp-server                            # 启动 dispatcher MCP stdio 服务器
+codewhale update                                # 检查并应用二进制更新
 ```
 
 Docker 镜像发布在 GHCR 上：
 
 ```bash
-docker volume create deepseek-tui-home
+docker volume create codewhale-home
 
 docker run --rm -it \
   -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
-  -v deepseek-tui-home:/home/deepseek/.deepseek \
+  -v codewhale-home:/home/codewhale/.deepseek \
   -v "$PWD:/workspace" \
   -w /workspace \
-  ghcr.io/hmbown/deepseek-tui:latest
+  ghcr.io/hmbown/codewhale:latest
 ```
 
 固定 tag、本地构建、volume 权限和非交互管道用法见 [docs/DOCKER.md](docs/DOCKER.md)。
@@ -334,7 +341,7 @@ DeepSeek 可作为自定义 Agent Client Protocol 服务器运行，供 Zed 等�
   "agent_servers": {
     "DeepSeek": {
       "type": "custom",
-      "command": "deepseek",
+      "command": "codewhale",
       "args": ["serve", "--acp"],
       "env": {}
     }
@@ -371,6 +378,10 @@ DeepSeek 可作为自定义 Agent Client Protocol 服务器运行，供 Zed 等�
 | **Agent** 🤖 | 默认交互模式；多步工具调用带审批门禁 |
 | **YOLO** ⚡ | 在可信工作区自动批准工具；仍会维护计划和清单以保持可见性 |
 
+模式与模型自动路由是两个概念。`Tab` 切换 Plan / Agent / YOLO，
+`/model auto` 选择模型和思考强度。`/goal` 当前用于追踪会话目标和
+token 预算；未来如果扩展成 Goal 工作区，也应与 `--model auto` 保持独立。
+
 ---
 
 ## 配置
@@ -386,13 +397,14 @@ DeepSeek 可作为自定义 Agent Client Protocol 服务器运行，供 Zed 等�
 | `DEEPSEEK_HTTP_HEADERS` | 可选模型请求头，例如 `X-Model-Provider-Id=your-model-provider` |
 | `DEEPSEEK_MODEL` | 默认模型 |
 | `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` | 流式响应空闲超时秒数，默认 `300`，限制在 `1..=3600` |
-| `DEEPSEEK_PROVIDER` | `deepseek`（默认）、`nvidia-nim`、`openai`、`openrouter`、`novita`、`atlascloud`、`fireworks`、`sglang`、`vllm`、`ollama` |
+| `DEEPSEEK_PROVIDER` | `codewhale`（默认）、`nvidia-nim`、`openai`、`atlascloud`、`wanjie-ark`、`openrouter`、`novita`、`fireworks`、`sglang`、`vllm`、`ollama` |
 | `DEEPSEEK_PROFILE` | 配置 profile 名称 |
 | `DEEPSEEK_MEMORY` | 设为 `on` 启用用户记忆 |
 | `DEEPSEEK_ALLOW_INSECURE_HTTP=1` | 在可信网络上允许非本机 `http://` API base URL |
-| `NVIDIA_API_KEY` / `OPENAI_API_KEY` / `OPENROUTER_API_KEY` / `NOVITA_API_KEY` / `ATLASCLOUD_API_KEY` / `FIREWORKS_API_KEY` / `SGLANG_API_KEY` / `VLLM_API_KEY` / `OLLAMA_API_KEY` | 提供商认证 |
+| `NVIDIA_API_KEY` / `OPENAI_API_KEY` / `ATLASCLOUD_API_KEY` / `WANJIE_ARK_API_KEY` / `OPENROUTER_API_KEY` / `NOVITA_API_KEY` / `FIREWORKS_API_KEY` / `SGLANG_API_KEY` / `VLLM_API_KEY` / `OLLAMA_API_KEY` | 提供商认证 |
 | `OPENAI_BASE_URL` / `OPENAI_MODEL` | 通用 OpenAI 兼容端点和模型 ID |
 | `ATLASCLOUD_BASE_URL` / `ATLASCLOUD_MODEL` | AtlasCloud 端点和模型覆盖 |
+| `WANJIE_ARK_BASE_URL` / `WANJIE_ARK_MODEL` | Wanjie Ark 端点和模型覆盖 |
 | `OPENROUTER_BASE_URL` | OpenRouter 端点覆盖 |
 | `NOVITA_BASE_URL` | Novita 端点覆盖 |
 | `FIREWORKS_BASE_URL` | Fireworks 端点覆盖 |
@@ -427,7 +439,7 @@ locale = "zh-Hans"
 或者通过环境变量（中文系统通常已自动生效）：
 
 ```bash
-LANG=zh_CN.UTF-8 deepseek run
+LANG=zh_CN.UTF-8 codewhale run
 ```
 
 ---
@@ -436,21 +448,19 @@ LANG=zh_CN.UTF-8 deepseek run
 
 | 模型 | 上下文 | 输入（缓存命中） | 输入（缓存未命中） | 输出 |
 |---|---|---|---|---|
-| `deepseek-v4-pro` | 1M | $0.003625 / 1M* | $0.435 / 1M* | $0.87 / 1M* |
+| `deepseek-v4-pro` | 1M | $0.003625 / 1M | $0.435 / 1M | $0.87 / 1M |
 | `deepseek-v4-flash` | 1M | $0.0028 / 1M | $0.14 / 1M | $0.28 / 1M |
 
 旧别名 `deepseek-chat` / `deepseek-reasoner` 映射到 `deepseek-v4-flash`。NVIDIA NIM 变体使用你的 NVIDIA 账号条款。
 
-*DeepSeek Pro 价格是限时 75% 折扣，有效期到 2026-05-31 15:59 UTC；该时间之后 TUI 成本估算会回退到 Pro 基础价格。*
-
 > [!Note]
-> 关于 DeepSeek-V4-Pro 的最新定价信息，请参阅官方 [DeepSeek 定价页面](https://api-docs.deepseek.com/zh-cn/quick_start/pricing)，请注意目前可享受 75% 的折扣，该优惠有效期至 **2026 年 5 月 31 日 23:59（北京时间）**。此外，README 文档中所列出的所有价格，均与官方发布的数值保持一致。
+> 上表的 V4 Pro 单价现已成为官方长期价格：DeepSeek 已宣布在 75% 限时折扣窗口于 **2026 年 5 月 31 日 23:59（北京时间）** 结束后，正式将原始价格调整为约四分之一。TUI 的成本估算已使用这些数值，因此无需任何代码改动。后续价格变动请参阅官方 [DeepSeek 定价页面](https://api-docs.deepseek.com/zh-cn/quick_start/pricing)。
 
 ---
 
 ## 创建和安装技能
 
-DeepSeek TUI 从工作区目录（`.agents/skills` → `skills` → `.opencode/skills` → `.claude/skills`）和全局 `~/.deepseek/skills` 发现技能。每个技能是一个包含 `SKILL.md` 的目录：
+codewhale 从工作区目录（`.agents/skills` → `skills` → `.opencode/skills` → `.claude/skills`）和全局 `~/.deepseek/skills` 发现技能。每个技能是一个包含 `SKILL.md` 的目录：
 
 ```text
 ~/.deepseek/skills/my-skill/
@@ -498,11 +508,22 @@ description: 当 DeepSeek 需要遵循我的自定义工作流时使用这个技
 
 ---
 
+## 支持
+
+CodeWhale 采用 MIT 许可证，使用和参与贡献都不需要赞助。如果它帮你节省了时间，
+最直接的长期支持方式是 [GitHub Sponsors](https://github.com/sponsors/Hmbown)。
+一次性支持也可以通过 [Buy Me a Coffee](https://www.buymeacoffee.com/hmbown) 完成。
+
+赞助会用于发布构建、CI/运行时测试、包发布，以及维护者处理 issue 和 review 的时间。
+功能请求、Bug 报告和 pull request 不需要赞助。
+
+---
+
 ## 致谢
 
 - **[DeepSeek](https://github.com/deepseek-ai)** — 感谢 DeepSeek 提供模型与支持，让每一次交互成为可能。
 - **[DataWhale](https://github.com/datawhalechina)** — 感谢 DataWhale 的支持，并欢迎我们加入“鲸兄弟”大家庭。
-- **[OpenWarp](https://github.com/zerx-lab/warp)** — 感谢 OpenWarp 优先支持 DeepSeek TUI，并一起打磨更好的终端智能体体验。
+- **[OpenWarp](https://github.com/zerx-lab/warp)** — 感谢 OpenWarp 优先支持 codewhale，并一起打磨更好的终端智能体体验。
 - **[Open Design](https://github.com/nexu-io/open-design)** — 感谢 Open Design 对面向设计的智能体工作流提供支持与协作。
 
 本项目由不断壮大的贡献者社区共同打造：
@@ -517,18 +538,19 @@ description: 当 DeepSeek 需要遵循我的自定义工作流时使用这个技
 - **[toi500](https://github.com/toi500)** — Windows 粘贴修复报告
 - **[xsstomy](https://github.com/xsstomy)** — 终端启动重绘报告
 - **[melody0709](https://github.com/melody0709)** — 斜杠前缀回车激活报告
-- **[lloydzhou](https://github.com/lloydzhou)** 和 **[jeoor](https://github.com/jeoor)** — 压缩成本报告；lloydzhou 还贡献了确定性的环境上下文注入 (#813, #922) 和 KV 前缀缓存稳定化 (#1080)
+- **[lloydzhou](https://github.com/lloydzhou)** 和 **[jeoor](https://github.com/jeoor)** — 压缩成本报告和 npm 安装器流暂停竞态修复 (#1860)；lloydzhou 还贡献了确定性的环境上下文注入 (#813, #922) 和 KV 前缀缓存稳定化 (#1080)
 - **[Agent-Skill-007](https://github.com/Agent-Skill-007)** — README 清晰化改进 (#685)
 - **[woyxiang](https://github.com/woyxiang)** — Windows 安装文档 (#696)
 - **[wangfeng](mailto:wangfengcsu@qq.com)** — 价格/折扣信息更新 (#692)
 - **[zichen0116](https://github.com/zichen0116)** — CODE_OF_CONDUCT.md (#686)
 - **[dfwqdyl-ui](https://github.com/dfwqdyl-ui)** — 模型 ID 大小写兼容性报告 (#729)
 - **[Oliver-ZPLiu](https://github.com/Oliver-ZPLiu)** — `working...` 卡死状态 Bug 报告和 Windows 剪贴板兜底修复 (#738, #850)
-- **[reidliu41](https://github.com/reidliu41)** — 退出后的恢复提示、工作区信任持久化、Ollama provider 支持，以及思考块流式终结修复 (#863, #870, #921, #1078)
+- **[reidliu41](https://github.com/reidliu41)** — 退出后的恢复提示、工作区信任持久化、Ollama provider 支持、思考块流式终结修复，以及帮助选择器选中行可见性优化 (#863, #870, #921, #1078, #1964)
+- **[cyq1017](https://github.com/cyq1017)** — Unicode `git_status` 路径、本地/配置技能发现，以及模式切换 toast 去重 (#1953, #1956, #1957)
 - **[xieshutao](https://github.com/xieshutao)** — 纯 Markdown skill 兜底解析 (#869)
 - **[GK012](https://github.com/GK012)** — npm wrapper 的 `--version` 兜底 (#885)
 - **[y0sif](https://github.com/y0sif)** — 直接子智能体完成后唤醒父级 turn loop (#901)
-- **[mac119](https://github.com/mac119)** 和 **[leo119](https://github.com/leo119)** — `deepseek update` 命令文档 (#838, #917)
+- **[mac119](https://github.com/mac119)** 和 **[leo119](https://github.com/leo119)** — `codewhale update` 命令文档 (#838, #917)
 - **[dumbjack](https://github.com/dumbjack)** / **浩淼的mac** — shell 命令空字节安全加固 (#706, #918)
 - **macworkers** — fork 完成后显示新 session id (#600, #919)
 - **zero** 和 **[zerx-lab](https://github.com/zerx-lab)** — 通知条件配置和更完整的 OSC 9 通知正文 (#820, #920)
@@ -550,12 +572,88 @@ description: 当 DeepSeek 需要遵循我的自定义工作流时使用这个技
 - **[THINKER-ONLY](https://github.com/THINKER-ONLY)** — OpenRouter 和自定义端点模型 ID 保留 (#1066)
 - **[Jefsky](https://github.com/Jefsky)** — `deepseek-cn` 官方端点默认值 (#1079, #1084)
 - **[wlon](https://github.com/wlon)** — NVIDIA NIM provider API key 优先级诊断 (#1081)
+- **[Horace Liu](https://github.com/liuhq)** — Nix 包支持和安装文档 (#1173)
+- **[jieshu666](https://github.com/jieshu666)** — 终端重绘闪烁修复 (#1563)
+- **[gordonlu](https://github.com/gordonlu)** — Windows Enter / CSI-u 输入修复 (#1612)
+- **[mdrkrg](https://github.com/mdrkrg)** — 首次运行 API key 缺失时的启动崩溃修复 (#1598)
+- **[Aitensa](https://github.com/Aitensa)** — diff 和 pager 输出的 CJK 换行支持 (#1622)
+- **[qiyan233](https://github.com/qiyan233)** — 遗留 DeepSeek CN provider 别名兼容 (#1645)
+- **[zlh124](https://github.com/zlh124)** — WSL2/headless 启动报告和剪贴板初始化修复 (#1772, #1773)
+- **[aboimpinto](https://github.com/aboimpinto)** — Windows alt-screen 日志、Home/End 编辑器，以及运行时日志跟进 (#1774, #1776, #1748, #1749, #1782, #1783)
+- **[LeoLin990405](https://github.com/LeoLin990405)** — provider 模型透传、reasoning 重放、thinking-only turn 和 Windows 引用修复 (#1740, #1743, #1742, #1744)
+- **[nightt5879](https://github.com/nightt5879)** — Ctrl+C 提示恢复修复 (#1764)
+- **[h3c-hexin](https://github.com/h3c-hexin)** — 流式批量工具调用保留和 CLI reasoning-effort 透传 (#1686, #1511)
+- **[hxy91819](https://github.com/hxy91819)** — 工具结果裁剪时的前缀缓存保留 (#1514)
+- **[JiarenWang](https://github.com/JiarenWang)** — Plan 模式只读执行、审批接管优化、Ctrl+H 删除修复和 undo 上下文同步 (#1123, #962, #958, #1150)
+- **[Liu-Vince](https://github.com/Liu-Vince)** — MCP 分页、markdown 缩进保留、zh-Hans i18n 优化和环境变量文档 (#1256, #1179, #1274, #1178)
+- **[linzhiqin2003](https://github.com/linzhiqin2003)** — `--model auto` 成本节约偏好、执行纪律提示和声明式事实记忆指导 (#1385, #1384, #1381)
+- **[lbcheng888](https://github.com/lbcheng888)** — 跨保存/恢复的成本持久化和对话滚动修复 (#1192, #1211)
+- **[pengyou200902](https://github.com/pengyou200902)** — UTF-8 安全记忆截断、截断标记精确化和快捷键文档 (#968, #1122, #1095)
+- **[ChaceLyee2101](https://github.com/ChaceLyee2101)** — 推理 token 成本统计和 zh-Hans 自动 CNY 显示，以及 zh-CN README 同步 (#1505, #1504)
+- **[CrepuscularIRIS](https://github.com/CrepuscularIRIS)** — Termius/SSH 低动画模式和 npx MCP 服务器沙箱修复 (#1479, #1346)
+- **[laoye2020](https://github.com/laoye2020)** — Catppuccin、Tokyo Night、Dracula 和 Gruvbox 主题及 `/theme` 选择器 (#1534)
+- **[punkcanyang](https://github.com/punkcanyang)** — Kitty (OSC 99) 和 Ghostty (OSC 777) 桌面通知支持 (#1426)
+- **[Rene-Kuhm](https://github.com/Rene-Kuhm)** — 西班牙语（es-419）拉丁美洲本地化 (#1452)
+- **[sternelee](https://github.com/sternelee)** — DeepSeek 前缀缓存稳定性追踪 (#1517)
+- **[ComeFromTheMars](https://github.com/ComeFromTheMars)** — Shift+Up/Down 对话滚动快捷键 (#1432)
+- **[sockerch](https://github.com/sockerch)** — 所有斜杠命令的拼音别名 (#1306)
+- **[Apeiron0w0](https://github.com/Apeiron0w0)** — Tabby 终端闪烁循环的 FocusGained 去抖动 (#1560)
+- **[greyfreedom](https://github.com/greyfreedom)** — 跳转到最新对话按钮 (#969)
+- **[SamhandsomeLee](https://github.com/SamhandsomeLee)** — 显式隐藏文件提及补全 (#1270)
+- **[dst1213](https://github.com/dst1213)** — 配额错误 HTTP 400 重试 (#1203)
+- **[fuleinist](https://github.com/fuleinist)** — `--yolo` 标志从 CLI 转发到 TUI (#1233)
+- **[heloanc](https://github.com/heloanc)** — Home/End 键编辑器支持 (#1246)
+- **[jinpengxuan](https://github.com/jinpengxuan)** — 入职期间活动 provider 凭据保留 (#1265)
+- **[lixiasky-back](https://github.com/lixiasky-back)** — 已验证 npm 二进制采用 (#1339)
+- **[J3y0r](https://github.com/J3y0r)** — 工作区切换命令 (#1065)
+- **[KhalidAlnujaidi](https://github.com/KhalidAlnujaidi)** — delegate 技能打包 (#1144)
+- **[Wenjunyun123](https://github.com/Wenjunyun123)** — 文档锚点偏移保留 (#1282)
+- **[whtis](https://github.com/whtis)** — zh-CN README 调度程序路径同步 (#1235)
+- **[aqilaziz](https://github.com/aqilaziz)** — memory 技能链接修复 (#1095)
+- **[wuwuzhijing](https://github.com/wuwuzhijing)** — rsproxy rustup 变通安装文档 (#1011)
+- **[eltociear](https://github.com/eltociear)** — 日语 README 翻译 (#746)
+- **[Ling](https://github.com/LING71671)** — `grep_files` 取消令牌支持和 Ctrl+Z 编辑器草稿恢复 (#1839, #1911)
+- **[Ben Younes](https://github.com/ousamabenyounes)** — Linux Wayland（非 wlroots）剪贴板支持 (#1938)
+- **[Matt Van Horn](https://github.com/mvanhorn)** — Docker 首次运行权限修复和运行时系统提示回归测试 (#1699, #1702)
+- **[Kristopher Clark](https://github.com/krisclarkdev)** — compaction 用户查询保留修复 (#1704)
+- **[tdccccc](https://github.com/tdccccc)** — 编辑器滚动修复和 pager 鼠标滚轮支持 (#1715, #1716)
+- **[LittleBlacky](https://github.com/LittleBlacky)** — provider gated `reasoning_content` 流式修复 (#1680)
+- **[Anaheim](https://github.com/AnaheimEX)** — `rlm_open` 空 source schema 校验报告 (#1712)
+- **[THatch26](https://github.com/THatch26)** — 终端 resize 后翻页修复 (#1724)
+- **[Alvin](https://github.com/alvin1)** — Zed ACP id 兼容性报告 (#1696)
+- **[knqiufan](https://github.com/knqiufan)** — sub-agent 文件写入委派工作 (#1833)
+- **[IIzzaya](https://github.com/IIzzaya)** — slash 补全精确 alias 优先排序想法 (#1811)
+- **[DC](https://github.com/duanchao-lab)** — 终端清理 guard 思路 (#1630)
+- **[imkingjh999](https://github.com/imkingjh999)** — provider/model 切换修复 (#1642)
+- **[Photo](https://github.com/eng2007)** — provider-aware `/model` picker catalog 工作 (#1201)
+- **[chennest](https://github.com/chennest)** — diagnostics schema 报告 (#1685)
+- **[kunpeng-ai-lab](https://github.com/kunpeng-ai-lab)** — Windows 编辑器滚动修复 (#1578)
+- **[WuMing](https://github.com/asdfg314284230)** — Windows PowerShell 闪烁修复 (#1591)
+- **[maker316](https://github.com/maker316)** — LoopGuard/checklist 循环报告 (#1574)
+- **[lalala](https://github.com/lalala-233)** — approval denial 回归报告 (#1617)
+- **[muyuliyan](https://github.com/muyuliyan)** — `pandoc_convert` 校验修复 (#1523)
+- **[czf0718](https://github.com/czf0718)** — resize 和 turn-completion 闪烁修复 (#1537)
+- **[MeAiRobot](https://github.com/MeAiRobot)** — toast 覆盖编辑器输入的修复 (#1485)
+- **[tiger-dog](https://github.com/tiger-dog)** — approval modal 折叠和 markdown identifier 修复 (#1455)
+- **[MMMarcinho](https://github.com/MMMarcinho)** — opt-in `image_analyze` 视觉工具 (#1467)
+- **[lucaszhu-hue](https://github.com/lucaszhu-hue)** — AtlasCloud provider 集成 (#1436)
+- **[sandofree](https://github.com/sandofree)** — Tavily 和 Bocha `web_search` 后端 (#1294)
+- **[zhuangbiaowei](https://github.com/zhuangbiaowei)** — `/change` release notes 命令 (#1416)
+- **[NorethSea](https://github.com/NorethSea)** — updater 同步刷新 companion binary 的修复 (#1492)
+- **[Jianfengwu2024](https://github.com/Jianfengwu2024)** — Windows MSVC toolchain 环境保留 (#1487)
+- **[Fire-dtx](https://github.com/Fire-dtx)** — npm postinstall 可恢复性工作 (#1059)
+- **[oooyuy92](https://github.com/oooyuy92)** — 长会话配色可读性报告 (#1070, #936)
+- **[qinxianyuzou](https://github.com/qinxianyuzou)** — zh-Hans destructive approval 文案 (#1087, #1091)
+- **[tyouter](https://github.com/tyouter)** — session title/history preview 清理 (#1510)
+- **[xulongzhe](https://github.com/xulongzhe)** — issue template 和 vision boundary follow-up (#1530, #1544)
+- **[YaYII](https://github.com/YaYII)** — trusted media path 工作 (#1462)
+- **[47Cid](https://github.com/47Cid)** 和 **[Jafar Akhondali](https://github.com/JafarAkhondali)** — 负责任安全披露和加固报告
 
 ---
 
 ## 贡献
 
-欢迎提交 pull request——请先查看 [CONTRIBUTING.md](CONTRIBUTING.md) 并留意[开放 issue](https://github.com/Hmbown/DeepSeek-TUI/issues) 中的好入门任务。
+欢迎提交 pull request——请先查看 [CONTRIBUTING.md](CONTRIBUTING.md) 并留意[开放 issue](https://github.com/Hmbown/CodeWhale/issues) 中的好入门任务。
 
 *本项目与 DeepSeek Inc. 无隶属关系。*
 
@@ -565,4 +663,4 @@ description: 当 DeepSeek 需要遵循我的自定义工作流时使用这个技
 
 ## Star 历史
 
-[![Star History Chart](https://api.star-history.com/chart?repos=Hmbown/DeepSeek-TUI&type=date&legend=top-left)](https://www.star-history.com/?repos=Hmbown%2FDeepSeek-TUI&type=date&logscale=&legend=top-left)
+[![Star History Chart](https://api.star-history.com/chart?repos=Hmbown/CodeWhale&type=date&legend=top-left)](https://www.star-history.com/?repos=Hmbown%2FCodeWhale&type=date&logscale=&legend=top-left)

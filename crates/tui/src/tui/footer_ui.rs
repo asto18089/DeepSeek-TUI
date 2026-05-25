@@ -60,32 +60,35 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &mut App) {
 
     // Animate the spacer between the left status line and the right-hand
     // chips whenever a turn is live: model loading/streaming, compacting, or
-    // sub-agents in flight. The spout strip is gated on `fancy_animations`
-    // (the "do I want a whale at all" knob); `low_motion` now governs only
-    // streaming pacing (typewriter vs upstream), not the spout. Dot-pulse
-    // counter ticks every 400 ms so `working` → `working...` reads at a
-    // calm pace regardless of motion mode.
+    // sub-agents in flight. The spout strip and dot-pulse fallback are gated
+    // on `fancy_animations` (the "do I want animated chrome" knob);
+    // `low_motion` governs streaming pacing and redraw cadence.
     if footer_working_strip_active(app) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let dot_frame = now_ms / 400;
+        let dot_frame = footer_working_label_frame(now_ms, app.fancy_animations);
         // Surface one compact live status row in the footer whenever a turn
         // is live. Tool turns get the current action plus active/done counts;
         // non-tool work falls back to the existing dot-pulse label.
-        props.state_label = active_subagent_status_label(app)
+        let mut label = active_voice_input_status_label(app, now_ms)
+            .or_else(|| active_subagent_status_label(app))
             .or_else(|| active_tool_status_label(app))
             .unwrap_or_else(|| crate::tui::widgets::footer_working_label(dot_frame, app.ui_locale));
+        // Append stall reason when the turn has been running > 30 s.
+        if let Some(reason) = stall_reason(app) {
+            label = format!("{label}  ({reason})");
+        }
+        props.state_label = label;
         props.state_color = palette::DEEPSEEK_SKY;
 
         // Water-spout frame source: wall-clock milliseconds. The sine-wave
         // math in `footer_working_strip_glyph_at` was tuned for this cadence
         // (`t = frame / 1000.0`, primary term × 8.0 ≈ 1.3 Hz at 1 ms ticks),
         // so frame must advance at ~1000 units/sec to produce the intended
-        // animation feel. `fancy_animations = false` hides the strip
-        // entirely; the textual `working...` pulse still keeps a heartbeat
-        // regardless.
+        // animation feel. `fancy_animations = false` hides the strip and pins
+        // the textual fallback to `working`.
         if app.fancy_animations {
             props.working_strip_frame = Some(now_ms);
         }
@@ -101,6 +104,48 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &mut App) {
     widget.render(area, buf);
 }
 
+/// Classify why a turn that has been running for > 30 s might appear stalled.
+/// Returns a short human-readable reason string, or `None` when the turn has
+/// not been running long enough to classify as stalled.
+pub(crate) fn stall_reason(app: &App) -> Option<&'static str> {
+    let elapsed = app.turn_started_at?.elapsed();
+    if elapsed.as_secs() < 30 {
+        return None;
+    }
+    if app.is_compacting {
+        return Some("compacting context");
+    }
+    if app.is_loading {
+        return Some("waiting for model");
+    }
+    if running_agent_count(app) > 0 {
+        return Some("sub-agents working");
+    }
+    if app.task_panel.iter().any(|task| task.status == "running") {
+        return Some("background jobs running");
+    }
+    let active = app.active_cell.as_ref()?;
+    if active.entries().iter().any(|cell| match cell {
+        crate::tui::history::HistoryCell::Tool(tool) => match tool {
+            crate::tui::history::ToolCell::Exec(exec) => {
+                exec.status == crate::tui::history::ToolStatus::Running
+            }
+            crate::tui::history::ToolCell::Exploring(explore) => explore
+                .entries
+                .iter()
+                .any(|e| e.status == crate::tui::history::ToolStatus::Running),
+            _ => false,
+        },
+        _ => false,
+    }) {
+        return Some("tools executing");
+    }
+    if app.runtime_turn_status.as_deref() == Some("in_progress") {
+        return Some("waiting - no recent activity");
+    }
+    None
+}
+
 /// Whether the footer should animate the water-spout strip. Driven by the
 /// underlying live-work flags so the strip stays visible for the *entire*
 /// turn — not just the moments where bytes are streaming. `is_loading` can
@@ -111,7 +156,64 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &mut App) {
 /// though the agent is still working.
 pub(crate) fn footer_working_strip_active(app: &App) -> bool {
     let turn_in_progress = app.runtime_turn_status.as_deref() == Some("in_progress");
-    app.is_loading || app.is_compacting || running_agent_count(app) > 0 || turn_in_progress
+    app.is_loading
+        || app.is_compacting
+        || running_agent_count(app) > 0
+        || turn_in_progress
+        || app.voice_input_state.is_some()
+}
+
+pub(crate) fn footer_working_label_frame(now_ms: u64, fancy_animations: bool) -> u64 {
+    if fancy_animations { now_ms / 400 } else { 0 }
+}
+
+pub(crate) fn active_voice_input_status_label(app: &App, now_ms: u64) -> Option<String> {
+    let state = app.voice_input_state.as_ref()?;
+    let elapsed = state.started_at.elapsed().as_secs();
+    Some(voice_input_status_text(
+        app.fancy_animations,
+        elapsed,
+        now_ms,
+    ))
+}
+
+pub(crate) fn voice_input_status_text(
+    fancy_animations: bool,
+    elapsed_secs: u64,
+    now_ms: u64,
+) -> String {
+    if !fancy_animations {
+        return format!("listening/transcribing {elapsed_secs}s");
+    }
+    let dots = match (now_ms / 300) % 4 {
+        0 => "",
+        1 => ".",
+        2 => "..",
+        _ => "...",
+    };
+    format!("listening/transcribing{dots} {elapsed_secs}s")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{footer_working_label_frame, voice_input_status_text};
+
+    #[test]
+    fn footer_working_label_frame_is_static_without_fancy_animations() {
+        assert_eq!(footer_working_label_frame(0, false), 0);
+        assert_eq!(footer_working_label_frame(399, false), 0);
+        assert_eq!(footer_working_label_frame(1_600, false), 0);
+        assert_eq!(footer_working_label_frame(1_600, true), 4);
+    }
+
+    #[test]
+    fn voice_input_status_label_animates_when_enabled() {
+        let first = voice_input_status_text(true, 2, 0);
+        let second = voice_input_status_text(true, 2, 300);
+
+        assert_ne!(first, second);
+        assert!(first.contains("listening/transcribing"));
+    }
 }
 
 pub(crate) fn is_noisy_subagent_progress(status: &str) -> bool {
@@ -609,10 +711,7 @@ pub(crate) fn footer_cache_spans(app: &App) -> Vec<Span<'static>> {
         palette::STATUS_ERROR
     };
     vec![Span::styled(
-        format!(
-            "Cache: {:.1}% hit | hit {hit_tokens} | miss {miss_tokens}",
-            percent
-        ),
+        format!("Cache: {percent:.1}% hit | hit {hit_tokens} | miss {miss_tokens}"),
         Style::default().fg(color),
     )]
 }

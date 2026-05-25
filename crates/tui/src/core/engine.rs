@@ -166,6 +166,11 @@ pub struct EngineConfig {
     pub search_provider: crate::config::SearchProvider,
     /// API key for Tavily or Bocha. `None` for Bing or DuckDuckGo.
     pub search_api_key: Option<String>,
+    /// Per-step DeepSeek API timeout for sub-agent `create_message` requests.
+    /// Resolved from `[subagents] api_timeout_secs` (clamped to 1..=1800)
+    /// once at engine construction, then threaded onto every
+    /// `SubAgentRuntime` the engine builds (#1806, #1808).
+    pub subagent_api_timeout: Duration,
 }
 
 impl Default for EngineConfig {
@@ -206,6 +211,9 @@ impl Default for EngineConfig {
             workshop: None,
             search_provider: crate::config::SearchProvider::default(),
             search_api_key: None,
+            subagent_api_timeout: Duration::from_secs(
+                crate::config::DEFAULT_SUBAGENT_API_TIMEOUT_SECS,
+            ),
         }
     }
 }
@@ -290,7 +298,7 @@ pub struct Engine {
     /// can fan completion events back into the engine.
     tx_subagent_completion: mpsc::UnboundedSender<SubAgentCompletion>,
     /// Receiver paired with `tx_subagent_completion`. Drained at the
-    /// turn-loop's empty-tool_uses branch to surface `<deepseek:subagent.done>`
+    /// turn-loop's empty-tool_uses branch to surface `<codewhale:subagent.done>`
     /// sentinels into the parent's transcript before deciding to end the turn.
     pub(super) rx_subagent_completion: mpsc::UnboundedReceiver<SubAgentCompletion>,
     cancel_token: CancellationToken,
@@ -359,6 +367,7 @@ impl Engine {
             ApiProvider::NvidiaNim => "NVIDIA_API_KEY/NVIDIA_NIM_API_KEY",
             ApiProvider::Openai => "OPENAI_API_KEY",
             ApiProvider::Atlascloud => "ATLASCLOUD_API_KEY",
+            ApiProvider::WanjieArk => "WANJIE_ARK_API_KEY/WANJIE_API_KEY/WANJIE_MAAS_API_KEY",
             ApiProvider::Openrouter => "OPENROUTER_API_KEY",
             ApiProvider::Novita => "NOVITA_API_KEY",
             ApiProvider::Fireworks => "FIREWORKS_API_KEY",
@@ -369,8 +378,8 @@ impl Engine {
 
         Some(format!(
             "The rejected key came from {env_var}; no saved config key is present.\n\
-             Run `deepseek auth status` to inspect credential sources, then \
-             `deepseek auth set --provider {provider}` to save a valid key in ~/.deepseek/config.toml, \
+             Run `codewhale auth status` to inspect credential sources, then \
+             `codewhale auth set --provider {provider}` to save a valid key in ~/.deepseek/config.toml, \
              or remove the stale export and open a fresh shell.",
             provider = provider.as_str()
         ))
@@ -434,6 +443,7 @@ impl Engine {
                     project_context_pack_enabled: config.project_context_pack_enabled,
                     locale_tag: &config.locale_tag,
                     translation_enabled: config.translation_enabled,
+                    model_id: &config.model,
                 },
                 session.approval_mode,
             );
@@ -655,8 +665,15 @@ impl Engine {
                         self.session.reasoning_effort_auto,
                     )
                     .with_max_spawn_depth(self.config.max_spawn_depth)
+                    .with_step_api_timeout(self.config.subagent_api_timeout)
                     .background_runtime();
-                    let route = resolve_subagent_assignment_route(&runtime, None, &prompt).await;
+                    let route = resolve_subagent_assignment_route(
+                        &runtime,
+                        None,
+                        &prompt,
+                        &SubAgentType::General,
+                    )
+                    .await;
                     runtime.model = route.model;
                     runtime.reasoning_effort = route.reasoning_effort;
                     runtime.reasoning_effort_auto = false;
@@ -1062,6 +1079,7 @@ impl Engine {
                             self.session.reasoning_effort_auto,
                         )
                         .with_max_spawn_depth(self.config.max_spawn_depth)
+                        .with_step_api_timeout(self.config.subagent_api_timeout)
                         .with_parent_completion_tx(self.tx_subagent_completion.clone());
                         if let Some(context) = fork_context_for_runtime.clone() {
                             rt = rt.with_fork_context(context);
@@ -1339,7 +1357,7 @@ impl Engine {
                 "Emergency compaction complete: {before_count} → {after_count} messages ({removed} removed), ~{before_tokens} → ~{after_tokens} tokens"
             );
             if retries_used > 0 {
-                details.push_str(&format!(" ({} retries)", retries_used));
+                details.push_str(&format!(" ({retries_used} retries)"));
             }
             if trimmed > 0 {
                 details.push_str(&format!(", trimmed {trimmed} oldest"));
@@ -1358,8 +1376,7 @@ impl Engine {
 
         let message = format!(
             "Emergency context compaction failed to reduce request below model limit \
-             (estimate ~{} tokens, budget ~{}).",
-            after_tokens, target_budget
+             (estimate ~{after_tokens} tokens, budget ~{target_budget})."
         );
         self.emit_compaction_failed(id, true, message.clone()).await;
         let _ = self.tx_event.send(Event::status(message)).await;
@@ -1372,6 +1389,15 @@ impl Engine {
         // `/trust add` / `/trust remove` mutations without an explicit cache
         // refresh hook.
         let trusted = crate::workspace_trust::WorkspaceTrust::load_for(&self.session.workspace);
+        let mut trusted_external_paths = trusted.paths().to_vec();
+        let clipboard_images_dir =
+            crate::tui::clipboard::clipboard_images_dir(&self.session.workspace);
+        if !trusted_external_paths
+            .iter()
+            .any(|path| path == &clipboard_images_dir)
+        {
+            trusted_external_paths.push(clipboard_images_dir);
+        }
         let mut ctx = ToolContext::with_auto_approve(
             self.session.workspace.clone(),
             self.session.trust_mode,
@@ -1383,8 +1409,15 @@ impl Engine {
         .with_features(self.config.features.clone())
         .with_shell_manager(self.shell_manager.clone())
         .with_runtime_services(self.config.runtime_services.clone())
+        .with_session_objects(crate::rlm::session::SessionObjectSnapshot::new(
+            self.session.id.clone(),
+            self.session.model.clone(),
+            self.session.workspace.clone(),
+            self.session.system_prompt.clone(),
+            self.session.messages.clone(),
+        ))
         .with_cancel_token(self.cancel_token.clone())
-        .with_trusted_external_paths(trusted.paths().to_vec());
+        .with_trusted_external_paths(trusted_external_paths);
 
         // Hand the user-memory path to tools so the model-callable
         // `remember` tool can append entries (#489). `None` when the
@@ -1785,6 +1818,7 @@ impl Engine {
                 project_context_pack_enabled: self.config.project_context_pack_enabled,
                 locale_tag: &self.config.locale_tag,
                 translation_enabled: self.config.translation_enabled,
+                model_id: &self.config.model,
             },
             self.session.approval_mode,
         );

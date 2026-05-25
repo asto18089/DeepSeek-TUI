@@ -13,18 +13,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// Maximum number of results to return to avoid overwhelming output
 const MAX_RESULTS: usize = 100;
 
 /// Maximum file size to search (skip large binaries)
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
-
-// [pinvou3-fork] grep_files hard timeout 防同步循环在大目录上跑数分钟阻塞
-// turn loop 响应 cancel button。30s 足够正常工作区 grep,大目录则 timeout
-// 返回 error 让 LLM fallback。
-const GREP_FILES_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Result of a grep match
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,10 +92,8 @@ impl ToolSpec for GrepFilesTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        // [pinvou3-fork] 把同步 walker + per-file regex 包到 spawn_blocking + 30s timeout,
-        // 让 turn loop 能在 30s 内响应 cancel button (vs 之前同步阻塞数分钟无响应)。
-        let pattern_str = required_str(&input, "pattern")?.to_string();
-        let path_str = optional_str(&input, "path").unwrap_or(".").to_string();
+        let pattern_str = required_str(&input, "pattern")?;
+        let path_str = optional_str(&input, "path").unwrap_or(".");
         let context_lines =
             usize::try_from(optional_u64(&input, "context_lines", 2)).unwrap_or(usize::MAX);
         let case_insensitive = optional_bool(&input, "case_insensitive", false);
@@ -153,103 +146,101 @@ impl ToolSpec for GrepFilesTool {
         let regex = Regex::new(&regex_pattern)
             .map_err(|e| ToolError::invalid_input(format!("Invalid regex pattern: {e}")))?;
 
-        // Resolve search path (must be in async scope to use ToolContext)
-        let search_path = context.resolve_path(&path_str)?;
-        let workspace = context.workspace.clone();
+        // Resolve search path
+        let search_path = context.resolve_path(path_str)?;
 
-        // [pinvou3-fork] spawn_blocking + timeout: walker + per-file regex 是阻塞 I/O,
-        // 在 async fn 内直接同步循环会阻塞 turn loop (cancel button 无响应)。
-        let task = tokio::task::spawn_blocking(move || -> Result<ToolResult, ToolError> {
-            let files = collect_files(&search_path, &include_patterns, &exclude_patterns)?;
+        let cancel_token = context.cancel_token.as_ref();
 
-            let mut results: Vec<GrepMatch> = Vec::new();
-            let mut files_searched = 0;
-            let mut total_matches = 0;
+        // Collect files to search
+        let files = collect_files(
+            &search_path,
+            &include_patterns,
+            &exclude_patterns,
+            cancel_token,
+        )?;
 
-            for file_path in files {
-                if results.len() >= max_results {
-                    break;
-                }
+        // Search files
+        let mut results: Vec<GrepMatch> = Vec::new();
+        let mut files_searched = 0;
+        let mut total_matches = 0;
 
-                // Skip files that are too large
-                if let Ok(metadata) = fs::metadata(&file_path)
-                    && metadata.len() > MAX_FILE_SIZE
-                {
-                    continue;
-                }
+        for file_path in files {
+            check_cancelled(cancel_token)?;
 
-                // Read file content
-                let Ok(file_content) = fs::read_to_string(&file_path) else {
-                    continue; // Skip binary or unreadable files
-                };
+            if results.len() >= max_results {
+                break;
+            }
 
-                files_searched += 1;
-                let lines: Vec<&str> = file_content.lines().collect();
+            // Skip files that are too large
+            if let Ok(metadata) = fs::metadata(&file_path)
+                && metadata.len() > MAX_FILE_SIZE
+            {
+                continue;
+            }
 
-                for (line_idx, line) in lines.iter().enumerate() {
-                    if regex.is_match(line) {
-                        total_matches += 1;
+            // Read file content
+            let Ok(file_content) = fs::read_to_string(&file_path) else {
+                continue; // Skip binary or unreadable files
+            };
 
-                        // Get context lines
-                        let context_before: Vec<String> = (line_idx
-                            .saturating_sub(context_lines)
-                            ..line_idx)
-                            .filter_map(|i| lines.get(i).map(|s| (*s).to_string()))
-                            .collect();
+            files_searched += 1;
+            let lines: Vec<&str> = file_content.lines().collect();
 
-                        let context_after: Vec<String> = ((line_idx + 1)
-                            ..=(line_idx + context_lines).min(lines.len() - 1))
-                            .filter_map(|i| lines.get(i).map(|s| (*s).to_string()))
-                            .collect();
+            for (line_idx, line) in lines.iter().enumerate() {
+                check_cancelled(cancel_token)?;
 
-                        // Get relative path from workspace
-                        let relative_path = file_path
-                            .strip_prefix(&workspace)
-                            .unwrap_or(&file_path)
-                            .to_string_lossy()
-                            .to_string();
+                if regex.is_match(line) {
+                    total_matches += 1;
 
-                        results.push(GrepMatch {
-                            file: relative_path,
-                            line_number: line_idx + 1,
-                            line: (*line).to_string(),
-                            context_before,
-                            context_after,
-                        });
+                    // Get context lines
+                    let context_before: Vec<String> = (line_idx.saturating_sub(context_lines)
+                        ..line_idx)
+                        .filter_map(|i| lines.get(i).map(|s| (*s).to_string()))
+                        .collect();
 
-                        if results.len() >= max_results {
-                            break;
-                        }
+                    let context_after: Vec<String> = ((line_idx + 1)
+                        ..=(line_idx + context_lines).min(lines.len() - 1))
+                        .filter_map(|i| lines.get(i).map(|s| (*s).to_string()))
+                        .collect();
+
+                    // Get relative path from workspace
+                    let relative_path = file_path
+                        .strip_prefix(&context.workspace)
+                        .unwrap_or(&file_path)
+                        .to_string_lossy()
+                        .to_string();
+
+                    results.push(GrepMatch {
+                        file: relative_path,
+                        line_number: line_idx + 1,
+                        line: (*line).to_string(),
+                        context_before,
+                        context_after,
+                    });
+
+                    if results.len() >= max_results {
+                        break;
                     }
                 }
             }
+        }
 
-            let matches_json: Vec<Value> = results
-                .iter()
-                .map(|item| grep_match_to_json(item, context_lines))
-                .collect();
+        let matches_json: Vec<Value> = results
+            .iter()
+            .map(|item| grep_match_to_json(item, context_lines))
+            .collect();
 
-            let result = json!({
-                "matches": matches_json,
-                "total_matches": total_matches,
-                "files_searched": files_searched,
-                "truncated": total_matches > max_results,
-            });
-
-            ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))
+        // Build result. When context_lines == 1, return the single context
+        // line as a string instead of a one-item array. That keeps the common
+        // "show just the adjacent line" case easy for model callers to read.
+        let result = json!({
+            "matches": matches_json,
+            "total_matches": total_matches,
+            "files_searched": files_searched,
+            "truncated": total_matches > max_results,
         });
 
-        match tokio::time::timeout(GREP_FILES_TIMEOUT, task).await {
-            Ok(Ok(Ok(r))) => Ok(r),
-            Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(join_err)) => Err(ToolError::execution_failed(format!(
-                "grep_files task panicked: {join_err}"
-            ))),
-            Err(_) => Err(ToolError::execution_failed(format!(
-                "grep_files timed out after {}s. Narrow with 'path' or 'include' (e.g. '*.rs')",
-                GREP_FILES_TIMEOUT.as_secs()
-            ))),
-        }
+        ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
 }
 
@@ -272,15 +263,24 @@ fn collect_files(
     root: &Path,
     include_patterns: &[String],
     exclude_patterns: &[String],
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<Vec<PathBuf>, ToolError> {
     let mut files = Vec::new();
+    check_cancelled(cancel_token)?;
 
     if root.is_file() {
         files.push(root.to_path_buf());
         return Ok(files);
     }
 
-    collect_files_recursive(root, root, include_patterns, exclude_patterns, &mut files)?;
+    collect_files_recursive(
+        root,
+        root,
+        include_patterns,
+        exclude_patterns,
+        cancel_token,
+        &mut files,
+    )?;
     Ok(files)
 }
 
@@ -289,8 +289,11 @@ fn collect_files_recursive(
     current: &Path,
     include_patterns: &[String],
     exclude_patterns: &[String],
+    cancel_token: Option<&CancellationToken>,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), ToolError> {
+    check_cancelled(cancel_token)?;
+
     let entries = fs::read_dir(current).map_err(|e| {
         ToolError::execution_failed(format!(
             "Failed to read directory {}: {}",
@@ -300,6 +303,8 @@ fn collect_files_recursive(
     })?;
 
     for entry in entries {
+        check_cancelled(cancel_token)?;
+
         let entry = entry.map_err(|e| ToolError::execution_failed(e.to_string()))?;
         let path = entry.path();
         let file_type = entry.file_type().map_err(|e| {
@@ -323,7 +328,14 @@ fn collect_files_recursive(
         }
 
         if file_type.is_dir() {
-            collect_files_recursive(root, &path, include_patterns, exclude_patterns, files)?;
+            collect_files_recursive(
+                root,
+                &path,
+                include_patterns,
+                exclude_patterns,
+                cancel_token,
+                files,
+            )?;
         } else if file_type.is_file() {
             // Check inclusions (if any specified)
             if include_patterns.is_empty() || should_include(&relative_str, include_patterns) {
@@ -332,6 +344,15 @@ fn collect_files_recursive(
         }
     }
 
+    Ok(())
+}
+
+fn check_cancelled(cancel_token: Option<&CancellationToken>) -> Result<(), ToolError> {
+    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(ToolError::execution_failed(
+            "search cancelled before completion",
+        ));
+    }
     Ok(())
 }
 
@@ -449,6 +470,7 @@ mod tests {
 
     use serde_json::{Value, json};
     use tempfile::tempdir;
+    use tokio_util::sync::CancellationToken;
 
     use crate::tools::spec::{ApprovalRequirement, ToolContext, ToolSpec};
 
@@ -658,6 +680,26 @@ mod tests {
         let result = tool.execute(json!({"pattern": "[invalid"}), &ctx).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_grep_files_respects_cancel_token() {
+        let tmp = tempdir().expect("tempdir");
+        fs::write(tmp.path().join("test.txt"), "needle\n").expect("write");
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        let ctx = ToolContext::new(tmp.path().to_path_buf()).with_cancel_token(cancel_token);
+
+        let tool = GrepFilesTool;
+        let err = tool
+            .execute(json!({"pattern": "needle"}), &ctx)
+            .await
+            .expect_err("cancelled grep should return an error");
+
+        assert!(
+            format!("{err:?}").contains("cancelled"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

@@ -242,6 +242,7 @@ pub const STATUS_INFO: Color = DEEPSEEK_BLUE;
 pub const MODE_AGENT: Color = Color::Rgb(80, 150, 255); // Bright blue
 pub const MODE_YOLO: Color = Color::Rgb(255, 100, 100); // Warning red
 pub const MODE_PLAN: Color = Color::Rgb(255, 170, 60); // Orange
+pub const MODE_GOAL: Color = Color::Rgb(100, 220, 160); // Mint green
 
 pub const SELECTION_BG: Color = Color::Rgb(26, 44, 74);
 #[allow(dead_code)]
@@ -332,6 +333,7 @@ pub struct UiTheme {
     pub mode_agent: Color,
     pub mode_yolo: Color,
     pub mode_plan: Color,
+    pub mode_goal: Color,
     /// Statusline status colors
     pub status_ready: Color,
     pub status_working: Color,
@@ -358,6 +360,7 @@ pub const UI_THEME: UiTheme = UiTheme {
     mode_agent: MODE_AGENT,
     mode_yolo: MODE_YOLO,
     mode_plan: MODE_PLAN,
+    mode_goal: MODE_GOAL,
     status_ready: TEXT_MUTED,
     status_working: DEEPSEEK_SKY,
     status_warning: STATUS_WARNING,
@@ -382,6 +385,7 @@ pub const LIGHT_UI_THEME: UiTheme = UiTheme {
     mode_agent: DEEPSEEK_BLUE,
     mode_yolo: DEEPSEEK_RED,
     mode_plan: Color::Rgb(180, 83, 9),
+    mode_goal: Color::Rgb(80, 180, 130), // mint green
     status_ready: LIGHT_TEXT_MUTED,
     status_working: DEEPSEEK_BLUE,
     status_warning: Color::Rgb(180, 83, 9),
@@ -406,6 +410,7 @@ pub const GRAYSCALE_UI_THEME: UiTheme = UiTheme {
     mode_agent: GRAYSCALE_TEXT_SOFT,
     mode_yolo: GRAYSCALE_TEXT_BODY,
     mode_plan: GRAYSCALE_TEXT_MUTED,
+    mode_goal: GRAYSCALE_TEXT_SOFT,
     status_ready: GRAYSCALE_TEXT_MUTED,
     status_working: GRAYSCALE_TEXT_SOFT,
     status_warning: GRAYSCALE_TEXT_BODY,
@@ -430,6 +435,7 @@ pub const CATPPUCCIN_MOCHA_UI_THEME: UiTheme = UiTheme {
     mode_agent: Color::Rgb(0x89, 0xb4, 0xfa),     // blue
     mode_yolo: Color::Rgb(0xf3, 0x8b, 0xa8),      // red
     mode_plan: Color::Rgb(0xfa, 0xb3, 0x87),      // peach
+    mode_goal: Color::Rgb(0xa6, 0xe3, 0xa1),      // green
     status_ready: Color::Rgb(0x7f, 0x84, 0x9c),   // overlay1
     status_working: Color::Rgb(0x74, 0xc7, 0xec), // sapphire
     status_warning: Color::Rgb(0xf9, 0xe2, 0xaf), // yellow
@@ -454,6 +460,7 @@ pub const TOKYO_NIGHT_UI_THEME: UiTheme = UiTheme {
     mode_agent: Color::Rgb(0x7a, 0xa2, 0xf7),     // blue
     mode_yolo: Color::Rgb(0xf7, 0x76, 0x8e),      // red
     mode_plan: Color::Rgb(0xff, 0x9e, 0x64),      // orange
+    mode_goal: Color::Rgb(0x9e, 0xce, 0x6a),      // green
     status_ready: Color::Rgb(0x56, 0x5f, 0x89),   // comment
     status_working: Color::Rgb(0x7d, 0xcf, 0xff), // cyan
     status_warning: Color::Rgb(0xe0, 0xaf, 0x68), // yellow
@@ -478,6 +485,7 @@ pub const DRACULA_UI_THEME: UiTheme = UiTheme {
     mode_agent: Color::Rgb(0xbd, 0x93, 0xf9),     // purple
     mode_yolo: Color::Rgb(0xff, 0x55, 0x55),      // red
     mode_plan: Color::Rgb(0xff, 0xb8, 0x6c),      // orange
+    mode_goal: Color::Rgb(0x50, 0xfa, 0x7b),      // green
     status_ready: Color::Rgb(0x62, 0x72, 0xa4),   // comment
     status_working: Color::Rgb(0x8b, 0xe9, 0xfd), // cyan
     status_warning: Color::Rgb(0xf1, 0xfa, 0x8c), // yellow
@@ -502,6 +510,7 @@ pub const GRUVBOX_DARK_UI_THEME: UiTheme = UiTheme {
     mode_agent: Color::Rgb(0x83, 0xa5, 0x98),     // blue
     mode_yolo: Color::Rgb(0xfb, 0x49, 0x34),      // red
     mode_plan: Color::Rgb(0xfe, 0x80, 0x19),      // orange
+    mode_goal: Color::Rgb(0x8e, 0xc0, 0x7c),      // green
     status_ready: Color::Rgb(0x92, 0x83, 0x74),   // gray
     status_working: Color::Rgb(0x8e, 0xc0, 0x7c), // aqua
     status_warning: Color::Rgb(0xfa, 0xbd, 0x2f), // yellow
@@ -1089,7 +1098,8 @@ fn grayscale_bg_from_luma(luma: u8) -> Color {
 }
 
 fn luma(r: u8, g: u8, b: u8) -> u8 {
-    (((u16::from(r) * 299) + (u16::from(g) * 587) + (u16::from(b) * 114)) / 1000) as u8
+    let weighted = u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114;
+    (weighted / 1000) as u8
 }
 // === Color depth + brightness helpers (v0.6.6 UI redesign) ===
 
@@ -1355,7 +1365,7 @@ mod tests {
         LIGHT_SURFACE, LIGHT_TEXT_BODY, LIGHT_TEXT_HINT, LIGHT_UI_THEME, PaletteMode,
         SURFACE_REASONING, SURFACE_REASONING_TINT, TEXT_BODY, TEXT_HINT, TEXT_REASONING,
         TEXT_TOOL_OUTPUT, UI_THEME, adapt_bg, adapt_bg_for_palette_mode, adapt_color,
-        adapt_fg_for_palette_mode, blend, nearest_ansi16, normalize_hex_rgb_color,
+        adapt_fg_for_palette_mode, blend, luma, nearest_ansi16, normalize_hex_rgb_color,
         normalize_theme_name, parse_hex_rgb_color, pulse_brightness, reasoning_surface_tint,
         rgb_to_ansi256, theme_label_for_mode, ui_theme_from_settings,
     };
@@ -1537,6 +1547,19 @@ mod tests {
         assert_eq!(
             adapt_fg_for_palette_mode(TEXT_HINT, GRAYSCALE_SURFACE, PaletteMode::Grayscale),
             GRAYSCALE_TEXT_HINT
+        );
+    }
+
+    #[test]
+    fn grayscale_luma_handles_bright_rgb_without_overflow() {
+        assert_eq!(luma(255, 255, 255), 255);
+        assert_eq!(
+            adapt_fg_for_palette_mode(
+                Color::Rgb(255, 255, 255),
+                GRAYSCALE_SURFACE,
+                PaletteMode::Grayscale
+            ),
+            GRAYSCALE_TEXT_BODY
         );
     }
 
