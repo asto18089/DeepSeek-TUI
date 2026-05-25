@@ -131,6 +131,33 @@ pub(super) fn format_tool_error(err: &ToolError, tool_name: &str) -> String {
     }
 }
 
+/// Extra guidance appended to a file-writing tool's error when the arguments
+/// came back missing a required field.
+///
+/// On a slow local backend a large `content` argument can out-run the SSE idle
+/// timeout: the stream dies mid-arguments, the truncated buffer is brace-repaired
+/// into a call that's missing `path` or `content`, and the model — seeing only a
+/// terse "missing required field" — re-emits the identical oversized call until
+/// the loop guard blocks it (wasting several idle-timeout windows). A `MissingField`
+/// on `write_file` / `append_file` is essentially always this truncation artifact,
+/// not a deliberate malformed call, so we redirect the model to the chunked path.
+///
+/// Scoped to `MissingField` only: `write_file`'s own oversize rejection returns
+/// `InvalidInput` (which already carries chunking guidance), so there's no overlap.
+pub(super) fn truncated_args_hint(tool_name: &str, err: &ToolError) -> Option<&'static str> {
+    let is_file_write = matches!(tool_name, "write_file" | "append_file");
+    if is_file_write && matches!(err, ToolError::MissingField { .. }) {
+        return Some(
+            "\n\nThis almost always means the tool-call arguments were truncated \
+             mid-stream — a large `content` value out-ran the response idle timeout \
+             before it finished sending. Do NOT resend the same call unchanged. \
+             Instead write a small skeleton with write_file (placeholder markers, no \
+             inline CSS/JS), then build the file up with append_file in ≤16KB chunks.",
+        );
+    }
+    None
+}
+
 // === Streaming-buffer parsing =========================================
 
 /// Promote a streaming `ToolUseState` to a finalized JSON input.

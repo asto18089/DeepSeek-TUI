@@ -2033,6 +2033,27 @@ fn final_tool_input_repairs_unparseable_buffer() {
     assert_eq!(final_tool_input(&state), json!({}));
 }
 
+#[test]
+fn truncated_args_hint_fires_for_file_write_missing_field() {
+    use crate::tools::spec::ToolError;
+    // write_file / append_file coming back missing a required field is the
+    // SSE-truncation signature → must carry chunking guidance.
+    let hint = truncated_args_hint("write_file", &ToolError::missing_field("path"))
+        .expect("write_file missing field should hint");
+    assert!(hint.contains("append_file"), "{hint}");
+    assert!(truncated_args_hint("append_file", &ToolError::missing_field("content")).is_some());
+}
+
+#[test]
+fn truncated_args_hint_skips_other_tools_and_other_errors() {
+    use crate::tools::spec::ToolError;
+    // Non-file-write tools: no hint even on missing field.
+    assert!(truncated_args_hint("exec_shell", &ToolError::missing_field("command")).is_none());
+    // write_file oversize rejection is InvalidInput (already has guidance) — no
+    // double hint.
+    assert!(truncated_args_hint("write_file", &ToolError::invalid_input("too big")).is_none());
+}
+
 // === #103 transparent stream-retry policy =====================================
 
 #[test]

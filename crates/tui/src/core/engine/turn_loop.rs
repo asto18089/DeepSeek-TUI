@@ -466,6 +466,33 @@ impl Engine {
                     Err(e) => {
                         stream_errors = stream_errors.saturating_add(1);
                         let message = self.decorate_auth_error_message(e.to_string());
+                        // Diagnostic for the SSE-idle-timeout-mid-tool-call bug:
+                        // when the stream dies with tool_use blocks still open,
+                        // dump each one's buffer state. An empty buffer means the
+                        // timeout fired BEFORE any argument delta arrived (the
+                        // half-born call later dispatches missing required fields,
+                        // e.g. write_file missing 'path'); a partial buffer means
+                        // the args were truncated mid-stream and arg_repair will
+                        // drop the tail. This is the line that confirms which path.
+                        if !tool_uses.is_empty() {
+                            let inflight: Vec<String> = tool_uses
+                                .iter()
+                                .map(|t| {
+                                    let head: String = t.input_buffer.chars().take(80).collect();
+                                    format!(
+                                        "{}(id={}, buf_len={}, head={head:?})",
+                                        t.name,
+                                        t.id,
+                                        t.input_buffer.len()
+                                    )
+                                })
+                                .collect();
+                            crate::logging::warn(format!(
+                                "stream error with {} tool_use block(s) in flight: [{}] — {message}",
+                                tool_uses.len(),
+                                inflight.join(", "),
+                            ));
+                        }
                         // #103: when the stream errors before any content was
                         // streamed AND we still have retry budget, transparently
                         // resend the request. DeepSeek has not billed for any
@@ -1863,7 +1890,10 @@ impl Engine {
                         }));
                         step_error_count += 1;
                         step_error_categories.push(envelope.category);
-                        let error = format_tool_error(&e, &outcome.name);
+                        let mut error = format_tool_error(&e, &outcome.name);
+                        if let Some(hint) = truncated_args_hint(&outcome.name, &e) {
+                            error.push_str(hint);
+                        }
                         tool_call.set_error(error.clone(), duration);
                         self.session.working_set.observe_tool_call(
                             &tool_name_for_ws,

@@ -272,9 +272,19 @@ impl DeepSeekClient {
                     Ok(Some(result)) => result,
                     Ok(None) => break, // Stream ended normally
                     Err(_elapsed) => {
+                        // Include byte/timing telemetry so we can distinguish a
+                        // prefill-stall (0 bytes received → backend never emitted
+                        // a first chunk) from a mid-arguments stall (bytes>0 →
+                        // stream died partway through a large tool-call arg). This
+                        // is the signal that tells the SSE-timeout-on-big-write
+                        // investigation which failure path actually fired.
                         yield Err(anyhow::anyhow!(
-                            "SSE stream idle timeout after {}s — no data received",
+                            "SSE stream idle timeout after {}s — no data received \
+                             (bytes_received={}, stream_age={}s since first byte={}s ago)",
                             idle.as_secs(),
+                            bytes_received,
+                            stream_start.elapsed().as_secs(),
+                            last_event_at.elapsed().as_secs(),
                         ));
                         break;
                     }

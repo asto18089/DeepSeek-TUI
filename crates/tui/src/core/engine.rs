@@ -1949,6 +1949,7 @@ use self::dispatch::{
     ParallelToolResult, ParallelToolResultEntry, ToolExecGuard, ToolExecOutcome,
     ToolExecutionBatch, ToolExecutionPlan, caller_allowed_for_tool, caller_type_for_tool_use,
     final_tool_input, format_tool_error, mcp_tool_approval_description, mcp_tool_is_parallel_safe,
+    truncated_args_hint,
     mcp_tool_is_read_only, parse_parallel_tool_calls, parse_tool_input,
     plan_tool_execution_batches, should_force_update_plan_first, should_stop_after_plan_tool,
 };
