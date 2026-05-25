@@ -2045,6 +2045,16 @@ fn truncated_args_hint_fires_for_file_write_missing_field() {
         .expect("write_file missing field should hint");
     assert!(hint.contains("append_file"), "{hint}");
     assert!(truncated_args_hint("append_file", &ToolError::missing_field("content")).is_some());
+    // required_str surfaces a truncated `content` as InvalidInput, not
+    // MissingField — that path must hint too (the observed pinvou3 stall loop).
+    assert!(
+        truncated_args_hint(
+            "write_file",
+            &ToolError::invalid_input("missing required field 'content'. Input provided: path")
+        )
+        .is_some(),
+        "InvalidInput naming a missing required field is a truncation artifact"
+    );
 }
 
 #[test]
@@ -2053,8 +2063,20 @@ fn truncated_args_hint_skips_other_tools_and_other_errors() {
     // Non-file-write tools: no hint even on missing field.
     assert!(truncated_args_hint("exec_shell", &ToolError::missing_field("command")).is_none());
     // write_file oversize rejection is InvalidInput (already has guidance) — no
-    // double hint.
+    // double hint. Its message is the over-the-limit text, NOT "missing required
+    // field", so the InvalidInput arm must not match it.
     assert!(truncated_args_hint("write_file", &ToolError::invalid_input("too big")).is_none());
+    assert!(
+        truncated_args_hint(
+            "write_file",
+            &ToolError::invalid_input(
+                "write_file content is 99999 bytes — over the 64KB single-call limit. \
+                 ... append_file in ≤16KB chunks."
+            )
+        )
+        .is_none(),
+        "oversize rejection already carries guidance — must not double-hint"
+    );
 }
 
 // === #103 transparent stream-retry policy =====================================

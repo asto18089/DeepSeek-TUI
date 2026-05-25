@@ -138,15 +138,28 @@ pub(super) fn format_tool_error(err: &ToolError, tool_name: &str) -> String {
 /// timeout: the stream dies mid-arguments, the truncated buffer is brace-repaired
 /// into a call that's missing `path` or `content`, and the model — seeing only a
 /// terse "missing required field" — re-emits the identical oversized call until
-/// the loop guard blocks it (wasting several idle-timeout windows). A `MissingField`
-/// on `write_file` / `append_file` is essentially always this truncation artifact,
+/// the loop guard blocks it (wasting several idle-timeout windows). On
+/// `write_file` / `append_file` this is essentially always a truncation artifact,
 /// not a deliberate malformed call, so we redirect the model to the chunked path.
 ///
-/// Scoped to `MissingField` only: `write_file`'s own oversize rejection returns
-/// `InvalidInput` (which already carries chunking guidance), so there's no overlap.
+/// The missing field surfaces as **either** variant depending on the arg path:
+///   - engine taxonomy → `ToolError::MissingField`
+///   - tool validation (`required_str`) → `ToolError::InvalidInput` whose message
+///     reads "missing required field '…'"
+/// We match both. The `InvalidInput` arm is scoped to the "missing required field"
+/// signature on purpose so it does NOT overlap with `write_file`'s oversize
+/// rejection — that's also `InvalidInput`, but its message is the over-the-limit
+/// text that already carries chunking guidance.
 pub(super) fn truncated_args_hint(tool_name: &str, err: &ToolError) -> Option<&'static str> {
-    let is_file_write = matches!(tool_name, "write_file" | "append_file");
-    if is_file_write && matches!(err, ToolError::MissingField { .. }) {
+    if !matches!(tool_name, "write_file" | "append_file") {
+        return None;
+    }
+    let is_truncation = match err {
+        ToolError::MissingField { .. } => true,
+        ToolError::InvalidInput { message } => message.contains("missing required field"),
+        _ => false,
+    };
+    if is_truncation {
         return Some(
             "\n\nThis almost always means the tool-call arguments were truncated \
              mid-stream — a large `content` value out-ran the response idle timeout \
