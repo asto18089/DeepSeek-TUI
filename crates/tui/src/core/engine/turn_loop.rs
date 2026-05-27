@@ -20,6 +20,11 @@ impl Engine {
         mode: AppMode,
         force_update_plan_first: bool,
     ) -> (TurnOutcomeStatus, Option<String>) {
+        // Signal to the terminal / taskbar that a turn is in progress
+        // (OSC 9 ; 4 indeterminate progress + title spinner).
+        crate::tui::notifications::set_taskbar_progress_busy();
+        crate::tui::notifications::start_title_animation("DeepSeek TUI");
+
         let client = self
             .deepseek_client
             .clone()
@@ -30,10 +35,11 @@ impl Engine {
         let mut context_recovery_attempts = 0u8;
         let mut tool_catalog = tools.unwrap_or_default();
         if !tool_catalog.is_empty() {
-            ensure_advanced_tooling(&mut tool_catalog, mode);
+            ensure_advanced_tooling(&mut tool_catalog, mode, &self.config.tools_always_load);
         }
         let mut active_tool_names = initial_active_tools(&tool_catalog);
         let mut loop_guard = LoopGuard::default();
+        let mut goal_continuations_this_turn = 0u32;
 
         // Transparent stream-retry counter: when the chunked-transfer
         // connection dies mid-stream and we got nothing useful out of it
@@ -1170,6 +1176,21 @@ impl Engine {
                     continue;
                 }
 
+                if let Some(continuation) = self
+                    .goal_continuation_message_if_needed(
+                        tool_registry,
+                        &mut goal_continuations_this_turn,
+                    )
+                    .await
+                {
+                    self.add_session_message(
+                        self.user_text_message_with_turn_metadata(continuation),
+                    )
+                    .await;
+                    turn.next_step();
+                    continue;
+                }
+
                 if thinking_only_no_sendable {
                     let holding_for_subagents = {
                         let running = {
@@ -2001,7 +2022,9 @@ impl Engine {
 
             if let Some(message) = loop_guard_halt {
                 crate::logging::warn(message.clone());
-                let _ = self.tx_event.send(Event::status(message)).await;
+                let _ = self.tx_event.send(Event::status(message.clone())).await;
+                // 设置 turn_error 以确保最终返回 TurnOutcomeStatus::Failed 而非 Completed
+                turn_error = Some(message);
                 break;
             }
 
@@ -2063,6 +2086,55 @@ impl Engine {
         (TurnOutcomeStatus::Completed, None)
     }
 
+    async fn goal_continuation_message_if_needed(
+        &self,
+        tool_registry: Option<&crate::tools::ToolRegistry>,
+        continuations_this_turn: &mut u32,
+    ) -> Option<String> {
+        let registry = tool_registry?;
+        if !registry.contains("update_goal") {
+            return None;
+        }
+
+        let snapshot = match self.config.goal_state.lock() {
+            Ok(state) => state.snapshot(),
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned during continuation check: {err}");
+                return None;
+            }
+        };
+
+        if !snapshot.is_active() {
+            return None;
+        }
+
+        let max = crate::tools::goal::MAX_GOAL_CONTINUATIONS_PER_TURN;
+        if *continuations_this_turn >= max {
+            let _ = self
+                .tx_event
+                .send(Event::status(format!(
+                    "Goal remains active after {max} continuation pass(es); ending turn to avoid a runaway loop."
+                )))
+                .await;
+            return None;
+        }
+
+        *continuations_this_turn = (*continuations_this_turn).saturating_add(1);
+        let _ = self
+            .tx_event
+            .send(Event::status(format!(
+                "Continuing active goal audit ({}/{max})",
+                *continuations_this_turn
+            )))
+            .await;
+
+        Some(crate::tools::goal::render_continuation_prompt(
+            &snapshot,
+            *continuations_this_turn,
+            max,
+        ))
+    }
+
     pub(super) fn messages_with_turn_metadata(&self) -> Vec<Message> {
         // `<turn_meta>` is stored on user-text messages when the message is
         // appended. Do not rewrite historical messages at request time: doing
@@ -2073,11 +2145,14 @@ impl Engine {
 }
 
 fn subagent_completion_runtime_message(payload: &str) -> Message {
-    // [pinvou3-fork] role 从 "system" → "user":
-    // Qwen3.6 chat_template (其他严格 jinja template 同) 硬性要求 system message
-    // 必须 messages[0],追加到中间会 raise "System message must be at the beginning"
-    // → vLLM 返回 400 BadRequest → subagent 链路在 parent 转述阶段全部失败。
-    // visibility="internal" 标签已让 LLM 识别为内部 runtime 事件,role 改 user 不丢语义。
+    // Role is "user", not "system": some OpenAI-compatible backends apply a
+    // strict chat template (e.g. vLLM serving Qwen3) that requires any system
+    // message to be messages[0]. A system message appended mid-conversation
+    // makes the template raise "System message must be at the beginning",
+    // which surfaces as a 400 BadRequest and breaks the whole sub-agent
+    // hand-off in the parent turn. The `visibility="internal"` tag already
+    // tells the model this is a runtime event rather than user input, so the
+    // role carries no semantic weight here — only template-compatibility cost.
     Message {
         role: "user".to_string(),
         content: vec![ContentBlock::Text {
@@ -2252,9 +2327,10 @@ mod tests {
             "Build passed\n<codewhale:subagent.done>{\"agent_id\":\"agent_a\"}</codewhale:subagent.done>",
         );
 
-        // [pinvou3-fork] role is "user", not "system": strict chat templates
-        // (vLLM/Qwen3) reject a system message appended mid-conversation with
-        // a 400. See subagent_completion_runtime_message. (Upstream PR #2057.)
+        // Must be "user", not "system": a system message appended mid-stream
+        // trips strict chat templates (vLLM/Qwen3) into a 400 BadRequest
+        // ("System message must be at the beginning"). The internal-event
+        // framing lives in the text + visibility tag, not the role.
         assert_eq!(message.role, "user");
         let text = match &message.content[0] {
             ContentBlock::Text { text, .. } => text,

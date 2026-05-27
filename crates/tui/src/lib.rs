@@ -57,6 +57,7 @@ pub mod skill_state;
 pub mod skills;
 pub mod snapshot;
 pub mod task_manager;
+pub mod tool_output_receipts;
 pub mod tools;
 pub mod tui;
 pub mod utils;

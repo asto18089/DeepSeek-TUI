@@ -64,9 +64,12 @@ fn release_resident_leases_for(agent_id: &str) {
 
 // [pinvou3-fork] C+: 100→20。参考 CrewAI Agent(max_iter=15) / OpenHands max_iterations=30 折中。
 // 100 步太宽,弱模型可能死磕 17+ 分钟。20 步足够 single-task subagent,且 cargo test 内可结束。
+// 注:上游 #2034 改为 `u32::MAX`(取消固定 cap,靠 explicit budget / final-response 终止)。
+// pinvou3 保留固定 cap 作本地弱模型(Qwen3.6)死磕兜底;subagent owner 可评估是否跟进 u32::MAX。
 const DEFAULT_MAX_STEPS: u32 = 20;
 // [pinvou3-fork] C: 单 subagent 内部 elapsed 硬上限 300s (5min)。参考 CrewAI Task(max_execution_time=300)。
 // 防 subagent 内部死磕反复重试任何场景 (web_search 失败 / LLM verbose / tool 卡死)。
+// (上游 #2034 一并移除了 elapsed cap;pinvou3 保留。)
 const DEFAULT_SUBAGENT_ELAPSED_MAX: Duration = Duration::from_secs(300);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Per-step LLM API call timeout. Each `create_message` request must complete
@@ -1857,6 +1860,11 @@ async fn subagent_session_projection(
 }
 
 fn default_state_path(workspace: &Path) -> PathBuf {
+    // Prefer .codewhale, fall back to .deepseek for project-local state
+    let primary = workspace.join(".codewhale").join("state");
+    if primary.exists() {
+        return primary.join(SUBAGENT_STATE_FILE);
+    }
     workspace
         .join(".deepseek")
         .join("state")
@@ -3527,12 +3535,6 @@ async fn run_subagent_task(task: SubAgentTask) {
     )
     .await;
 
-    let mut manager = task.manager_handle.write().await;
-    match &result {
-        Ok(res) => manager.update_from_result(&task.agent_id, res.clone()),
-        Err(err) => manager.update_failed(&task.agent_id, err.to_string()),
-    }
-
     // Emit BOTH a human-friendly summary (rendered in the parent's
     // sidebar / cell) AND a structured sentinel the model can recognize
     // on its next turn. Format: human summary on the first line,
@@ -3565,16 +3567,24 @@ async fn run_subagent_task(task: SubAgentTask) {
     }
 
     let payload = format!("{summary}\n{sentinel}");
+    let agent_id = task.agent_id.clone();
 
     // Wake the engine's parent turn loop if this is one of its direct
-    // children (issue #756). Gating by `spawn_depth == 1` means the parent
-    // only sees completions for agents it directly orchestrated, not for
-    // grandchildren spawned recursively inside its children.
-    emit_parent_completion(&task.runtime, &task.agent_id, &payload);
+    // children (issue #756). Issue #1961 also requires emit to happen
+    // before marking the manager terminal state so the parent can observe the
+    // completion while its "running children" gate is still open. If we
+    // update first, the parent can finalize before the completion arrives.
+    emit_parent_completion(&task.runtime, &agent_id, &payload);
+
+    let mut manager = task.manager_handle.write().await;
+    match &result {
+        Ok(res) => manager.update_from_result(&agent_id, res.clone()),
+        Err(err) => manager.update_failed(&agent_id, err.to_string()),
+    }
 
     if let Some(event_tx) = task.runtime.event_tx {
         let _ = event_tx.try_send(Event::AgentComplete {
-            id: task.agent_id,
+            id: agent_id.clone(),
             result: payload,
         });
     }

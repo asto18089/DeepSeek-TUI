@@ -37,12 +37,11 @@ const API_MAX_OUTPUT_TOKENS: u32 = 65_536;
 /// `DEEPSEEK_MAX_OUTPUT_TOKENS=16384` so input + output stays well under the
 /// provider's hard limit.
 pub(super) fn effective_max_output_tokens(model: &str) -> u32 {
-    if let Ok(raw) = std::env::var("DEEPSEEK_MAX_OUTPUT_TOKENS") {
-        if let Ok(n) = raw.trim().parse::<u32>() {
-            if n > 0 {
-                return n;
-            }
-        }
+    if let Ok(raw) = std::env::var("DEEPSEEK_MAX_OUTPUT_TOKENS")
+        && let Ok(n) = raw.trim().parse::<u32>()
+        && n > 0
+    {
+        return n;
     }
     let window = context_window_for_model(model).unwrap_or(128_000);
     if window >= 500_000 {
@@ -369,32 +368,30 @@ pub(super) fn estimate_input_tokens_conservative(
         .saturating_add(framing_overhead)
 }
 
-/// Threshold (in tokens) above which a model is treated as "large-context"
-/// for internal budgeting. Above this, `context_input_budget` reserves the
-/// full [`TURN_MAX_OUTPUT_TOKENS`] (262K) headroom to leave room for V4
-/// interleaved thinking. Below this, it uses [`effective_max_output_tokens`]
-/// — i.e. what the API actually sends — so a 256K-window self-hosted model
-/// (e.g. vLLM Qwen with `--max-model-len 262144` and
-/// `DEEPSEEK_MAX_OUTPUT_TOKENS=16384`) ends up with a usable input budget
-/// instead of `None`.
+/// Context windows at or above this size reserve the full
+/// [`TURN_MAX_OUTPUT_TOKENS`] (262K) when computing the internal input budget,
+/// leaving room for V4-class interleaved thinking. Below it, the reservation
+/// falls back to [`effective_max_output_tokens`] so a smaller self-hosted
+/// window does not underflow to a negative budget.
 const INTERNAL_BUDGET_LARGE_WINDOW_THRESHOLD: u32 = 500_000;
 
-/// Compute the input-side token budget for a model.
-///
-/// `budget = window - reserved_output - headroom`
+/// Internal input-side token budget for a model: `window - reserved_output -
+/// headroom`. Used by the preflight check, emergency recovery, and capacity
+/// trimming to decide when to compact.
 ///
 /// The reserved-output term is window-dependent:
-///   * `window ≥ 500K` (V4-class) → [`TURN_MAX_OUTPUT_TOKENS`] (262K).
-///     Preserves the upstream "leave room for V4 interleaved thinking"
-///     contract validated by `internal_context_budget_unaffected_by_api_request_cap`.
-///   * `window < 500K` (smaller / self-hosted) → [`effective_max_output_tokens`].
-///     Without this branch a 256K-window Qwen deployment computes
-///     `256K - 262K - 1K = negative` and returns `None`, silently
-///     disabling every preflight and emergency-recovery path.
+///   * `window >= 500K` (V4-class large-context) -> [`TURN_MAX_OUTPUT_TOKENS`]
+///     (262K). Preserves the "leave room for interleaved thinking" contract.
+///   * `window < 500K` (smaller / self-hosted, e.g. a 256K vLLM Qwen window)
+///     -> [`effective_max_output_tokens`], i.e. what the API actually caps
+///     output at. Reserving the full 262K here would compute
+///     `256K - 262K - 1K`, which underflows `checked_sub` to `None` and
+///     *silently disables every preflight and emergency recovery path* — the
+///     session then runs until the provider hard-rejects on context length.
 pub(super) fn context_input_budget(model: &str) -> Option<usize> {
-    let window_u32 = context_window_for_model(model)?;
-    let window = usize::try_from(window_u32).ok()?;
-    let reserved_output = if window_u32 >= INTERNAL_BUDGET_LARGE_WINDOW_THRESHOLD {
+    let window_tokens = context_window_for_model(model)?;
+    let window = usize::try_from(window_tokens).ok()?;
+    let reserved_output = if window_tokens >= INTERNAL_BUDGET_LARGE_WINDOW_THRESHOLD {
         TURN_MAX_OUTPUT_TOKENS
     } else {
         effective_max_output_tokens(model)

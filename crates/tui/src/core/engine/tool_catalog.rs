@@ -29,70 +29,58 @@ pub(super) fn is_tool_search_tool(name: &str) -> bool {
     matches!(name, TOOL_SEARCH_REGEX_NAME | TOOL_SEARCH_BM25_NAME)
 }
 
-pub(super) fn should_default_defer_tool(name: &str, mode: AppMode) -> bool {
-    // pinvou3 L1.5: blocklist 优先于所有 mode-specific 逻辑，
-    // 让 Yolo 模式也能隐藏非核心工具（GUI 单 session 场景不需要 task/agent/
-    // rlm/pr/git/fim/patch 类）。详见 pinvou3/docs/工具表精简方案.md
-    if crate::tools::pinvou3_blocklist::is_pinvou3_hidden(name) {
-        return true;
-    }
+pub(super) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
+    "agent_open",
+    "apply_patch",
+    "checklist_write",
+    "edit_file",
+    "exec_shell",
+    "fetch_url",
+    "file_search",
+    "git_diff",
+    "git_status",
+    "grep_files",
+    "list_dir",
+    "read_file",
+    "run_tests",
+    "task_create",
+    "task_list",
+    "task_read",
+    "update_plan",
+    "web_search",
+    "write_file",
+];
 
-    if mode == AppMode::Yolo {
+pub(super) fn should_default_defer_tool(
+    name: &str,
+    _mode: AppMode,
+    always_load: &HashSet<String>,
+) -> bool {
+    if always_load.contains(name) {
         return false;
     }
 
-    // Shell exec tools are kept active in Agent so the model can run
-    // verification commands (build/test/git/cargo) without first having to
-    // discover them through ToolSearch. Plan mode does not register shell
-    // execution tools.
-    let always_loaded_in_action_modes = matches!(mode, AppMode::Agent)
-        && matches!(
-            name,
-            "exec_shell"
-                | "exec_shell_wait"
-                | "exec_shell_interact"
-                | "exec_wait"
-                | "exec_interact"
-        );
-    if always_loaded_in_action_modes {
+    if is_tool_search_tool(name) {
         return false;
     }
 
-    !matches!(
-        name,
-        "read_file"
-            | "write_file"
-            | "list_dir"
-            | "grep_files"
-            | "file_search"
-            | "diagnostics"
-            | "rlm_open"
-            | "rlm_eval"
-            | "rlm_configure"
-            | "rlm_close"
-            | "rlm_session_objects"
-            | "handle_read"
-            | "recall_archive"
-            | "notify"
-            | MULTI_TOOL_PARALLEL_NAME
-            | "update_plan"
-            | "checklist_write"
-            | "todo_write"
-            | "task_create"
-            | "task_list"
-            | "task_read"
-            | "task_gate_run"
-            | "task_shell_start"
-            | "task_shell_wait"
-            | "github_issue_context"
-            | "github_pr_context"
-            | REQUEST_USER_INPUT_NAME
-    )
+    !DEFAULT_ACTIVE_NATIVE_TOOLS
+        .iter()
+        .any(|core_tool| core_tool == &name)
 }
 
-pub(super) fn apply_native_tool_deferral(catalog: &mut [Tool], mode: AppMode) {
+pub(super) fn apply_native_tool_deferral(
+    catalog: &mut [Tool],
+    mode: AppMode,
+    always_load: &HashSet<String>,
+) {
     for tool in &mut *catalog {
-        tool.defer_loading = Some(should_default_defer_tool(&tool.name, mode));
+        // [pinvou3-fork] blocklist 叠加在上游 defer 策略之上:强制隐藏 GUI 单 session
+        // 不需要的非核心工具(task/agent/rlm/pr/git/fim/patch 类,上游默认 active 列表含这些)。
+        // 放在 apply 层而非 should_default_defer_tool,保上游单测纯净。详见 docs/工具表精简方案.md
+        let blocklisted = crate::tools::pinvou3_blocklist::is_pinvou3_hidden(&tool.name);
+        tool.defer_loading =
+            Some(blocklisted || should_default_defer_tool(&tool.name, mode, always_load));
     }
     let active: Vec<&str> = catalog
         .iter()
@@ -133,8 +121,9 @@ pub(super) fn build_model_tool_catalog(
     mut native_tools: Vec<Tool>,
     mut mcp_tools: Vec<Tool>,
     mode: AppMode,
+    always_load: &HashSet<String>,
 ) -> Vec<Tool> {
-    apply_native_tool_deferral(&mut native_tools, mode);
+    apply_native_tool_deferral(&mut native_tools, mode, always_load);
     apply_mcp_tool_deferral(&mut mcp_tools, mode);
     // Sort each partition by name for prefix-cache stability (#263). The
     // upstream `to_api_tools()` already sorts the registry's HashMap output;
@@ -148,7 +137,11 @@ pub(super) fn build_model_tool_catalog(
     native_tools
 }
 
-pub(super) fn ensure_advanced_tooling(catalog: &mut Vec<Tool>, mode: AppMode) {
+pub(super) fn ensure_advanced_tooling(
+    catalog: &mut Vec<Tool>,
+    mode: AppMode,
+    always_load: &HashSet<String>,
+) {
     // code_execution depends on a locally-installed Python interpreter
     // (python3 / python / py -3). Before v0.8.31, the tool was always
     // advertised and would fail at execution time on Windows where
@@ -172,7 +165,11 @@ pub(super) fn ensure_advanced_tooling(catalog: &mut Vec<Tool>, mode: AppMode) {
                 "required": ["code"]
             }),
             allowed_callers: Some(vec!["direct".to_string()]),
-            defer_loading: Some(false),
+            defer_loading: Some(should_default_defer_tool(
+                CODE_EXECUTION_TOOL_NAME,
+                mode,
+                always_load,
+            )),
             input_examples: None,
             strict: None,
             cache_control: None,
@@ -188,7 +185,9 @@ pub(super) fn ensure_advanced_tooling(catalog: &mut Vec<Tool>, mode: AppMode) {
         && !catalog.iter().any(|t| t.name == JS_EXECUTION_TOOL_NAME)
         && crate::dependencies::resolve_node().is_some()
     {
-        catalog.push(crate::tools::js_execution::js_execution_tool_definition());
+        let mut tool = crate::tools::js_execution::js_execution_tool_definition();
+        tool.defer_loading = Some(should_default_defer_tool(&tool.name, mode, always_load));
+        catalog.push(tool);
     }
 
     if !catalog.iter().any(|t| t.name == TOOL_SEARCH_REGEX_NAME) {

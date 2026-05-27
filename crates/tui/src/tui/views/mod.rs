@@ -3,6 +3,7 @@ use ratatui::{buffer::Buffer, layout::Rect};
 use std::cell::{Cell, RefCell};
 use std::fmt;
 
+use crate::config::Config;
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::settings::Settings;
@@ -45,7 +46,6 @@ pub enum CommandPaletteAction {
     ExecuteCommand { command: String },
     InsertText { text: String },
     OpenTextPager { title: String, content: String },
-    VoiceInput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +156,11 @@ pub enum ViewEvent {
     ProviderPickerApiKeySubmitted {
         provider: crate::config::ApiProvider,
         api_key: String,
+    },
+    /// Emitted by the `/provider` picker when Kimi CLI OAuth credentials can
+    /// be reused for Moonshot/Kimi dispatch.
+    ProviderPickerKimiOAuthEnabled {
+        provider: crate::config::ApiProvider,
     },
     /// Emitted by the `/mode` picker when the user chooses a mode.
     ModeSelected {
@@ -611,6 +616,15 @@ impl ConfigView {
                 scope: ConfigScope::Saved,
             },
             ConfigRow {
+                section: ConfigSection::Model,
+                key: "base_url".to_string(),
+                value: Config::load(app.config_path.clone(), app.config_profile.as_deref())
+                    .map(|config| config.deepseek_base_url())
+                    .unwrap_or_else(|_| "(unavailable)".to_string()),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
                 section: ConfigSection::Permissions,
                 key: "approval_mode".to_string(),
                 value: app.approval_mode.label().to_string(),
@@ -743,23 +757,6 @@ impl ConfigView {
                 section: ConfigSection::Composer,
                 key: "paste_burst_detection".to_string(),
                 value: settings.paste_burst_detection.to_string(),
-                editable: true,
-                scope: ConfigScope::Saved,
-            },
-            ConfigRow {
-                section: ConfigSection::Composer,
-                key: "voice_input_command".to_string(),
-                value: settings
-                    .voice_input_command
-                    .clone()
-                    .unwrap_or_else(|| "(not configured)".to_string()),
-                editable: true,
-                scope: ConfigScope::Saved,
-            },
-            ConfigRow {
-                section: ConfigSection::Composer,
-                key: "voice_input_timeout_secs".to_string(),
-                value: settings.voice_input_timeout_secs.to_string(),
                 editable: true,
                 scope: ConfigScope::Saved,
             },
@@ -1146,8 +1143,6 @@ fn config_hint_for_key(key: &str) -> &'static str {
         "max_history" => "integer (0 allowed)",
         "default_model" => "deepseek-v4-pro | deepseek-v4-flash | deepseek-* | none/default",
         "reasoning_effort" => "auto | off | low | medium | high | max | default",
-        "voice_input_command" => "command string | none/default",
-        "voice_input_timeout_secs" => "1..=600",
         "mcp_config_path" => "path to mcp.json",
         _ => "",
     }
@@ -2028,6 +2023,7 @@ mod tests {
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use ratatui::{buffer::Buffer, layout::Rect};
+    use std::fs;
     use std::path::PathBuf;
 
     fn create_test_app() -> App {
@@ -2190,6 +2186,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(keys.contains(&"model"));
         assert!(keys.contains(&"reasoning_effort"));
+        assert!(keys.contains(&"base_url"));
         assert!(keys.contains(&"approval_mode"));
         assert!(keys.contains(&"theme"));
         assert!(keys.contains(&"locale"));
@@ -2201,13 +2198,37 @@ mod tests {
         assert!(keys.contains(&"composer_border"));
         assert!(keys.contains(&"composer_vim_mode"));
         assert!(keys.contains(&"bracketed_paste"));
-        assert!(keys.contains(&"voice_input_command"));
-        assert!(keys.contains(&"voice_input_timeout_secs"));
         assert!(keys.contains(&"context_panel"));
         assert!(keys.contains(&"cost_currency"));
         assert!(keys.contains(&"prefer_external_pdftotext"));
         assert!(keys.contains(&"mcp_config_path"));
         assert!(view.rows.iter().all(|row| row.editable));
+    }
+
+    #[test]
+    fn config_view_base_url_reflects_app_config_path() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "deepseek-tui-base-url-view-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let config_path = temp_root.join("config.toml");
+        fs::write(
+            &config_path,
+            "base_url = \"https://ui-config-view.local/v1\"\n",
+        )
+        .unwrap();
+
+        let mut app = create_test_app();
+        app.config_path = Some(config_path.clone());
+        let view = ConfigView::new_for_app(&app);
+
+        let row = view
+            .rows
+            .iter()
+            .find(|row| row.key == "base_url")
+            .expect("base_url row missing");
+        assert_eq!(row.value, "https://ui-config-view.local/v1");
     }
 
     #[test]

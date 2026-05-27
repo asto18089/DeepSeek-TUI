@@ -7,8 +7,8 @@
 //! - Proper cancellation support
 //! - Tool execution orchestration
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -42,6 +42,7 @@ use crate::models::{
 };
 use crate::prompts;
 use crate::seam_manager::{SeamConfig, SeamManager};
+use crate::tools::goal::{SharedGoalState, new_shared_goal_state};
 use crate::tools::plan::{SharedPlanState, new_shared_plan_state};
 use crate::tools::shell::{SharedShellManager, new_shared_shell_manager};
 use crate::tools::spec::RuntimeToolServices;
@@ -99,6 +100,9 @@ pub struct EngineConfig {
     /// When true, the model is instructed to respond in the current locale
     /// and a post-hoc translation layer replaces remaining English output.
     pub translation_enabled: bool,
+    /// Whether user-visible transcript rendering shows thinking blocks.
+    /// Prompt assembly uses this to avoid localizing hidden reasoning.
+    pub show_thinking: bool,
     /// Maximum number of assistant steps before stopping.
     pub max_steps: u32,
     /// Maximum number of concurrently active subagents.
@@ -122,6 +126,8 @@ pub struct EngineConfig {
     pub todos: SharedTodoList,
     /// Shared Plan state.
     pub plan_state: SharedPlanState,
+    /// Shared runtime goal state for model-visible goal tools.
+    pub goal_state: SharedGoalState,
     /// Maximum sub-agent recursion depth (default 3). See
     /// `SubAgentRuntime::max_spawn_depth`. Override via
     /// `[runtime] max_spawn_depth = N` in `~/.deepseek/config.toml`.
@@ -162,15 +168,23 @@ pub struct EngineConfig {
     pub strict_tool_mode: bool,
     /// Workshop / large-tool-output routing (#548). `None` disables routing.
     pub workshop: Option<crate::tools::large_output_router::WorkshopConfig>,
-    /// Which search backend `web_search` should use. Default: Bing.
+    /// Which search backend `web_search` should use. Default: DuckDuckGo.
     pub search_provider: crate::config::SearchProvider,
-    /// API key for Tavily or Bocha. `None` for Bing or DuckDuckGo.
+    /// API key for Tavily, Bocha, or Metaso. `None` for Bing or DuckDuckGo.
+    /// Metaso also falls back to `METASO_API_KEY` env var, then a built-in key.
     pub search_api_key: Option<String>,
     /// Per-step DeepSeek API timeout for sub-agent `create_message` requests.
     /// Resolved from `[subagents] api_timeout_secs` (clamped to 1..=1800)
     /// once at engine construction, then threaded onto every
     /// `SubAgentRuntime` the engine builds (#1806, #1808).
     pub subagent_api_timeout: Duration,
+    /// Native tools that should stay in the model-visible catalog even when
+    /// they are outside the small default core surface (#2076).
+    pub tools_always_load: HashSet<String>,
+    /// When true and `/usr/bin/bwrap` is present on Linux, route exec_shell
+    /// through bubblewrap instead of relying solely on Landlock (#2184).
+    #[allow(dead_code)] // Wired through ShellManager in follow-up PR
+    pub prefer_bwrap: bool,
 }
 
 impl Default for EngineConfig {
@@ -186,6 +200,7 @@ impl Default for EngineConfig {
             instructions: Vec::new(),
             project_context_pack_enabled: true,
             translation_enabled: false,
+            show_thinking: true,
             max_steps: 100,
             max_subagents: DEFAULT_MAX_SUBAGENTS,
             features: Features::with_defaults(),
@@ -194,6 +209,7 @@ impl Default for EngineConfig {
             capacity: CapacityControllerConfig::default(),
             todos: new_shared_todo_list(),
             plan_state: new_shared_plan_state(),
+            goal_state: new_shared_goal_state(),
             max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
             network_policy: None,
             snapshots_enabled: true,
@@ -214,6 +230,8 @@ impl Default for EngineConfig {
             subagent_api_timeout: Duration::from_secs(
                 crate::config::DEFAULT_SUBAGENT_API_TIMEOUT_SECS,
             ),
+            tools_always_load: HashSet::new(),
+            prefer_bwrap: false,
         }
     }
 }
@@ -371,6 +389,7 @@ impl Engine {
             ApiProvider::Openrouter => "OPENROUTER_API_KEY",
             ApiProvider::Novita => "NOVITA_API_KEY",
             ApiProvider::Fireworks => "FIREWORKS_API_KEY",
+            ApiProvider::Moonshot => "MOONSHOT_API_KEY/KIMI_API_KEY",
             ApiProvider::Sglang => "SGLANG_API_KEY",
             ApiProvider::Vllm => "VLLM_API_KEY",
             ApiProvider::Ollama => "OLLAMA_API_KEY",
@@ -399,6 +418,10 @@ impl Engine {
 
     /// Create a new engine with the given configuration
     pub fn new(config: EngineConfig, api_config: &Config) -> (Self, EngineHandle) {
+        if let Some(objective) = normalized_goal_objective(config.goal_objective.as_deref()) {
+            sync_goal_state_from_host(&config.goal_state, Some(&objective), None, false);
+        }
+
         let (tx_op, rx_op) = mpsc::channel(32);
         let (tx_event, rx_event) = mpsc::channel(256);
         let (tx_approval, rx_approval) = mpsc::channel(64);
@@ -430,6 +453,8 @@ impl Engine {
         // message at request time so file churn does not rewrite this prefix.
         let user_memory_block =
             crate::memory::compose_block(config.memory_enabled, &config.memory_path);
+        let prompt_goal_objective =
+            goal_objective_for_prompt(config.goal_objective.as_deref(), &config.goal_state);
         let system_prompt =
             prompts::system_prompt_for_mode_with_context_skills_session_and_approval(
                 AppMode::Agent,
@@ -439,11 +464,12 @@ impl Engine {
                 Some(&config.instructions),
                 prompts::PromptSessionContext {
                     user_memory_block: user_memory_block.as_deref(),
-                    goal_objective: config.goal_objective.as_deref(),
+                    goal_objective: prompt_goal_objective.as_deref(),
                     project_context_pack_enabled: config.project_context_pack_enabled,
                     locale_tag: &config.locale_tag,
                     translation_enabled: config.translation_enabled,
                     model_id: &config.model,
+                    show_thinking: config.show_thinking,
                 },
                 session.approval_mode,
             );
@@ -599,6 +625,7 @@ impl Engine {
                     auto_approve,
                     approval_mode,
                     translation_enabled,
+                    show_thinking,
                 } => {
                     self.handle_send_message(
                         content,
@@ -613,6 +640,7 @@ impl Engine {
                         auto_approve,
                         approval_mode,
                         translation_enabled,
+                        show_thinking,
                     )
                     .await;
                 }
@@ -819,6 +847,7 @@ impl Engine {
                         self.session.auto_approve,
                         self.session.approval_mode,
                         self.config.translation_enabled,
+                        self.config.show_thinking,
                     )
                     .await;
                 }
@@ -907,6 +936,7 @@ impl Engine {
         auto_approve: bool,
         approval_mode: crate::tui::approval::ApprovalMode,
         translation_enabled: bool,
+        show_thinking: bool,
     ) {
         // Reset cancel token for fresh turn (in case previous was cancelled)
         self.reset_cancel_token();
@@ -933,11 +963,17 @@ impl Engine {
         // work on the blocking pool so the async runtime stays responsive;
         // failure is non-fatal (the helper logs at WARN).
         if self.config.snapshots_enabled {
+            // Clone the user prompt now — `content` is moved into
+            // `user_text_message_with_turn_metadata` below, so we need
+            // a copy for both pre- and post-turn snapshot labels. The
+            // label carries a truncated first line so `/restore`
+            // listings are human-readable.
+            let snapshot_prompt = content.clone();
             let pre_workspace = self.session.workspace.clone();
             let pre_seq = self.turn_counter;
             let pre_cap = self.config.snapshots_max_workspace_bytes;
             let _ = tokio::task::spawn_blocking(move || {
-                pre_turn_snapshot(&pre_workspace, pre_seq, pre_cap)
+                pre_turn_snapshot(&pre_workspace, pre_seq, pre_cap, Some(&snapshot_prompt))
             })
             .await;
         }
@@ -947,6 +983,10 @@ impl Engine {
         // so the footer doesn't display a stale failure row across
         // turns (#499).
         crate::retry_status::clear();
+
+        // Clone user prompt for post-turn snapshot label before `content`
+        // is moved into `user_text_message_with_turn_metadata` below.
+        let snapshot_prompt_post = content.clone();
 
         // Check if we have the appropriate client
         if self.deepseek_client.is_none() {
@@ -979,9 +1019,21 @@ impl Engine {
         let user_msg = self.user_text_message_with_turn_metadata(content);
         self.session.add_message(user_msg);
 
+        let previous_goal_objective = self.config.goal_objective.clone();
+
         self.session.model = model;
         self.config.model.clone_from(&self.session.model);
-        self.config.goal_objective = goal_objective;
+        self.config.goal_objective = goal_objective.clone();
+        if normalized_goal_objective(previous_goal_objective.as_deref())
+            != normalized_goal_objective(goal_objective.as_deref())
+        {
+            sync_goal_state_from_host(
+                &self.config.goal_state,
+                normalized_goal_objective(goal_objective.as_deref()).as_deref(),
+                None,
+                false,
+            );
+        }
         self.session.reasoning_effort = reasoning_effort;
         self.session.reasoning_effort_auto = reasoning_effort_auto;
         self.session.auto_model = auto_model;
@@ -990,6 +1042,7 @@ impl Engine {
         self.session.trust_mode = trust_mode;
         self.config.trust_mode = trust_mode;
         self.config.translation_enabled = translation_enabled;
+        self.config.show_thinking = show_thinking;
         self.session.auto_approve = auto_approve;
         self.session.approval_mode = if auto_approve {
             crate::tui::approval::ApprovalMode::Auto
@@ -1114,7 +1167,12 @@ impl Engine {
             Vec::new()
         };
         let tools = tool_registry.as_ref().map(|registry| {
-            build_model_tool_catalog(registry.to_api_tools_with_cache(true), mcp_tools, mode)
+            build_model_tool_catalog(
+                registry.to_api_tools_with_cache(true),
+                mcp_tools,
+                mode,
+                &self.config.tools_always_load,
+            )
         });
 
         // Main turn loop
@@ -1157,11 +1215,18 @@ impl Engine {
         // paste immediately (#234). The git work proceeds on the blocking
         // pool without forcing the engine loop to await it.
         if self.config.snapshots_enabled {
+            // `snapshot_prompt_post` was cloned from `content` above,
+            // before `content` was moved into the session messages.
             let post_workspace = self.session.workspace.clone();
             let post_seq = self.turn_counter;
             let post_cap = self.config.snapshots_max_workspace_bytes;
             crate::utils::spawn_blocking_supervised("post-turn-snapshot", move || {
-                post_turn_snapshot(&post_workspace, post_seq, post_cap);
+                post_turn_snapshot(
+                    &post_workspace,
+                    post_seq,
+                    post_cap,
+                    Some(&snapshot_prompt_post),
+                );
             });
         }
     }
@@ -1806,6 +1871,10 @@ impl Engine {
     fn refresh_system_prompt(&mut self, mode: AppMode) {
         let user_memory_block =
             crate::memory::compose_block(self.config.memory_enabled, &self.config.memory_path);
+        let prompt_goal_objective = goal_objective_for_prompt(
+            self.config.goal_objective.as_deref(),
+            &self.config.goal_state,
+        );
         let base = prompts::system_prompt_for_mode_with_context_skills_session_and_approval(
             mode,
             &self.config.workspace,
@@ -1814,11 +1883,12 @@ impl Engine {
             Some(&self.config.instructions),
             prompts::PromptSessionContext {
                 user_memory_block: user_memory_block.as_deref(),
-                goal_objective: self.config.goal_objective.as_deref(),
+                goal_objective: prompt_goal_objective.as_deref(),
                 project_context_pack_enabled: self.config.project_context_pack_enabled,
                 locale_tag: &self.config.locale_tag,
                 translation_enabled: self.config.translation_enabled,
                 model_id: &self.config.model,
+                show_thinking: self.config.show_thinking,
             },
             self.session.approval_mode,
         );
@@ -1871,6 +1941,45 @@ fn system_prompt_hash(prompt: Option<&SystemPrompt>) -> u64 {
         }
     }
     hasher.finish()
+}
+
+fn normalized_goal_objective(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn sync_goal_state_from_host(
+    goal_state: &SharedGoalState,
+    objective: Option<&str>,
+    token_budget: Option<u32>,
+    completed: bool,
+) {
+    match goal_state.lock() {
+        Ok(mut state) => state.sync_from_host(objective, token_budget, completed),
+        Err(err) => tracing::warn!("goal state lock poisoned while syncing host goal: {err}"),
+    }
+}
+
+fn goal_objective_for_prompt(
+    configured_goal: Option<&str>,
+    goal_state: &SharedGoalState,
+) -> Option<String> {
+    match goal_state.lock() {
+        Ok(state) => {
+            if state.objective().is_some() {
+                return state.is_active().then(|| {
+                    state
+                        .objective()
+                        .expect("checked goal objective")
+                        .to_string()
+                });
+            }
+        }
+        Err(err) => tracing::warn!("goal state lock poisoned while building prompt: {err}"),
+    }
+    normalized_goal_objective(configured_goal)
 }
 
 /// Spawn the engine in a background task
@@ -1989,7 +2098,7 @@ use self::dispatch::{
 };
 use self::loop_guard::{AttemptDecision, LoopGuard, OutcomeDecision};
 #[cfg(test)]
-use self::lsp_hooks::{edited_paths_for_tool, parse_patch_paths};
+use self::lsp_hooks::edited_paths_for_tool;
 #[cfg(test)]
 use self::streaming::TOOL_CALL_START_MARKERS;
 use self::streaming::{

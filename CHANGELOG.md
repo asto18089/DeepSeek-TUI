@@ -7,6 +7,218 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Composer text selection with copy/cut.** Mouse drag and Shift+Arrow
+  selection in the composer input box, with Ctrl+C copy and Ctrl+X cut
+  support. Home, End, Ctrl+A, and Ctrl+E now clear the selection (#2228).
+- **Copy transcript without visual-wrap newlines.** Transcript copy now
+  strips visual-wrap column line breaks from paragraphs, producing clean
+  text for pasting into editors or prompts (#1906).
+- **Configurable base URL in /config view.** The `/config` panel now
+  displays the effective DeepSeek base URL (#1967).
+- **CNB mirror support for China-friendly downloads.** Added
+  `CODEWHALE_RELEASE_BASE_URL` and `CODEWHALE_USE_CNB_MIRROR` to
+  both npm install scripts and Rust self-updater (#2222).
+- **[✓] completion markers.** Checklist, plan, and tool completion
+  markers now render as `[✓]` instead of `[x]` (#1935).
+
+### Changed
+
+- **Project context loading now logs the source file.** (#2227)
+- **macOS onboarding and empty-state layout pinned to top** instead
+  of vertically centered (#1837).
+- **State-root migration continues.** Migrated 15+ storage paths to
+  prefer `~/.codewhale` with `~/.deepseek` fallback (#2231).
+- **READMEs updated for the CodeWhale rename.** All three READMEs now
+  reference canonical `~/.codewhale` paths.
+
+### Fixed
+
+- **Deadlock when spawning multiple concurrent sub-agents.** Replaced
+  `RwLock`-based serialisation with a `Semaphore(1)` (#1856).
+- **Steered/queued messages now render in correct transcript order.**
+  `steer_user_message` now flushes the active cell before inserting (#2225).
+- **Session save test updated for managed sessions directory.** (#2223).
+- **Loop guard reports Failed on halt.** Turn outcome correctly reports
+  `Failed` instead of `Completed` when the loop guard trips (#1859).
+- **DEEPSEEK_YOLO env honoured on startup.** The `--yolo` flag is now
+  correctly merged with the `DEEPSEEK_YOLO` environment variable (#1870).
+
+### Community
+
+Thanks to contributors whose PRs landed in this release:
+**@Fire-dtx** (#1856),
+**@imkingjh999** (#2228),
+**@harvey2011888** (#1859),
+**@victorcheng2333** (#1870),
+**@IIzzaya** (#1935),
+**@PurplePulse** (#1837),
+**@cyq1017** (#1967),
+**@knqiufan** (#1906).
+
+## [0.8.46] - 2026-05-26
+
+### Added
+
+- **`CODEWHALE_*` env aliases.** `CODEWHALE_PROVIDER`, `CODEWHALE_MODEL`,
+  and `CODEWHALE_BASE_URL` are public product-scoped aliases that take
+  precedence over the legacy `DEEPSEEK_*` forms. The `DEEPSEEK_*` names
+  remain accepted for back-compat.
+- **Platform archive bundles.** Release artifacts now ship as per-platform
+  archives (`tar.gz` for Linux/macOS, `.zip` for Windows) containing both
+  `codewhale` and `codewhale-tui` binaries plus an install script. No more
+  downloading two loose files and guessing which ones to pick (#2193).
+- **Windows portable archive.** `codewhale-windows-x64-portable.zip` ships
+  the two binaries without an install script for USB-stick distribution
+  (#2193).
+- **Web install download tile.** The website install page now shows a
+  platform-aware download tile with arch detection, SHA256 checksum
+  display, and China mirror links, instead of burying the download behind
+  the Cargo instructions (#2192).
+- **Whale dark palette refresh.** Better contrast and layer separation
+  across the TUI color scheme (#2197).
+- **Auto-collapse finished sub-agents.** Completed sub-agent sessions now
+  collapse automatically in the sidebar, reducing noise during long
+  sessions (#2195).
+- **Shell-running status chip.** A `⏳ shell running` chip appears in the
+  TUI footer while background shell tasks are active (#2194).
+- **Sandbox process hardening (Linux).** `PR_SET_DUMPABLE=0`,
+  `NO_NEW_PRIVS`, and `RLIMIT_CORE=0` are applied at shell startup to
+  harden child processes against inspection and privilege escalation
+  (#2183).
+- **CONTRIBUTING.md cross-links.** Issue and PR templates are now
+  cross-linked from CONTRIBUTING.md to improve contributor onboarding
+  (#2203).
+
+### Changed
+
+- **DeepSeek-first focus.** v0.8.46 refocuses on delivering the
+  highest-quality experience on DeepSeek first. Additional first-class
+  provider paths are planned for v0.9.0 after the core DeepSeek workflow
+  is solid.
+
+### Fixed
+
+- **Model name casing preserved.** `normalize_model_name_for_provider` no
+  longer lowercases user-set model names such as `DeepSeek-V4-Flash`,
+  preventing API lookup failures on case-sensitive backends (#2109).
+- **Esc in model picker applies selection.** Dismissing the model picker
+  with Esc now applies the last-highlighted choice instead of reverting
+  (#2196).
+- **Web install downloads both binaries.** The `install-binary.tsx`
+  snippet now fetches both `codewhale` and `codewhale-tui`, fixing the
+  `MISSING_COMPANION_BINARY` trap on fresh npm installs (#2191).
+- **`grep_files` skips large directories.** The pure-Rust search tool
+  now skips known-large directories (`.git`, `node_modules`, `target`)
+  before walking, preventing hangs on deep or slow filesystems.
+- **Version-update hint uses semver.** The update notification in the
+  footer now compares versions semantically instead of lexicographically,
+  so `0.8.10 > 0.8.9` is recognized correctly.
+- **CVE-2026-8723 in feishu-bridge.** Bumped `qs` to `>=6.15.2` in the
+  Feishu bridge integration (#2198).
+
+### Community
+
+Thanks to new contributors whose PRs landed in this release:
+**@donglovejava** (#2154, #2163, #2166, #2167, #2168),
+**@encyc** (#2152),
+**@saieswar237** (#2178),
+**@sximelon** (#2174),
+**@nanookclaw** (#2135),
+**@Sskift** (#2119),
+**@xin1104** (#2105),
+**@mrluanma** (#2059),
+**@Lellansin** (#2055),
+**@zhuangbiaowei** (#2145),
+**@aboimpinto** (#1872),
+and continuing contributors **@reidliu41**, **@cyq1017**, **@idling11**,
+**@h3c-hexin**, **@wdw8276**, **@zlh124**, and **@jeoor**.
+
+## [0.8.45] - 2026-05-25
+
+### Added
+
+- **RLM session objects.** `rlm_open` can now load `session://` refs,
+  exposing the active prompt, history, and session data as symbolic objects
+  inside RLM REPLs (#2047).
+- **Command palette voice input.** The command palette can launch a configured
+  speech-to-text helper and show footer status while transcription runs
+  (#2047).
+- **Moonshot/Kimi provider.** Moonshot/Kimi is now a first-class provider,
+  including API-key auth, model completion, CLI auth, secret-store
+  integration, and optional Kimi CLI credential reuse.
+- **Deterministic whale-species sub-agent names.** Sub-agents now get stable,
+  human-readable whale-species nicknames (e.g. "Beluga", "Orca") while
+  preserving the raw agent ID in the popup (#2035, #2016).
+- **`/balance` command scaffold.** Registered the `/balance` slash command
+  as a placeholder for future provider billing queries (#2035, #2019).
+- **Readable `/restore` snapshot labels.** Snapshot labels now include the
+  originating user prompt so restore listings are easier to identify. Thanks
+  @idling11 (#2111).
+- **Sidebar hover tooltips.** Truncated Work and Tasks sidebar lines now expose
+  their full text on hover. Thanks @idling11 (#2110).
+
+### Changed
+
+- **AGENTS.md is now maintainer-local.** The project instructions file no
+  longer ships as a tracked repo file; it lives in maintainer-local ignored
+  state (#2047).
+
+### Fixed
+
+- **Sub-agent completion handoff compatibility.** Completion handoffs now use a
+  chat-template-safe role and emit before terminal updates, fixing strict
+  OpenAI-compatible/self-hosted backends and preserving transcript ordering.
+  Thanks @h3c-hexin and @cyq1017 (#2057, #2120).
+- **Self-hosted context budgeting.** Sub-500K self-hosted model windows now keep
+  a usable input budget instead of disabling preflight compaction after output
+  reservation underflow. Thanks @h3c-hexin (#2060).
+- **Goal prompts start actionable.** Goal-start prompts now open in an
+  actionable state instead of requiring an extra nudge. Thanks @cyq1017
+  (#2097).
+- **Composer session title display.** The composer chrome shows the current
+  session title again and avoids grayscale luma overflow in debug builds.
+  Thanks @wdw8276 (#2108).
+- **Approval prompts use a one-step confirmation flow.** Enter now commits the
+  selected approval option directly, destructive warnings remain visible, and
+  abort cancels the active turn instead of only denying the current tool call.
+  Thanks @reidliu41 (#2143).
+- **Model picker selection survives Esc.** Dismissing the model picker with Esc
+  no longer loses the highlighted selection. Thanks @reidliu41 (#2056).
+- **Moonshot/Kimi sessions launch from the dispatcher.** The `codewhale`
+  wrapper now includes Moonshot/Kimi in the TUI provider allowlist, so
+  `codewhale --provider moonshot --model kimi-k2.6` reaches the TUI instead of
+  stopping after config resolution.
+- **Slash recovery no longer restores command tails in the composer.**
+  Resuming a session or recovering from a crash no longer leaves stale
+  slash-command text (e.g. `/sessions`) in the composer input (#2047, #2032).
+- **Remembered tool approvals now update the live active turn.**
+  When the "remember" checkbox is set on an approval dialog, the active
+  turn's auto-approve flag flips immediately instead of waiting for the
+  next turn. Thanks @gaord (#2047, #2041).
+- **YAML block scalars in SKILL.md frontmatter.** Multi-line descriptions
+  using `>` or `|` indicators are now parsed correctly — folded block
+  scalars join non-empty lines with spaces, literal scalars preserve
+  newlines, and all three chomping modes (strip/clip/keep) are supported.
+  Thanks @zlh124 (#1908, #1907).
+- **User messages highlighted in the transcript.** User-authored messages
+  now render with a full-row background in the live TUI transcript, making
+  it easier to scan prior turns. Assistant and system messages are
+  unaffected. Thanks @reidliu41 (#1995, #1672).
+- **Cancellable `list_dir` and `file_search`.** Long directory walks and
+  file searches now respond to user cancel/stop requests with a 30-second
+  fallback timeout, preventing the TUI from hanging on deep or slow
+  filesystems (#2035).
+
+### Community
+
+- **README contributor acknowledgements resynced.** The Thanks list now
+  includes the latest contributor rows for @donglovejava, @encyc,
+  @saieswar237, @sximelon, @nanookclaw, @Sskift, @xin1104, @mrluanma,
+  @Lellansin, and @zhuangbiaowei, while preserving the existing @jeoor
+  acknowledgement in the consolidated list.
+
 ## [0.8.44] - 2026-05-24
 
 ### Added
@@ -4806,7 +5018,9 @@ Welcome — and thank you.
 - Hooks system and config profiles
 - Example skills and launch assets
 
-[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.44...HEAD
+[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.46...HEAD
+[0.8.46]: https://github.com/Hmbown/CodeWhale/compare/v0.8.45...v0.8.46
+[0.8.45]: https://github.com/Hmbown/CodeWhale/compare/v0.8.44...v0.8.45
 [0.8.44]: https://github.com/Hmbown/CodeWhale/compare/v0.8.43...v0.8.44
 [0.8.43]: https://github.com/Hmbown/CodeWhale/compare/v0.8.42...v0.8.43
 [0.8.42]: https://github.com/Hmbown/CodeWhale/compare/v0.8.41...v0.8.42
