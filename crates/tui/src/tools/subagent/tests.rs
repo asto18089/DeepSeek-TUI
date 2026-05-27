@@ -713,6 +713,47 @@ async fn tool_agent_route_forces_flash_with_thinking_off() {
     assert_eq!(route.reasoning_effort.as_deref(), Some("off"));
 }
 
+// [pinvou3-fork-guard #7] tool_agent 必须**继承父 runtime.model**,不能用上游硬编码
+// 的 "deepseek-v4-flash"（本地 vLLM 无此模型 → 404）。
+// 上面那条 `..._forces_flash` 测试的 stub model 恰好就是 deepseek-v4-flash,所以
+// 即使上游把 model 改回硬编码它也照样通过(假阳性)。这里显式用一个**区别于上游
+// 硬编码值**的 model 名,才能真正拦住 fork patch 被静默回退。
+#[tokio::test]
+async fn forkguard_tool_agent_route_inherits_parent_model_not_hardcoded_flash() {
+    let mut runtime = stub_runtime();
+    runtime.model = "qwen36_35b_256k".to_string();
+    let runtime = runtime
+        .with_auto_model(false)
+        .with_reasoning_effort(Some("max".to_string()), false);
+
+    let route = resolve_subagent_assignment_route(
+        &runtime,
+        Some("deepseek-v4-pro".to_string()),
+        "run OCR on this screenshot",
+        &SubAgentType::ToolAgent,
+    )
+    .await;
+
+    assert_eq!(
+        route.model, "qwen36_35b_256k",
+        "tool_agent 必须继承父 model;若回退上游硬编码 deepseek-v4-flash,本地 vLLM 会 404"
+    );
+    assert_eq!(route.reasoning_effort.as_deref(), Some("off"));
+}
+
+// [pinvou3-fork-guard #1/#2] 本地弱模型预算:单 agent 步数 20、墙钟上限 300s。
+// 上游 #2034 倾向 u32::MAX / 取消 elapsed cap,sync 时极易被静默改回 → 弱模型
+// 死磕 17min。这条常量断言比指纹 grep 更稳(grep 抓不住值被改)。
+#[test]
+fn forkguard_subagent_step_and_elapsed_caps_match_local_budget() {
+    assert_eq!(DEFAULT_MAX_STEPS, 20, "弱模型 step 预算被改动");
+    assert_eq!(
+        DEFAULT_SUBAGENT_ELAPSED_MAX,
+        std::time::Duration::from_secs(300),
+        "subagent 墙钟上限被改动"
+    );
+}
+
 #[test]
 fn subagent_auto_reasoning_resolves_to_distinct_v4_tiers() {
     let runtime = stub_runtime().with_reasoning_effort(Some("high".to_string()), true);

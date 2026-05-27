@@ -503,6 +503,39 @@ mod tests {
         ToolContext::new(PathBuf::from("."))
     }
 
+    // [pinvou3-fork-guard #13] fake-ip TUN 下域名全解析到 198.18/15 占位段。
+    // validate_dns_resolved_ip 必须放行落在受信 fake-ip CIDR 内的解析 IP,
+    // 但真实私网/loopback/元数据 IP 仍要拦(否则 SSRF)。上游若重写这个函数
+    // 丢掉 is_trusted_fakeip_addr 分支,本地联网工具会被自家 SSRF 防护全杀。
+    #[test]
+    fn forkguard_validate_dns_resolved_ip_allows_fakeip_blocks_real_private() {
+        use crate::network_policy::{NetworkPolicy, NetworkPolicyDecider};
+        let decider = NetworkPolicyDecider::new(NetworkPolicy::default(), None)
+            .with_trusted_fakeip_cidrs(&["198.18.0.0/15"]);
+
+        // fake-ip 占位 IP:即便落在 restricted 段也放行
+        assert!(validate_dns_resolved_ip(
+            "example.com",
+            &"198.18.0.7".parse().unwrap(),
+            Some(&decider)
+        )
+        .is_ok());
+        // 真实私网 IP:仍拦
+        assert!(validate_dns_resolved_ip(
+            "evil.internal",
+            &"192.168.1.1".parse().unwrap(),
+            Some(&decider)
+        )
+        .is_err());
+        // 无 decider:restricted IP 必拦
+        assert!(validate_dns_resolved_ip(
+            "evil.internal",
+            &"192.168.1.1".parse().unwrap(),
+            None
+        )
+        .is_err());
+    }
+
     #[test]
     fn html_to_text_strips_scripts_styles_and_tags() {
         let html = r#"
