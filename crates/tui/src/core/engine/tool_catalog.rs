@@ -69,18 +69,33 @@ pub(super) fn should_default_defer_tool(
         .any(|core_tool| core_tool == &name)
 }
 
+/// [pinvou3-fork] pinvou3 用 **blocklist 模型**(显示全部、隐藏黑名单),而上游 v0.8.47
+/// `should_default_defer_tool` 是 **allowlist**(只显示 `DEFAULT_ACTIVE_NATIVE_TOOLS`)。
+/// 两者 philosophy 相反:上游 allowlist 会 defer 掉 `request_user_input` / `append_file` 等
+/// 不在白名单但 pinvou3 必需的工具(symptom: GUI 里 request_user_input 不出气泡)。
+/// 故 Yolo(GUI 单 session)下只 defer 黑名单、其余全显示;非 Yolo 才叠加上游 allowlist。
+/// 单独成函数(而非塞进 should_default_defer_tool)保上游单测纯净。详见 docs/工具表精简方案.md
+pub(super) fn pinvou3_should_defer_native_tool(
+    name: &str,
+    mode: AppMode,
+    always_load: &HashSet<String>,
+) -> bool {
+    if crate::tools::pinvou3_blocklist::is_pinvou3_hidden(name) {
+        return true;
+    }
+    if mode == AppMode::Yolo {
+        return false;
+    }
+    should_default_defer_tool(name, mode, always_load)
+}
+
 pub(super) fn apply_native_tool_deferral(
     catalog: &mut [Tool],
     mode: AppMode,
     always_load: &HashSet<String>,
 ) {
     for tool in &mut *catalog {
-        // [pinvou3-fork] blocklist 叠加在上游 defer 策略之上:强制隐藏 GUI 单 session
-        // 不需要的非核心工具(task/agent/rlm/pr/git/fim/patch 类,上游默认 active 列表含这些)。
-        // 放在 apply 层而非 should_default_defer_tool,保上游单测纯净。详见 docs/工具表精简方案.md
-        let blocklisted = crate::tools::pinvou3_blocklist::is_pinvou3_hidden(&tool.name);
-        tool.defer_loading =
-            Some(blocklisted || should_default_defer_tool(&tool.name, mode, always_load));
+        tool.defer_loading = Some(pinvou3_should_defer_native_tool(&tool.name, mode, always_load));
     }
     let active: Vec<&str> = catalog
         .iter()

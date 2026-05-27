@@ -577,6 +577,33 @@ fn tools_always_load_overrides_default_native_deferral() {
     ));
 }
 
+// [pinvou3-fork] 回归保护:Yolo(GUI 单 session)下,pinvou3 必需但不在上游
+// DEFAULT_ACTIVE_NATIVE_TOOLS 白名单的工具(request_user_input / append_file)
+// 必须 offer(不 defer),否则 GUI 调不出 request_user_input 气泡 / 大文件 append_file。
+// 此前 v0.8.47 sync 因上游把 deferral 从 blocklist 改 allowlist 静默踩过(symptom: 气泡消失)。
+#[test]
+fn pinvou3_yolo_offers_nonblocklisted_tools_outside_upstream_default() {
+    let always_load = HashSet::new();
+    for tool in ["request_user_input", "append_file"] {
+        assert!(
+            !pinvou3_should_defer_native_tool(tool, AppMode::Yolo, &always_load),
+            "{tool} 在 Yolo 下不应被 defer(pinvou3 blocklist 模型,GUI 必需)"
+        );
+    }
+    // 黑名单工具即便 Yolo 也 defer
+    assert!(pinvou3_should_defer_native_tool(
+        "git_show",
+        AppMode::Yolo,
+        &always_load
+    ));
+    // 非 Yolo 回落上游 allowlist:不在 DEFAULT_ACTIVE 的工具仍 defer
+    assert!(pinvou3_should_defer_native_tool(
+        "request_user_input",
+        AppMode::Agent,
+        &always_load
+    ));
+}
+
 #[test]
 #[ignore = "one-shot metric for scripts/measure-tool-catalog.py"]
 #[allow(clippy::print_stderr)]

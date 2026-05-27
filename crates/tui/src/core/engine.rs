@@ -2117,7 +2117,7 @@ use self::tool_catalog::{
 #[cfg(test)]
 use self::tool_catalog::{
     TOOL_SEARCH_BM25_NAME, maybe_activate_requested_deferred_tool,
-    preflight_requested_deferred_tool, should_default_defer_tool,
+    pinvou3_should_defer_native_tool, preflight_requested_deferred_tool, should_default_defer_tool,
 };
 use self::tool_execution::emit_tool_audit;
 use self::tool_setup::sandbox_policy_for_mode;
