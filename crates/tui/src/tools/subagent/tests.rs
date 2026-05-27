@@ -2123,3 +2123,38 @@ fn subagent_completion_payload_carries_existing_sentinel_format() {
         "sentinel should not duplicate the human summary line"
     );
 }
+
+// [pinvou3-fork] LLM may truncate the "agent_" prefix; resolve_agent_ref
+// should tolerate this and reconstruct the full id.
+#[test]
+fn resolve_agent_ref_tolerates_truncated_agent_prefix() {
+    let mut manager = SubAgentManager::new(PathBuf::from("."), 1);
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let agent = SubAgent::new(
+        "agent_f8f4b687".to_string(),
+        SubAgentType::Explore,
+        "prompt".to_string(),
+        make_assignment(),
+        "test-model".to_string(),
+        None,
+        None,
+        input_tx,
+        "boot_test".to_string(),
+    );
+    manager.agents.insert(agent.id.clone(), agent);
+
+    // Exact match by full agent_id
+    assert_eq!(
+        manager.resolve_agent_ref("agent_f8f4b687").unwrap(),
+        "agent_f8f4b687"
+    );
+
+    // Truncated prefix is reconstructed
+    assert_eq!(
+        manager.resolve_agent_ref("f8f4b687").unwrap(),
+        "agent_f8f4b687"
+    );
+
+    // Non-existent agent still fails
+    assert!(manager.resolve_agent_ref("nonexistent").is_err());
+}

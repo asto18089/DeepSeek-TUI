@@ -1416,7 +1416,17 @@ impl SubAgentManager {
 
         match matches.as_slice() {
             [id] => Ok(id.clone()),
-            [] => Err(anyhow!("Agent session {agent_ref} not found")),
+            [] => {
+                // [pinvou3-fork] LLM 可能截断 "agent_" 前缀（如把 "agent_f8f4b687"
+                // 记成 "f8f4b687"）。在精确匹配失败后补上前缀再试一次。
+                if !agent_ref.starts_with("agent_") {
+                    let with_prefix = format!("agent_{}", agent_ref);
+                    if let Some(agent) = self.agents.get(&with_prefix) {
+                        return Ok(agent.id.clone());
+                    }
+                }
+                Err(anyhow!("Agent session {agent_ref} not found"))
+            }
             _ => Err(anyhow!(
                 "Agent session name '{agent_ref}' is ambiguous; use an agent_id"
             )),
@@ -4479,7 +4489,7 @@ pub(crate) async fn resolve_subagent_assignment_route(
     agent_type: &SubAgentType,
 ) -> SubAgentResolvedRoute {
     if matches!(agent_type, SubAgentType::ToolAgent) {
-        return tool_agent_route();
+        return tool_agent_route(runtime);
     }
 
     let explicit_model = configured_model.is_some();
@@ -4502,9 +4512,12 @@ pub(crate) async fn resolve_subagent_assignment_route(
     route
 }
 
-fn tool_agent_route() -> SubAgentResolvedRoute {
+fn tool_agent_route(runtime: &SubAgentRuntime) -> SubAgentResolvedRoute {
     SubAgentResolvedRoute {
-        model: "deepseek-v4-flash".to_string(),
+        // [pinvou3-fork] 上游硬编码 deepseek-v4-flash，本地 vLLM 没有这个模型。
+        // tool_agent 的 fast-lane 语义通过 reasoning_effort=off 保证，
+        // model 继承父 runtime（pinvou3 本地只有 qwen36_35b_256k）。
+        model: runtime.model.clone(),
         reasoning_effort: Some("off".to_string()),
     }
 }
