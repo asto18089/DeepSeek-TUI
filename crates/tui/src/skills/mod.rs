@@ -598,22 +598,25 @@ pub fn skills_directories(workspace: &Path) -> Vec<PathBuf> {
     skills_directories_with_home(workspace, home.as_deref())
 }
 
-fn skills_directories_with_home(workspace: &Path, home_dir: Option<&Path>) -> Vec<PathBuf> {
-    let mut candidates = vec![
-        workspace.join(".agents").join("skills"),
-        workspace.join("skills"),
-        workspace.join(".opencode").join("skills"),
-        workspace.join(".claude").join("skills"),
-        workspace.join(".cursor").join("skills"),
-        workspace.join(".codewhale").join("skills"),
-    ];
+fn skills_directories_with_home(_workspace: &Path, home_dir: Option<&Path>) -> Vec<PathBuf> {
+    // pinvou3 fork (patch #41): 砍掉底座的 10 路径扫描清单(`.agents/skills`,
+    // `.opencode/skills`, `.claude/skills`, `.cursor/skills`, `.codewhale/skills`
+    // 等工具约定 + workspace + home 重叠版本),只保留:
+    //
+    //   1. `~/.agents/skills`        — 唯一全局共享约定(用户多 AI 工具共用)
+    //   2. `EngineConfig.skills_dir` — pinvou3 通过 fork patch #25/#26 注入,
+    //                                  union 在调用方 `discover_for_workspace_and_dir`
+    //                                  里追加,**不在本函数返回**
+    //
+    // 为什么砍:pinvou3 是 GUI 单一 embedder,workspace=$HOME → 原 10 路径全部
+    // 重叠 / 冗余 / 噪音;`.opencode` / `.cursor` / `.codewhale` 等命名约定对
+    // pinvou3 用户无意义。简化扫描 = prompt 短 + 行为可预期。
+    //
+    // 不通用,**纯 pinvou3 fork** 决策,不适合上游 PR。
+    let _ = _workspace;
+    let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(home) = home_dir {
         candidates.push(home.join(".agents").join("skills"));
-        candidates.push(home.join(".claude").join("skills"));
-        candidates.push(home.join(".codewhale").join("skills"));
-        candidates.push(home.join(".deepseek").join("skills"));
-    } else {
-        candidates.push(PathBuf::from("/tmp/codewhale/skills"));
     }
     existing_skill_dirs(candidates)
 }
@@ -706,6 +709,29 @@ pub fn render_available_skills_context_for_workspace(workspace: &Path) -> Option
     render_skills_block(&registry)
 }
 
+/// Union of [`render_available_skills_context_for_workspace`] and
+/// [`render_available_skills_context`]: scan every workspace candidate
+/// directory **plus** the caller-supplied `skills_dir`, then render one
+/// merged Skills block. Lets callers configure an extra skill
+/// installation root (e.g. a vendored bundle directory) without it being
+/// short-circuited by home-rooted candidates the workspace search already
+/// hits. Mirrors [`discover_for_workspace_and_dir`].
+///
+/// **pinvou3 fork (P0-1)**: prompts.rs used to call
+/// `for_workspace(...).or_else(|| skills_dir.and_then(...))` — the
+/// fallback never fires when `discover_in_workspace` already returns
+/// any skill from `~/.deepseek/skills` / `~/.agents/skills`, so the
+/// caller's `EngineConfig.skills_dir` was effectively dead. This entry
+/// point fixes that.
+#[must_use]
+pub fn render_available_skills_context_for_workspace_and_dir(
+    workspace: &Path,
+    skills_dir: &Path,
+) -> Option<String> {
+    let registry = discover_for_workspace_and_dir(workspace, skills_dir);
+    render_skills_block(&registry)
+}
+
 /// Codex's progressive-disclosure contract: the model sees skill names,
 /// descriptions, and paths up front, then opens the specific `SKILL.md` only
 /// when a skill is relevant.
@@ -789,14 +815,14 @@ instructions when using a specific skill.\n\n",
         .collect();
     if !phased_skills.is_empty() {
         out.push_str(
-            "\n### Phase tracking — MANDATORY for phased skills (pinvou3)\n\
-The skills below declare a `phases:` pipeline. When the user invokes one of them, treat it as a sequential workflow, NOT a reference manual:\n\n\
+            "\n### Phase tracking format (only when a phased skill is actually invoked)\n\
+**This section is dormant by default.** It only applies when you actually decide to use one of the skills listed below — the user named it, or the task clearly matches its description. **For any other task: ignore this entire section. Don't announce that a phased skill is 不适用 / not applicable / out of scope — just answer the user's question directly.**\n\n\
+When you do invoke a phased skill, follow this protocol:\n\n\
 1. **Every assistant reply must begin** with a single line `<phase id=\"ID\"/>` (literal angle-bracket string, e.g. `<phase id=\"p0\"/>`). No text, no quotes, no whitespace before it. The line is consumed by the pinvou3 UI as a state signal — keep it on its own line, then a blank line, then your actual reply.\n\
 2. **Start from the first phase** (typically p0). Do NOT skip phases. Walk in the order written in `phases:`.\n\
-3. **Do not advance** to the next phase until the current phase's expected output is delivered. If the current phase requires user input, use `request_user_input` and stop the turn — do not pre-emptively do work for later phases.\n\
-4. **Use phase IDs exactly** as in the skill's `phases:` list. Re-emit the same marker on consecutive replies while you remain in the same phase; emit a new marker only when you actually transition.\n\
-5. Even if the user says 'just make the deliverable' or 'skip the questions', you must still emit the marker and start at p0 — the phase ordering exists because past projects without it failed.\n\n\
-### Skills with phases (workflow definitions)\n",
+3. **Do not advance** to the next phase until the current phase's expected output is delivered. If the current phase requires user input, use `request_user_input` and stop the turn.\n\
+4. **Use phase IDs exactly** as in the skill's `phases:` list. Re-emit the same marker on consecutive replies while you remain in the same phase.\n\n\
+### Skills with phases\n",
         );
         for skill in &phased_skills {
             let chips: Vec<String> = skill
@@ -817,20 +843,6 @@ The skills below declare a `phases:` pipeline. When the user invokes one of them
                 chips.join(" → ")
             ));
         }
-        out.push_str(
-            "\n### Phased reply — correct format example\n\
-User: 用 h3c-ppt 帮我做 PPT。\n\
-Assistant:\n\
-```\n\
-<phase id=\"p0\"/>\n\
-\n\
-开工前先按 h3c-ppt 的 P0 五问对一下:\n\
-1. 受众是谁? (客户高管 / 政府 / 销售 / 多方)\n\
-2. 截止日期 + 是否多版本?\n\
-...\n\
-```\n\
-The first line is *exactly* `<phase id=\"p0\"/>` — do not paraphrase, do not say 'I will output marker', do not omit it. If you find yourself writing prose first, stop and prepend the marker line.\n",
-        );
     }
 
     Some(out)
@@ -968,6 +980,26 @@ mod tests {
         assert!(
             rendered.contains("Phase tracking"),
             "phase prompt missing when skill has phases:\n{rendered}"
+        );
+
+        // pinvou3 fork (2026-05-28 实测 case): Plan 模式问"我要做俄罗斯方块"时
+        // AI 回 "先按 h3c-ppt 不适用" — 根因是 phase tracking 段语气太强
+        // ("MANDATORY for phased skills") 让 AI 觉得每次都要判断"phased skill 触发吗",
+        // 然后显式声明。修法:加 "dormant by default" + "Don't announce ... 不适用" 反指引。
+        // 这两段是核心防回归 anchor。
+        assert!(
+            rendered.contains("dormant by default"),
+            "phase tracking 段必须明示 dormant by default(防 AI 每次主动判断 phased skill 触发):\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Don't announce that a phased skill is 不适用"),
+            "phase tracking 段必须显式反指引'不要声明 phased skill 不适用':\n{rendered}"
+        );
+        // Verbose "Phased reply — correct format example" 段(原 45 行,含 user/Assistant
+        // 完整 example "用 h3c-ppt 帮我做 PPT") 已删 — 那段让 AI 过度联想 h3c-ppt。
+        assert!(
+            !rendered.contains("Phased reply — correct format example"),
+            "Phased reply example 段不应回归(AI 看完整 example 会过度联想 h3c-ppt)"
         );
     }
 
@@ -1184,6 +1216,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork patch #41: workspace-rooted skill dirs scrapped; only ~/.agents/skills + EngineConfig.skills_dir scanned"]
     fn skills_directories_returns_existing_dirs_in_precedence_order() {
         let tmpdir = TempDir::new().unwrap();
         let workspace = tmpdir.path();
@@ -1275,6 +1308,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork patch #41: workspace-rooted skill dirs scrapped"]
     fn discover_in_workspace_merges_with_first_wins_precedence() {
         let tmpdir = TempDir::new().unwrap();
         let workspace = tmpdir.path();
@@ -1322,6 +1356,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork patch #41: .opencode/skills no longer scanned"]
     fn discover_in_workspace_pulls_skills_from_opencode_dir() {
         let tmpdir = TempDir::new().unwrap();
         let workspace = tmpdir.path();
@@ -1340,6 +1375,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork patch #41: .cursor/skills no longer scanned"]
     fn discover_in_workspace_pulls_skills_from_cursor_dir() {
         let tmpdir = TempDir::new().unwrap();
         let workspace = tmpdir.path();
@@ -1398,6 +1434,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork patch #41: cross-tool workspace skill dirs no longer scanned"]
     fn render_available_skills_context_for_workspace_picks_up_cross_tool_dirs() {
         let tmpdir = TempDir::new().unwrap();
         let workspace = tmpdir.path();
@@ -1604,6 +1641,7 @@ mod tests {
     /// `.agents/skills/` and a global skill in `~/.codewhale/skills/`
     /// must both be discoverable.
     #[test]
+    #[ignore = "pinvou3 fork patch #41: workspace skill dirs no longer scanned"]
     fn discover_finds_both_workspace_and_global_skills() {
         let tmpdir = TempDir::new().unwrap();
         let workspace = tmpdir.path().join("workspace");
@@ -1858,6 +1896,75 @@ mod tests {
             skill.description,
             "Usage:\n  $ deepseek --model auto\n  $ deepseek doctor"
         );
+    }
+
+    /// pinvou3 fork-guard (patches #25/#26 + #41): the only skill sources
+    /// pinvou3 scans are `~/.agents/skills` (single global convention) and
+    /// `EngineConfig.skills_dir` (the pinvou3 bundle path). Workspace
+    /// search and other tool-convention dirs (`.opencode` / `.cursor` /
+    /// `.claude` / `.codewhale` / `.deepseek`) were removed in #41.
+    /// Regression: any of those reappear, or `skills_dir` gets short-
+    /// circuited again.
+    #[test]
+    fn forkguard_skills_dir_unions_with_home_rooted_workspace_skills() {
+        let tmpdir = TempDir::new().unwrap();
+        let workspace = tmpdir.path().join("ws");
+        let bundle = tmpdir.path().join("bundle");
+        let fake_home = tmpdir.path().join("fake-home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        // home-rooted skill (the single global path pinvou3 keeps after #41).
+        std::fs::create_dir_all(fake_home.join(".agents/skills/from-home")).unwrap();
+        std::fs::write(
+            fake_home.join(".agents/skills/from-home/SKILL.md"),
+            "---\nname: from-home\ndescription: home-rooted skill\n---\nbody",
+        )
+        .unwrap();
+
+        // A different tool-convention dir that pinvou3 fork #41 explicitly drops.
+        std::fs::create_dir_all(fake_home.join(".deepseek/skills/should-be-ignored")).unwrap();
+        std::fs::write(
+            fake_home.join(".deepseek/skills/should-be-ignored/SKILL.md"),
+            "---\nname: should-be-ignored\ndescription: dropped by pinvou3\n---\nbody",
+        )
+        .unwrap();
+
+        // bundle skill (analogous to pinvou3's `~/.pinvou3/bundle/skills`).
+        std::fs::create_dir_all(bundle.join("from-bundle")).unwrap();
+        std::fs::write(
+            bundle.join("from-bundle/SKILL.md"),
+            "---\nname: from-bundle\ndescription: bundle skill\n---\nbody",
+        )
+        .unwrap();
+
+        let registry = super::discover_for_workspace_and_dir_with_home(
+            &workspace,
+            &bundle,
+            Some(&fake_home),
+        );
+        let names: Vec<&str> = registry.list().iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"from-home"),
+            "~/.agents/skills must remain visible. Got: {names:?}"
+        );
+        assert!(
+            names.contains(&"from-bundle"),
+            "skills_dir-supplied skill must be unioned in, not short-circuited. Got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"should-be-ignored"),
+            "pinvou3 fork #41 dropped .deepseek/skills — must NOT be scanned. Got: {names:?}"
+        );
+
+        // And the public render path the prompt builder uses must surface it too.
+        let rendered = super::render_available_skills_context_for_workspace_and_dir(
+            &workspace, &bundle,
+        )
+        .expect("rendered block should be non-empty");
+        assert!(rendered.contains("from-bundle"));
+        assert!(!rendered.contains("should-be-ignored"));
     }
 
     /// Folded (`>`) block scalars also preserve relative indentation

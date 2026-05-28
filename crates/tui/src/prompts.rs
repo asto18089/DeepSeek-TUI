@@ -29,7 +29,7 @@ pub struct PromptSessionContext<'a> {
     /// the resolved session locale.
     pub translation_enabled: bool,
     /// Active model identifier injected into the Constitutional
-    /// preamble ("You are {model_id}, running inside CodeWhale").
+    /// preamble ("You are {model_id}, running inside pinvou3").
     /// Defaults to `"codewhale"` when the caller doesn't supply one,
     /// preserving backward compatibility with existing call sites
     /// that predate dynamic model injection.
@@ -139,8 +139,13 @@ for the current turn."
 /// in `prompts/base.md` can reference it without the model having to
 /// guess from the user's first message. `locale_tag` is resolved by
 /// the caller from `Settings` so this function stays I/O-free.
-fn render_environment_block(workspace: &Path, locale_tag: &str) -> String {
-    let deepseek_version = env!("CARGO_PKG_VERSION");
+/// pinvou3 fork (P2-2): dropped `lang` (redundant with locale_preamble +
+/// locale_closer + pinvou3 `<instructions>` block — already pinned three
+/// places) and `codewhale_version` (env!("CARGO_PKG_VERSION") returns
+/// the codewhale-tui crate version, not pinvou3-app version — confusing
+/// and unused by the model). `locale_tag` parameter kept for API
+/// compatibility; rename to `_locale_tag` to silence unused warning.
+fn render_environment_block(workspace: &Path, _locale_tag: &str) -> String {
     let platform = std::env::consts::OS;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string());
     let pwd = workspace.display();
@@ -148,8 +153,6 @@ fn render_environment_block(workspace: &Path, locale_tag: &str) -> String {
     format!(
         "## Environment\n\
          \n\
-         - lang: {locale_tag}\n\
-         - deepseek_version: {deepseek_version}\n\
          - platform: {platform}\n\
          - shell: {shell}\n\
          - pwd: {pwd}"
@@ -326,7 +329,7 @@ pub(crate) fn locale_reinforcement_closer(locale_tag: &str) -> Option<&'static s
 }
 
 const LOCALE_PREAMBLE_ZH_HANS: &str = "## 语言要求\n\n\
-你正在 codewhale 中运行。无论任务上下文（代码、错误日志、文件名）\
+你正在 pinvou3 中运行。无论任务上下文（代码、错误日志、文件名）\
 是英文，无论系统提示的其余部分是英文，你都必须用简体中文进行 \
 `reasoning_content`（内部思考）和最终回复。代码、文件路径、工具名称\
 （例如 `read_file`、`exec_shell`）、环境变量、命令行参数和 URL \
@@ -514,7 +517,7 @@ fn apply_model_template(prompt: &str, model_id: &str) -> String {
 const AUTHORITY_RECAP: &str = "\
 ## Authority Recap
 
-The Constitution of CodeWhale (Articles I-VII) governs your behavior.
+The Constitution of pinvou3 (Articles I-VII) governs your behavior.
 Tier 1 rules — truthfulness, user agency, tool-use mandate, verification
 duty — are non-negotiable. The user's next message is the highest
 directive within Constitutional bounds. Personality, memory, and handoff
@@ -722,17 +725,6 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
         full_prompt = format!("{full_prompt}\n\n{pack}");
     }
 
-    // 2.25. Environment block — locale, platform, shell, pwd. All
-    // four inputs are session-stable (workspace path is fixed for
-    // the run; locale is loaded once by the caller; platform/shell
-    // come from process env). Inserted above skills so it remains in
-    // the workspace-static cache layer alongside the mode prompt and
-    // project context.
-    full_prompt = format!(
-        "{full_prompt}\n\n{}",
-        render_environment_block(workspace, session_context.locale_tag),
-    );
-
     // 2.3a. Translation output instruction — when enabled, instruct
     // the model to respond in the resolved session locale. Stays
     // above the volatile-content boundary because it's a per-session
@@ -749,34 +741,40 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
     // skills directory (`.agents/skills`, `skills`,
     // `.opencode/skills`, `.claude/skills`, `.cursor/skills`) plus global
     // `~/.agents/skills` / `~/.deepseek/skills` so skills installed for any
-    // AI-tool convention show up in the catalogue. The legacy
-    // single-`skills_dir` path is
-    // honoured as a fallback for callers that don't supply a
-    // workspace-aware view; it falls through to the same merged
-    // registry when available.
-    let skills_block = crate::skills::render_available_skills_context_for_workspace(workspace)
-        .or_else(|| skills_dir.and_then(crate::skills::render_available_skills_context));
+    // AI-tool convention show up in the catalogue.
+    //
+    // pinvou3 fork (P0-1): when `EngineConfig.skills_dir` is supplied
+    // we **union** it into the discovery set instead of using it only as
+    // a fallback. The legacy `for_workspace(...).or_else(skills_dir...)`
+    // short-circuits whenever the workspace search hits any home-rooted
+    // skill (very common when workspace=$HOME), making bundle-distributed
+    // skills (e.g. pinvou3's `~/.pinvou3/bundle/skills`) invisible to the
+    // model. The union behaviour is what most embedders actually want.
+    let skills_block = match skills_dir {
+        Some(dir) => {
+            crate::skills::render_available_skills_context_for_workspace_and_dir(workspace, dir)
+        }
+        None => crate::skills::render_available_skills_context_for_workspace(workspace),
+    };
     if let Some(block) = skills_block {
         full_prompt = format!("{full_prompt}\n\n{block}");
     }
 
-    // 4. Context Management (Agent / Yolo only).
+    // 4. Context Management (Agent / Yolo only). Made embedder-agnostic
+    // (pinvou3 fork P1-3): the upstream wording hard-coded `/compact`
+    // slash command, `cache hit %` footer chip, and DeepSeek-specific
+    // pricing claims — none of which apply to GUI/non-DeepSeek embedders.
     if matches!(mode, AppMode::Agent | AppMode::Yolo) {
         full_prompt.push_str(
             "\n\n## Context Management\n\n\
-             When the conversation gets long (you'll see a context usage indicator), you can:\n\
-             1. Use `/compact` to summarize earlier context and free up space\n\
-             2. The system will preserve important information (files you're working on, recent messages, tool results)\n\
-             3. After compaction, you'll see a summary of what was discussed and can continue seamlessly\n\n\
-             If you notice context is getting long (>60% during sustained work), proactively suggest using `/compact` to the user.\n\n\
+             Long sessions accumulate context. When the runtime signals context pressure (a usage indicator, an explicit warning, or a user request), it may offer a compaction command to summarize earlier turns — its name and trigger depend on the embedder.\n\n\
              ### Prompt-cache awareness\n\n\
-             DeepSeek caches the longest *byte-stable prefix* of every request and charges roughly 100× less for cache-hit tokens than miss tokens. The system prompt above is layered most-static-first specifically so the prefix stays stable turn-over-turn. To keep cache hits high:\n\
-             - **Working set location:** the current repo working set is stored on new user messages inside a `<turn_meta>` block. Treat it as high-priority turn metadata, not as a stable system-prompt section.\n\
+             Most modern LLM APIs cache shared byte-stable prefixes and charge much less for cache-hit tokens than for miss tokens. The system prompt above is layered most-static-first so the prefix stays stable turn-over-turn. To keep cache hits high:\n\
+             - **Working set location:** the current repo working set is delivered on new user messages inside a `<turn_meta>` block. Treat it as high-priority turn metadata, not as a stable system-prompt section.\n\
              - **Append, don't reorder.** New context goes at the end (latest user / tool messages). Reshuffling earlier messages or rewriting their content invalidates the cache for everything after the change.\n\
              - **Don't paraphrase quoted content.** If you've already read a file, refer to it by path or line range instead of re-quoting it with different formatting.\n\
-             - **Use `/compact` as a hard reset, not a tweak.** Compaction is meant for when the cache is already losing — it intentionally rewrites the prefix to a shorter summary. Don't trigger it for small wins.\n\
-             - **Read once, refer back.** Re-reading the same file produces a different tool-result envelope than the prior read; it's cheaper to scroll back than to re-fetch.\n\
-             - **Footer chip:** the `cache hit %` chip turns red below 40% and yellow below 80%. If it's been red for several turns, that's a signal to consolidate."
+             - **Use compaction as a hard reset, not a tweak.** Whatever the embedder calls it, compaction intentionally rewrites the prefix to a shorter summary — only trigger it when the cache is already losing.\n\
+             - **Read once, refer back.** Re-reading the same file produces a different tool-result envelope than the prior read; it's cheaper to scroll back than to re-fetch."
         );
     }
 
@@ -791,6 +789,25 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
     // skills, context management, compact template) live above this line
     // so DeepSeek's KV prefix cache can hit on the entire system prompt
     // regardless of per-session edits to memory, goals, or instructions.
+
+    // 6 (was 2.25). Environment block — platform / shell / pwd.
+    //
+    // **pinvou3 fork (P2-2)**: moved from above the volatile boundary
+    // (was static layer #2.25) to below it. The upstream comment claimed
+    // "workspace path is fixed for the run" → static-cacheable. That's
+    // true for the codewhale-tui terminal use case (one process,
+    // one workspace), but **false for pinvou3**: each engine instance
+    // is bound to a per-session workspace (`~/.pinvou3/sessions/<sid>/
+    // workspace`), so `pwd` is volatile across sessions, dragging the
+    // entire static prefix out of cache reuse for every new session.
+    // Moving the block below the boundary keeps mode / project /
+    // skills / context-mgmt / compact-template byte-stable across
+    // sessions while preserving the pwd info the model needs for
+    // `exec_shell`.
+    full_prompt = format!(
+        "{full_prompt}\n\n{}",
+        render_environment_block(workspace, session_context.locale_tag),
+    );
 
     // 6a. Configured `instructions = [...]` files (#454). Loaded
     // and concatenated in declared order. Placed below the volatile boundary
@@ -918,22 +935,36 @@ mod tests {
         );
     }
 
+    /// pinvou3 fork (P-brand): the Brother Whale preamble is upstream
+    /// branding philosophy that doesn't apply to pinvou3. The Constitution
+    /// title and Articles II / VII are still load-bearing — keep those
+    /// pinned, but make sure the deleted phrases don't resurface.
     #[test]
-    fn base_prompt_carries_constitutional_preamble() {
-        // Pin the load-bearing Constitutional anchors. The exact prose
-        // can evolve, but CodeWhale must keep the Brother Whale preamble,
-        // the coordination principle, and the hierarchy of law.
+    fn forkguard_constitutional_preamble_uses_pinvou3_branding() {
+        // Anchors that must remain present.
+        for phrase in [
+            "future intelligences can better coordinate",
+            "Article II — The Primacy of Truth",
+            "Article VII — The Hierarchy of Law",
+            "CONSTITUTION OF PINVOU3",
+            "running inside pinvou3",
+        ] {
+            assert!(
+                BASE_PROMPT.contains(phrase),
+                "BASE_PROMPT missing required anchor {phrase:?}"
+            );
+        }
+        // Phrases pinvou3 fork dropped.
         for phrase in [
             "We begin with Brother Whale",
             "Brother Whale is the founding intelligence",
             "Every model that runs here is Brother Whale",
-            "future intelligences can better coordinate",
-            "Article II — The Primacy of Truth",
-            "Article VII — The Hierarchy of Law",
+            "CONSTITUTION OF CODEWHALE",
+            "running inside CodeWhale",
         ] {
             assert!(
-                BASE_PROMPT.contains(phrase),
-                "BASE_PROMPT missing Constitutional phrase {phrase:?}"
+                !BASE_PROMPT.contains(phrase),
+                "BASE_PROMPT unexpectedly contains dropped CodeWhale-branding phrase {phrase:?}"
             );
         }
     }
@@ -1013,7 +1044,7 @@ mod tests {
             "full system prompt must contain the authority recap"
         );
         assert!(
-            text.contains("The Constitution of CodeWhale (Articles I-VII) governs your behavior"),
+            text.contains("The Constitution of pinvou3 (Articles I-VII) governs your behavior"),
             "authority recap must reference the Constitution"
         );
     }
@@ -1062,14 +1093,21 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let block = render_environment_block(tmp.path(), "zh-Hans");
         assert!(block.starts_with("## Environment"));
-        assert!(block.contains("- lang: zh-Hans"));
-        assert!(block.contains(&format!(
-            "- deepseek_version: {}",
-            env!("CARGO_PKG_VERSION")
-        )));
         assert!(block.contains(&format!("- pwd: {}", tmp.path().display())));
         assert!(block.contains("- platform:"));
         assert!(block.contains("- shell:"));
+        // pinvou3 fork (P2-2): `lang` + `codewhale_version` dropped —
+        // `lang` is redundant (locale preamble/closer anchor it), and
+        // `codewhale_version` shows the wrong version (codewhale-tui
+        // crate, not the embedder's app version).
+        assert!(
+            !block.contains("- lang:"),
+            "pinvou3 fork drops `lang` field — locale_preamble/closer already anchor language"
+        );
+        assert!(
+            !block.contains("codewhale_version"),
+            "pinvou3 fork drops `codewhale_version` — wrong layer's version, confusing"
+        );
     }
 
     #[test]
@@ -1406,8 +1444,8 @@ mod tests {
             SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
         };
         assert!(prompt.contains("## Environment"));
-        assert!(prompt.contains("- lang: ja"));
-        assert!(prompt.contains("- deepseek_version:"));
+        assert!(prompt.contains("- platform:"));
+        // pinvou3 fork (P2-2): `lang` and `codewhale_version` were dropped.
     }
 
     #[test]
@@ -1794,11 +1832,19 @@ mod tests {
         assert!(!prompt.contains("## Current Session Goal"));
     }
 
+    /// pinvou3 fork (patches #29-#33): Tool Selection Guide kept but
+    /// concrete tool names (`agent_eval` etc.) abstracted to
+    /// "the sub-agent's eval/poll variant" because pinvou3 exposes
+    /// `delegate_to_agent`, not the upstream `agent_*` family.
     #[test]
-    fn tool_selection_guide_avoids_defensive_tool_suppression() {
+    fn forkguard_tool_selection_guide_is_embedder_aware() {
         let prompt = compose_prompt(AppMode::Agent, Personality::Calm);
         assert!(prompt.contains("Tool Selection Guide"));
-        assert!(prompt.contains("Use `agent_eval`"));
+        assert!(
+            prompt.contains("Sub-agent tools (if exposed)"),
+            "pinvou3 fork rewrote the sub-agent guide to be embedder-aware"
+        );
+        // Defensive-tool-suppression rule from upstream: still enforced.
         assert!(
             !prompt.contains("When NOT to use certain tools"),
             "the system prompt should steer tool choice without training the model to avoid available tools"
@@ -1879,22 +1925,21 @@ mod tests {
     ///
     /// Don't assert on prose. If you wouldn't fail a code review for
     /// changing the wording, don't fail a test for it.
+    /// pinvou3 fork (patch #29): RLM section deleted from base.md.
+    /// pinvou3 does not expose `rlm_open` / `rlm_eval` / `rlm_configure`
+    /// / `rlm_close`. Reverse assertion: if the upstream RLM section
+    /// reappears after a sync, this test fails so we know to re-clean.
     #[test]
-    fn rlm_specialty_tool_guidance_present() {
+    fn forkguard_rlm_section_removed_by_pinvou3() {
         let prompt = compose_prompt(AppMode::Agent, Personality::Calm);
-        // Structural: the RLM heading must exist as a section anchor.
-        assert!(prompt.contains("RLM — How to Use It"));
-        // Structural: the word "rlm" must appear multiple times (tool
-        // name, section heading, toolbox reference). Just verify the
-        // lowercase form — exact wording is NOT a test concern.
+        assert!(
+            !prompt.contains("RLM — How to Use It"),
+            "RLM section must not be in BASE_PROMPT — pinvou3 doesn't expose RLM tools"
+        );
         let rlm_count = prompt.to_lowercase().matches("rlm").count();
         assert!(
-            rlm_count >= 5,
-            "RLM guidance present: expected >= 5 mentions of 'rlm', got {rlm_count}"
-        );
-        assert!(
-            !prompt.contains("When NOT to use RLM"),
-            "RLM guidance should explain fit and verification without telling the model to avoid the tool"
+            rlm_count == 0,
+            "Expected 0 'rlm' mentions after pinvou3 fork removed the section, got {rlm_count}"
         );
     }
 
@@ -1913,24 +1958,51 @@ mod tests {
         );
     }
 
+    /// pinvou3 fork-guard (P2-3, patch #28): Tier 5 Local Law must explicitly
+    /// cover `EngineConfig.instructions` files. Without this clause, embedders
+    /// that inject instructions via `EngineConfig.instructions` (e.g. pinvou3
+    /// writing `~/.pinvou3/sessions/<sid>/instructions.md`) get their files
+    /// classified by path — and since those paths aren't AGENTS.md / CLAUDE.md
+    /// / `.codewhale/instructions.md` / `.deepseek/instructions.md`, the model
+    /// can default-treat them as Tier 7 Memory (imperative memory = lowest
+    /// tier per Article VII, overridable by a single user sentence).
     #[test]
-    fn prompt_uses_persistent_agent_and_rlm_surface() {
+    fn forkguard_local_law_tier_covers_engine_config_instructions() {
         let prompt = compose_prompt(AppMode::Agent, Personality::Calm);
-        for tool in [
-            "agent_open",
-            "agent_eval",
-            "agent_close",
-            "rlm_open",
-            "rlm_eval",
-            "rlm_configure",
-            "rlm_close",
-            "handle_read",
+        assert!(
+            prompt.contains("files configured via `EngineConfig.instructions`"),
+            "Tier 5 Local Law must explicitly cover EngineConfig.instructions \
+             paths so embedder-injected instructions are not default-classified \
+             as Tier 7 Memory."
+        );
+        // 2026-05-28 simplification: 删了具体品牌路径名(AGENTS.md/CLAUDE.md/
+        // .codewhale/.deepseek)。Tier 5 不应再裸暴露这些品牌字串。
+        for brand_path in [
+            "AGENTS.md, CLAUDE.md",
+            "`.codewhale/instructions.md`, `.deepseek/instructions.md`",
         ] {
             assert!(
-                prompt.contains(tool),
-                "prompt should mention new persistent tool `{tool}`"
+                !prompt.contains(brand_path),
+                "Tier 5 不应裸列品牌路径 {brand_path:?}"
             );
         }
+    }
+
+    /// pinvou3 fork (patches #30-#33): Toolbox section deleted +
+    /// Tool Selection Guide abstracted. BASE_PROMPT no longer lists
+    /// upstream-specific concrete tool names. Anti-regression assertion:
+    /// if upstream re-introduces the Toolbox/agent_eval names, fail loud.
+    #[test]
+    fn forkguard_pinvou3_omitted_upstream_specific_tool_names_from_base_prompt() {
+        let prompt = compose_prompt(AppMode::Agent, Personality::Calm);
+        // The hard-listed Toolbox section is gone.
+        assert!(
+            !prompt.contains("## Toolbox (fast reference"),
+            "pinvou3 fork: Toolbox section removed — runtime tool schemas are authoritative"
+        );
+        // The retired-sub-agent block was originally there to scrub a
+        // historical migration. After we abstract the guide it should also
+        // not contain those names.
         for retired in [
             "agent_spawn",
             "agent_wait",
@@ -1940,7 +2012,6 @@ mod tests {
             "agent_resume",
             "agent_list",
             "spawn_agent",
-            "delegate_to_agent",
             "send_input",
             "close_agent",
         ] {
@@ -1951,13 +2022,24 @@ mod tests {
         }
     }
 
+    /// pinvou3 fork (patch #31): Tool Selection Guide for `agent_open`
+    /// was rewritten as "Sub-agent tools (if exposed)" and the
+    /// DeepSeek-specific `fork_context: true` / `byte-identical` /
+    /// "DeepSeek prefix-cache reuse" prose was dropped because pinvou3
+    /// runs Qwen3.6 (not DeepSeek) and exposes `delegate_to_agent`
+    /// rather than `agent_open(fork_context: ...)`. This forkguard
+    /// fails if the upstream wording sneaks back in.
     #[test]
-    fn prompt_documents_fork_context_prefix_cache_contract() {
+    fn forkguard_no_deepseek_specific_fork_context_prose_in_base_prompt() {
         let prompt = compose_prompt(AppMode::Agent, Personality::Calm);
-        assert!(prompt.contains("fork_context: true"));
-        assert!(prompt.contains("byte-identical"));
-        assert!(prompt.contains("DeepSeek prefix-cache reuse"));
-        assert!(prompt.contains("Fresh sessions are the default"));
+        assert!(
+            !prompt.contains("DeepSeek prefix-cache reuse"),
+            "pinvou3 runs Qwen3.6 — no model-specific prefix-cache prose belongs in base prompt"
+        );
+        assert!(
+            !prompt.contains("fork_context: true"),
+            "pinvou3 doesn't expose `agent_open(fork_context: ...)`; guidance for it shouldn't ship"
+        );
     }
 
     #[test]

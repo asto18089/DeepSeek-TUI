@@ -1,14 +1,15 @@
-//! Project context loading for CodeWhale.
+//! Project context loading.
 //!
 //! This module handles loading project-specific context files that provide
-//! instructions and context to the AI agent. These include:
+//! instructions and context to the AI agent.
 //!
-//! - `WHALE.md` - CodeWhale-native project instructions (highest priority)
-//! - `AGENTS.md` - Generic agent instructions (compatible with other agents)
-//! - `.claude/instructions.md` - Claude-style hidden instructions
-//! - `CLAUDE.md` - Claude-style instructions
-//! - `.codewhale/instructions.md` - Hidden instructions file (new)
-//! - `.deepseek/instructions.md` - Hidden instructions file (legacy)
+//! **pinvou3 fork (P-brand cleanup)**: the upstream 6-path scan list
+//! (`WHALE.md` / `AGENTS.md` / `.claude/instructions.md` / `CLAUDE.md` /
+//! `.codewhale/instructions.md` / `.deepseek/instructions.md`) + 4-path
+//! global agents fallback (`~/.codewhale/{AGENTS,WHALE}.md` /
+//! `~/.deepseek/{AGENTS,WHALE}.md`) has been scrapped. pinvou3 only
+//! recognizes `<workspace>/.pinvou3/workspace_context.md` (written at
+//! boot by the bridge); other-AI-tool global config files are not read.
 //!
 //! The loaded content is injected into the system prompt to give the agent
 //! context about the project's conventions, structure, and requirements.
@@ -24,22 +25,17 @@ use thiserror::Error;
 /// WHALE.md is the CodeWhale-native convention; AGENTS.md and CLAUDE.md
 /// provide compatibility with other coding agents. `.codewhale/` is the
 /// new config directory; `.deepseek/` is the legacy fallback.
-const PROJECT_CONTEXT_FILES: &[&str] = &[
-    "WHALE.md",
-    "AGENTS.md",
-    ".claude/instructions.md",
-    "CLAUDE.md",
-    ".codewhale/instructions.md",
-    ".deepseek/instructions.md",
-];
+// pinvou3 fork (P-brand cleanup): 砍掉底座 6 条品牌/工具约定路径
+// (`WHALE.md` / `AGENTS.md` / `.claude/instructions.md` / `CLAUDE.md` /
+// `.codewhale/instructions.md` / `.deepseek/instructions.md`),pinvou3 用户
+// 不需要识别其他 AI 工具的全局配置文件。只保留 pinvou3 自家路径。
+const PROJECT_CONTEXT_FILES: &[&str] = &[".pinvou3/workspace_context.md"];
 
-/// User-level project instructions loaded as a fallback when the workspace and
-/// its parents do not define project context. `.codewhale/` takes priority
-/// over `.deepseek/` for both WHALE.md and AGENTS.md.
-const GLOBAL_AGENTS_RELATIVE_PATH: &[&str] = &[".codewhale", "AGENTS.md"];
-const GLOBAL_AGENTS_LEGACY_PATH: &[&str] = &[".deepseek", "AGENTS.md"];
-const GLOBAL_WHALE_RELATIVE_PATH: &[&str] = &[".codewhale", "WHALE.md"];
-const GLOBAL_WHALE_LEGACY_PATH: &[&str] = &[".deepseek", "WHALE.md"];
+// pinvou3 fork (P-brand cleanup): 砍掉底座 `~/.codewhale/AGENTS.md` /
+// `~/.codewhale/WHALE.md` / `~/.deepseek/AGENTS.md` / `~/.deepseek/WHALE.md`
+// 等全局 fallback 路径。pinvou3 不需要识别其他 AI 工具的全局 agents 配置。
+// 保留空数组让 `load_global_agents_context` 走 early return 不扫盘。
+const GLOBAL_PATHS: &[&[&str]] = &[];
 
 /// Maximum size for project context files (to prevent loading huge files)
 const MAX_CONTEXT_SIZE: usize = 100 * 1024; // 100KB
@@ -510,17 +506,16 @@ fn merge_global_and_project_instructions(
 fn load_global_agents_context(workspace: &Path, home_dir: Option<&Path>) -> Option<ProjectContext> {
     let home = home_dir?;
 
-    // Priority order:
-    // 1. ~/.codewhale/WHALE.md      (CodeWhale-native)
-    // 2. ~/.codewhale/AGENTS.md     (new config directory)
-    // 3. ~/.deepseek/WHALE.md       (legacy fallback)
-    // 4. ~/.deepseek/AGENTS.md      (legacy fallback)
-    let candidates: &[&[&str]] = &[
-        GLOBAL_WHALE_RELATIVE_PATH,
-        GLOBAL_AGENTS_RELATIVE_PATH,
-        GLOBAL_WHALE_LEGACY_PATH,
-        GLOBAL_AGENTS_LEGACY_PATH,
-    ];
+    // pinvou3 fork (P-brand cleanup): GLOBAL_PATHS 已砍空,
+    // pinvou3 不识别其他 AI 工具的 ~/.codewhale/AGENTS.md / ~/.deepseek/WHALE.md
+    // 等全局 fallback。这里早返回 None,留函数 shell 防上游 sync 时回退;
+    // 真正的 pinvou3 workspace context 通过 PROJECT_CONTEXT_FILES 的
+    // `.pinvou3/workspace_context.md` 入口注入。
+    let candidates: &[&[&str]] = GLOBAL_PATHS;
+    if candidates.is_empty() {
+        let _ = home;
+        return None;
+    }
 
     let mut warnings = Vec::new();
 
@@ -557,12 +552,12 @@ fn load_global_agents_context(workspace: &Path, home_dir: Option<&Path>) -> Opti
 /// `.codewhale/instructions.md` (or `.deepseek/instructions.md` as legacy
 /// fallback). Returns the generated content on success.
 fn auto_generate_context(workspace: &Path) -> Option<String> {
-    let codewhale_dir = workspace.join(".codewhale");
-    let instructions_path = codewhale_dir.join("instructions.md");
-    let legacy_instructions_path = workspace.join(".deepseek/instructions.md");
-
-    // Don't overwrite an existing file (check both locations)
-    if instructions_path.exists() || legacy_instructions_path.exists() {
+    // pinvou3 fork (P-brand cleanup): auto-gen 检查目标对齐
+    // `PROJECT_CONTEXT_FILES`(只剩 `.pinvou3/workspace_context.md`)。如果它已存在,
+    // 不重新生成。pinvou3 bridge `boot()` 会在 GUI 启动时主动写这个文件,所以
+    // 实际上 auto_generate_context 在 pinvou3 场景永远 short-circuit return None。
+    let pinvou3_workspace_context = workspace.join(".pinvou3").join("workspace_context.md");
+    if pinvou3_workspace_context.exists() {
         return None;
     }
 
@@ -571,25 +566,32 @@ fn auto_generate_context(workspace: &Path) -> Option<String> {
 
     let content = format!(
         "# Project Structure (Auto-generated)\n\n\
-         > This file was automatically generated by CodeWhale.\n\
+         > This file was automatically generated by pinvou3.\n\
          > You can edit or delete it at any time.\n\n\
          **Summary:** {summary}\n\n\
          **Tree:**\n```\n{tree}\n```"
     );
 
-    // Create .codewhale/ directory
-    if let Err(e) = std::fs::create_dir_all(&codewhale_dir) {
-        tracing::warn!("Failed to create .codewhale/ directory: {e}");
+    // pinvou3 fork (P-brand cleanup): 写到 `.pinvou3/workspace_context.md`
+    // (跟 PROJECT_CONTEXT_FILES 唯一一条路径对齐),不再写 `.codewhale/instructions.md`。
+    // 实际 pinvou3 场景这条路径已被 bridge.boot() 写了精简版,函数前面就 return None,
+    // 这里的 fallback 写盘只在 edge case(pinvou3 没 boot 就调底座代码)触发。
+    let pinvou3_dir = workspace.join(".pinvou3");
+    if let Err(e) = std::fs::create_dir_all(&pinvou3_dir) {
+        tracing::warn!("Failed to create .pinvou3/ directory: {e}");
         return None;
     }
 
-    match std::fs::write(&instructions_path, &content) {
+    match std::fs::write(&pinvou3_workspace_context, &content) {
         Ok(()) => {
-            tracing::info!("Auto-generated {}", instructions_path.display());
+            tracing::info!("Auto-generated {}", pinvou3_workspace_context.display());
             Some(content)
         }
         Err(e) => {
-            tracing::warn!("Failed to write {}: {e}", instructions_path.display());
+            tracing::warn!(
+                "Failed to write {}: {e}",
+                pinvou3_workspace_context.display()
+            );
             None
         }
     }
@@ -741,6 +743,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_load_project_context_agents_md() {
         let tmp = tempdir().expect("tempdir");
         let agents_path = tmp.path().join("AGENTS.md");
@@ -759,6 +762,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_load_project_context_priority() {
         let tmp = tempdir().expect("tempdir");
 
@@ -780,6 +784,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_load_project_context_hidden_dir() {
         let tmp = tempdir().expect("tempdir");
         let hidden_dir = tmp.path().join(".deepseek");
@@ -798,6 +803,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_as_system_block() {
         let tmp = tempdir().expect("tempdir");
         let agents_path = tmp.path().join("AGENTS.md");
@@ -812,6 +818,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_empty_file_warning() {
         let tmp = tempdir().expect("tempdir");
         let agents_path = tmp.path().join("AGENTS.md");
@@ -849,6 +856,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_load_with_parents() {
         let tmp = tempdir().expect("tempdir");
 
@@ -890,6 +898,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_load_with_parents_searches_above_git_root_when_needed() {
         let tmp = tempdir().expect("tempdir");
 
@@ -1023,6 +1032,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_load_global_agents_when_project_has_no_context() {
         let workspace = tempdir().expect("workspace tempdir");
         let home = tempdir().expect("home tempdir");
@@ -1044,6 +1054,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_local_and_global_agents_merge_when_both_exist() {
         // #1157: when both `~/.deepseek/AGENTS.md` and a project AGENTS.md
         // exist, the prompt should carry user-wide preferences AND the
@@ -1090,6 +1101,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_global_agents_only_no_project_unchanged_fallback() {
         // Sanity: when only the global file exists, the historical
         // fallback behaviour is preserved — no merge framing leaks in.
@@ -1113,6 +1125,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_invalid_global_agents_warns_and_falls_back_to_generated_context() {
         let workspace = tempdir().expect("workspace tempdir");
         let home = tempdir().expect("home tempdir");

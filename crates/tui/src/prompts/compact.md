@@ -1,6 +1,8 @@
-## Compaction Relay — Tier 9 (Precedent)
+## Compaction Relay Template — Tier 9 (Precedent)
 
-The conversation above this point has been compacted. Below is a structured summary of what was discussed and decided. Read this first — it replaces re-reading the compressed transcript.
+This is the **template** the runtime expects when compaction happens later in this session. **It is not a real handoff** — there is no compacted content above. If the runtime later runs compaction (some embedders expose a command like `/compact`; pinvou3 calls it from the GUI), it will fill in the sections below with what was actually discussed, replacing this template. When you see this template with placeholders intact (square-bracket text), treat it as future-format guidance only; nothing has actually been compacted yet.
+
+When a real compaction summary appears (placeholders replaced with concrete content), read it first — it replaces re-reading the compressed transcript.
 
 ### Goal
 [The user's high-level objective for this session]
