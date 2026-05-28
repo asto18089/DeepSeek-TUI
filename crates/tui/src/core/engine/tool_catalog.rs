@@ -83,6 +83,14 @@ pub(super) fn pinvou3_should_defer_native_tool(
     if crate::tools::pinvou3_blocklist::is_pinvou3_hidden(name) {
         return true;
     }
+    // pinvou3 引导 AI 用 `request_user_input` 处理歧义(instructions §1.4 + Plan
+    // per-turn reminder),工具表里必须永远在。上游 allowlist 没把它加进
+    // `DEFAULT_ACTIVE_NATIVE_TOOLS`,非 Yolo 模式下会被 defer → GUI 不出气泡 →
+    // AI fallback 在 text 里列 A/B/C 选项(实测 case: Plan 模式问 "我要做俄罗斯方块"
+    // 时 AI 用 text 而非气泡)。硬保留,跨所有 mode。
+    if name == REQUEST_USER_INPUT_NAME {
+        return false;
+    }
     if mode == AppMode::Yolo {
         return false;
     }

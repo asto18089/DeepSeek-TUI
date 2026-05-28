@@ -581,6 +581,11 @@ fn tools_always_load_overrides_default_native_deferral() {
 // DEFAULT_ACTIVE_NATIVE_TOOLS 白名单的工具(request_user_input / append_file)
 // 必须 offer(不 defer),否则 GUI 调不出 request_user_input 气泡 / 大文件 append_file。
 // 此前 v0.8.47 sync 因上游把 deferral 从 blocklist 改 allowlist 静默踩过(symptom: 气泡消失)。
+//
+// 2026-05-28 补强:`request_user_input` 跨所有 mode 永不 defer(Plan/Agent 也要,
+// 因为 pinvou3 instructions §1.4 + Plan reminder 都引导 AI 用这工具问澄清,
+// 工具表必须永远有它)。实测 case: Plan 模式问"我要做俄罗斯方块"AI 用 text
+// 列 A/B/C 选项而不是 request_user_input 气泡,根因就是非 Yolo 下被 defer。
 #[test]
 fn pinvou3_yolo_offers_nonblocklisted_tools_outside_upstream_default() {
     let always_load = HashSet::new();
@@ -596,9 +601,16 @@ fn pinvou3_yolo_offers_nonblocklisted_tools_outside_upstream_default() {
         AppMode::Yolo,
         &always_load
     ));
-    // 非 Yolo 回落上游 allowlist:不在 DEFAULT_ACTIVE 的工具仍 defer
+    // request_user_input 跨所有 mode 都不 defer(pinvou3 instructions §1.4 引导用它问澄清)
+    for mode in [AppMode::Yolo, AppMode::Plan, AppMode::Agent] {
+        assert!(
+            !pinvou3_should_defer_native_tool("request_user_input", mode, &always_load),
+            "request_user_input 在 {mode:?} 下不应被 defer(pinvou3 引导调它问澄清,工具表必须有)"
+        );
+    }
+    // 其他非白名单工具(如 append_file)在非 Yolo 下仍回落上游 allowlist 被 defer
     assert!(pinvou3_should_defer_native_tool(
-        "request_user_input",
+        "append_file",
         AppMode::Agent,
         &always_load
     ));
