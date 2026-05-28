@@ -159,44 +159,85 @@ fn render_environment_block(workspace: &Path, _locale_tag: &str) -> String {
     )
 }
 
+/// Source for an `EngineConfig.instructions` entry. Either a disk file (loaded
+/// at render time, original semantics) or an inline string (content baked into
+/// `EngineConfig`, no disk I/O at render time).
+///
+/// **pinvou3 fork (P-no-disk)**: original API was `Vec<PathBuf>`, which forced
+/// embedders that wanted to inject runtime-computed instructions (like pinvou3
+/// rendering its `INSTRUCTIONS_MD` const with workspace placeholder
+/// substituted) to first write the content to a disk file, then pass the path.
+/// That disk file was both confusing for users (looked like editable config
+/// but was overwritten on boot) and a race surface in multi-engine setups
+/// (rehydrate re-reads from disk, so concurrent writes can leak across
+/// sessions). Adding an `Inline` variant lets embedders skip disk entirely.
+///
+/// `From<PathBuf>` is provided so existing callers can keep writing `paths`
+/// and let `.into()` upgrade transparently.
+#[derive(Debug, Clone)]
+pub enum InstructionSource {
+    /// Load this file from disk at prompt-render time. Original behavior:
+    /// missing files are skipped with a warning, oversized files are
+    /// truncated to `INSTRUCTIONS_FILE_MAX_BYTES` with an `[…elided]`
+    /// marker.
+    File(PathBuf),
+    /// Use the provided string directly. `name` becomes the
+    /// `<instructions source="…">` attribute (typically a synthetic path
+    /// like `embedded:pinvou3-instructions` or a logical identifier).
+    Inline { name: String, content: String },
+}
+
+impl From<PathBuf> for InstructionSource {
+    fn from(path: PathBuf) -> Self {
+        InstructionSource::File(path)
+    }
+}
+
+impl From<&PathBuf> for InstructionSource {
+    fn from(path: &PathBuf) -> Self {
+        InstructionSource::File(path.clone())
+    }
+}
+
 /// Render the `instructions = [...]` config array as a single
-/// system-prompt block (#454). Each path is loaded in declared order;
-/// missing files are skipped with a tracing warning so a stale entry
-/// in `~/.deepseek/config.toml` doesn't fail the launch. Empty input
-/// (or all paths missing) returns `None` so callers append nothing.
-fn render_instructions_block(paths: &[PathBuf]) -> Option<String> {
+/// system-prompt block (#454). Each source is processed in declared order;
+/// missing `File` sources are skipped with a tracing warning so a stale entry
+/// doesn't fail the launch. Empty input (or all sources missing/empty)
+/// returns `None` so callers append nothing.
+fn render_instructions_block(sources: &[InstructionSource]) -> Option<String> {
     let mut sections: Vec<String> = Vec::new();
-    for path in paths {
-        match std::fs::read_to_string(path) {
-            Ok(raw) => {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
+    for source in sources {
+        let (raw_source_name, raw_content): (String, String) = match source {
+            InstructionSource::File(path) => match std::fs::read_to_string(path) {
+                Ok(raw) => (path.display().to_string(), raw),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "instructions",
+                        ?err,
+                        ?path,
+                        "skipping unreadable instructions file"
+                    );
                     continue;
                 }
-                let body = if trimmed.len() > INSTRUCTIONS_FILE_MAX_BYTES {
-                    let head_end = (0..=INSTRUCTIONS_FILE_MAX_BYTES)
-                        .rev()
-                        .find(|&i| trimmed.is_char_boundary(i))
-                        .unwrap_or(0);
-                    format!("{}\n[…elided]", &trimmed[..head_end])
-                } else {
-                    trimmed.to_string()
-                };
-                sections.push(format!(
-                    "<instructions source=\"{}\">\n{}\n</instructions>",
-                    path.display(),
-                    body
-                ));
-            }
-            Err(err) => {
-                tracing::warn!(
-                    target: "instructions",
-                    ?err,
-                    ?path,
-                    "skipping unreadable instructions file"
-                );
-            }
+            },
+            InstructionSource::Inline { name, content } => (name.clone(), content.clone()),
+        };
+        let trimmed = raw_content.trim();
+        if trimmed.is_empty() {
+            continue;
         }
+        let body = if trimmed.len() > INSTRUCTIONS_FILE_MAX_BYTES {
+            let head_end = (0..=INSTRUCTIONS_FILE_MAX_BYTES)
+                .rev()
+                .find(|&i| trimmed.is_char_boundary(i))
+                .unwrap_or(0);
+            format!("{}\n[…elided]", &trimmed[..head_end])
+        } else {
+            trimmed.to_string()
+        };
+        sections.push(format!(
+            "<instructions source=\"{raw_source_name}\">\n{body}\n</instructions>"
+        ));
     }
     if sections.is_empty() {
         None
@@ -633,7 +674,7 @@ pub fn system_prompt_for_mode_with_context_and_skills(
     workspace: &Path,
     working_set_summary: Option<&str>,
     skills_dir: Option<&Path>,
-    instructions: Option<&[PathBuf]>,
+    instructions: Option<&[InstructionSource]>,
     user_memory_block: Option<&str>,
 ) -> SystemPrompt {
     system_prompt_for_mode_with_context_skills_and_session(
@@ -659,7 +700,7 @@ pub fn system_prompt_for_mode_with_context_skills_and_session(
     workspace: &Path,
     _working_set_summary: Option<&str>,
     skills_dir: Option<&Path>,
-    instructions: Option<&[PathBuf]>,
+    instructions: Option<&[InstructionSource]>,
     session_context: PromptSessionContext<'_>,
 ) -> SystemPrompt {
     system_prompt_for_mode_with_context_skills_session_and_approval(
@@ -678,7 +719,7 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
     workspace: &Path,
     _working_set_summary: Option<&str>,
     skills_dir: Option<&Path>,
-    instructions: Option<&[PathBuf]>,
+    instructions: Option<&[InstructionSource]>,
     session_context: PromptSessionContext<'_>,
     approval_mode: ApprovalMode,
 ) -> SystemPrompt {
@@ -814,8 +855,8 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
     // because these files are workspace-scoped and may differ between
     // sessions; any edit to them would otherwise bust the prefix cache for
     // all subsequent static layers.
-    if let Some(paths) = instructions
-        && let Some(block) = render_instructions_block(paths)
+    if let Some(sources) = instructions
+        && let Some(block) = render_instructions_block(sources)
     {
         full_prompt = format!("{full_prompt}\n\n{block}");
     }
@@ -1944,12 +1985,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): Tier 5 段精简后不再裸列 AGENTS.md/CLAUDE.md 品牌路径,'Local Law' anchor 仍在但其它的不在;新断言见 forkguard_local_law_tier_covers_engine_config_instructions"]
     fn workspace_orientation_guidance_present() {
         let prompt = compose_prompt(AppMode::Agent, Personality::Calm);
-        // Workspace orientation guidance is now distributed across the
-        // Constitutional preamble (project context loading) and the
-        // Local Law tier (AGENTS.md/instructions.md). Verify the
-        // key guidance anchors are still present.
         assert!(prompt.contains("AGENTS.md"));
         assert!(prompt.contains("Local Law"));
         assert!(
@@ -2228,7 +2266,8 @@ mod tests {
 
     #[test]
     fn render_instructions_block_returns_none_for_empty_input() {
-        assert!(super::render_instructions_block(&[]).is_none());
+        let empty: &[super::InstructionSource] = &[];
+        assert!(super::render_instructions_block(empty).is_none());
     }
 
     #[test]
@@ -2238,7 +2277,7 @@ mod tests {
         std::fs::write(&real, "real content here").unwrap();
         let bogus = tmp.path().join("does-not-exist.md");
 
-        let block = super::render_instructions_block(&[bogus.clone(), real.clone()])
+        let block = super::render_instructions_block(&[bogus.clone().into(), real.clone().into()])
             .expect("present file should produce a block");
         assert!(block.contains("real content here"));
         assert!(block.contains(&real.display().to_string()));
@@ -2254,7 +2293,7 @@ mod tests {
         std::fs::write(&a, "ALPHA_MARKER").unwrap();
         std::fs::write(&b, "BRAVO_MARKER").unwrap();
 
-        let block = super::render_instructions_block(&[a, b]).expect("non-empty");
+        let block = super::render_instructions_block(&[a.into(), b.into()]).expect("non-empty");
         let alpha_pos = block.find("ALPHA_MARKER").expect("alpha rendered");
         let bravo_pos = block.find("BRAVO_MARKER").expect("bravo rendered");
         assert!(
@@ -2271,7 +2310,8 @@ mod tests {
         std::fs::write(&empty, "   \n   \n").unwrap();
         std::fs::write(&real, "real content").unwrap();
 
-        let block = super::render_instructions_block(&[empty, real]).expect("non-empty");
+        let block =
+            super::render_instructions_block(&[empty.into(), real.into()]).expect("non-empty");
         // Empty file produces no `<instructions>` section, only the real one.
         let count = block.matches("<instructions").count();
         assert_eq!(count, 1, "only the non-empty file should produce a section");
@@ -2284,13 +2324,57 @@ mod tests {
         // 200 KiB of content — well above the 100 KiB cap.
         std::fs::write(&big, "X".repeat(200 * 1024)).unwrap();
 
-        let block = super::render_instructions_block(&[big]).expect("non-empty");
+        let block = super::render_instructions_block(&[big.into()]).expect("non-empty");
         assert!(block.contains("[…elided]"), "truncation marker missing");
         // Block should be much smaller than the original file.
         assert!(
             block.len() < 110 * 1024,
             "block should be capped near 100 KiB"
         );
+    }
+
+    /// pinvou3 fork (C / P-no-disk): InstructionSource::Inline 不读 disk,
+    /// 直接用 `content`,`name` 作 `<instructions source="…">` 属性。
+    #[test]
+    fn forkguard_render_instructions_block_handles_inline_source() {
+        let block = super::render_instructions_block(&[super::InstructionSource::Inline {
+            name: "pinvou3:test/embedded".to_string(),
+            content: "INLINE_MARKER_CONTENT".to_string(),
+        }])
+        .expect("non-empty");
+        assert!(block.contains("INLINE_MARKER_CONTENT"));
+        assert!(block.contains("source=\"pinvou3:test/embedded\""));
+
+        // Empty inline → skipped just like empty file.
+        let empty_inline = super::InstructionSource::Inline {
+            name: "empty".to_string(),
+            content: "   ".to_string(),
+        };
+        assert!(super::render_instructions_block(&[empty_inline]).is_none());
+
+        // Oversize inline → truncated with elided marker.
+        let big_inline = super::InstructionSource::Inline {
+            name: "huge".to_string(),
+            content: "Y".repeat(200 * 1024),
+        };
+        let trimmed = super::render_instructions_block(&[big_inline]).expect("non-empty");
+        assert!(trimmed.contains("[…elided]"));
+
+        // File + Inline 混用,顺序保持。
+        let tmp = tempdir().expect("tempdir");
+        let file_path = tmp.path().join("file-first.md");
+        std::fs::write(&file_path, "FILE_MARKER").unwrap();
+        let mixed = super::render_instructions_block(&[
+            file_path.into(),
+            super::InstructionSource::Inline {
+                name: "inline-second".to_string(),
+                content: "INLINE_MARKER".to_string(),
+            },
+        ])
+        .expect("non-empty");
+        let file_pos = mixed.find("FILE_MARKER").expect("file rendered");
+        let inline_pos = mixed.find("INLINE_MARKER").expect("inline rendered");
+        assert!(file_pos < inline_pos, "声明顺序必须保留(File then Inline)");
     }
 
     #[test]
@@ -2300,12 +2384,13 @@ mod tests {
         let extra = workspace.join("extra-instructions.md");
         std::fs::write(&extra, "EXTRA_INSTRUCTIONS_MARKER_BODY").unwrap();
 
+        let extra_source: super::InstructionSource = extra.clone().into();
         let prompt = match super::system_prompt_for_mode_with_context_and_skills(
             AppMode::Agent,
             workspace,
             None,
             None,
-            Some(std::slice::from_ref(&extra)),
+            Some(std::slice::from_ref(&extra_source)),
             None,
         ) {
             SystemPrompt::Text(text) => text,

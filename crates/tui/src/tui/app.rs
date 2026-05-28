@@ -5360,6 +5360,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork patch #41: workspace skill dirs scrapped"]
     fn cached_skills_merges_across_candidate_directories() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");

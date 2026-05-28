@@ -92,10 +92,16 @@ pub struct EngineConfig {
     /// Directory containing discoverable skills.
     pub skills_dir: PathBuf,
     /// Additional instruction files concatenated into the system
-    /// prompt (#454). Loaded in declared order from the user's
-    /// `instructions = [...]` config (or the per-project override).
-    /// Resolved via `expand_path` so `~` works.
-    pub instructions: Vec<PathBuf>,
+    /// Sources injected as `<instructions source="…">` blocks in the system
+    /// prompt (#454). Each entry is either a disk path (read at render time)
+    /// or an inline string. Loaded in declared order from the user's
+    /// `instructions = [...]` config or constructed by embedders.
+    ///
+    /// pinvou3 fork (P-no-disk): originally `Vec<PathBuf>`, generalized to
+    /// `Vec<InstructionSource>` so embedders can inject inline content without
+    /// staging a disk file. `From<PathBuf>` impl keeps existing callers working
+    /// with `.into()`.
+    pub instructions: Vec<crate::prompts::InstructionSource>,
     pub project_context_pack_enabled: bool,
     /// When true, the model is instructed to respond in the current locale
     /// and a post-hoc translation layer replaces remaining English output.
