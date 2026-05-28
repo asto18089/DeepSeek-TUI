@@ -77,7 +77,7 @@ pub struct Skill {
 }
 
 /// One phase entry from the SKILL.md `phases:` frontmatter line.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PhaseDef {
     pub id: String,
     pub title: String,

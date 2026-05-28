@@ -25,7 +25,7 @@ use std::time::Duration;
 const DUCKDUCKGO_HOST: &str = "html.duckduckgo.com";
 const BING_HOST: &str = "www.bing.com";
 const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
-const BOCHA_ENDPOINT: &str = "https://api.bochaai.com/v1/ai/search";
+const BOCHA_ENDPOINT: &str = "https://api.bochaai.com/v1/ai-search";
 const METASO_ENDPOINT: &str = "https://metaso.cn/api/v1";
 /// Intentionally public default key provided by Metaso for open-source/community use.
 /// Last-resort fallback after config and env var. Rate-limited to ~100 searches/day.
