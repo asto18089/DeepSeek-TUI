@@ -52,7 +52,8 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     // 附件预处理（应移到 bridge 上传 pipeline，见文档 §6.1）
     "pandoc_convert",
     "image_ocr",
-    "image_analyze",
+    // image_analyze 已放出:Qwen3.6 实测有视觉(2026-05-28),vision_config 指向同一 vllm 端点,
+    // 用户附图后由 LLM 调 image_analyze(workspace 相对路径)读图。
     // todo 兼容别名（保留 checklist_*；todo_* 是 v0.8.x 之前的 legacy alias）
     "todo_write",
     "todo_add",
@@ -137,6 +138,8 @@ mod tests {
         assert!(!is_pinvou3_hidden("web_search"));
         assert!(!is_pinvou3_hidden("checklist_write"));
         assert!(!is_pinvou3_hidden("update_plan"));
+        // 视觉:Qwen3.6 有视觉能力,image_analyze 已放出供 LLM 读用户附图
+        assert!(!is_pinvou3_hidden("image_analyze"));
     }
 
     #[test]
