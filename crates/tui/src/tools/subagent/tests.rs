@@ -1780,6 +1780,7 @@ fn stub_runtime() -> SubAgentRuntime {
         parent_completion_tx: None,
         fork_context: None,
         step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
+        user_input_tx: None,
     }
 }
 

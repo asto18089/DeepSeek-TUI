@@ -82,25 +82,28 @@ impl EngineHandle {
     }
 
     /// Submit a response for request_user_input.
+    ///
+    /// [pinvou3-fork] `tx_user_input` is a broadcast channel: `send` is
+    /// synchronous and errors only when there are zero live subscribers
+    /// (e.g. the awaiting turn/sub-agent already ended). That is not a
+    /// failure for the caller, so the error is ignored.
     pub async fn submit_user_input(
         &self,
         id: impl Into<String>,
         response: UserInputResponse,
     ) -> Result<()> {
-        self.tx_user_input
-            .send(UserInputDecision::Submitted {
-                id: id.into(),
-                response,
-            })
-            .await?;
+        let _ = self.tx_user_input.send(UserInputDecision::Submitted {
+            id: id.into(),
+            response,
+        });
         Ok(())
     }
 
     /// Cancel a request_user_input prompt.
     pub async fn cancel_user_input(&self, id: impl Into<String>) -> Result<()> {
-        self.tx_user_input
-            .send(UserInputDecision::Cancelled { id: id.into() })
-            .await?;
+        let _ = self
+            .tx_user_input
+            .send(UserInputDecision::Cancelled { id: id.into() });
         Ok(())
     }
 

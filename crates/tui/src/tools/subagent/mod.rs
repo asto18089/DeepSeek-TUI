@@ -20,7 +20,10 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{broadcast, mpsc},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -32,6 +35,7 @@ use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt, Tool};
 use crate::tools::handle::VarHandle;
 use crate::tools::plan::{PlanState, SharedPlanState};
 use crate::tools::registry::{ToolRegistry, ToolRegistryBuilder};
+use crate::tools::user_input::{UserInputDecision, UserInputRequest};
 use crate::tools::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_bool, optional_u64, required_str,
@@ -331,7 +335,10 @@ pub struct SubAgentAssignment {
 }
 
 impl SubAgentAssignment {
-    fn new(objective: String, role: Option<String>) -> Self {
+    // [pinvou3-fork] pub(crate) so the engine's Op::SpawnSubAgent handler can
+    // build an assignment when dispatching a workflow role via
+    // spawn_background_with_assignment_options.
+    pub(crate) fn new(objective: String, role: Option<String>) -> Self {
         Self { objective, role }
     }
 }
@@ -594,6 +601,10 @@ pub(crate) struct SubAgentSpawnOptions {
     pub model: Option<String>,
     pub nickname: Option<String>,
     pub fork_context: bool,
+    /// [pinvou3-fork] Per-spawn step budget. `None` falls back to the manager
+    /// default (`DEFAULT_MAX_STEPS`). Lets the Harness Loop honor each registry
+    /// role's `max_steps` (e.g. slide_writer=80 vs requirements_analyst=10).
+    pub max_steps: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -797,6 +808,13 @@ pub struct SubAgentRuntime {
     /// false-timeout the child mid-thinking. `child_runtime()` and
     /// `background_runtime()` preserve the parent's value (#1806, #1808).
     pub step_api_timeout: Duration,
+    /// [pinvou3-fork] Broadcast sender for `request_user_input` answers. When
+    /// `Some`, the sub-agent turn loop intercepts `request_user_input` tool
+    /// calls — emits `Event::UserInputRequired` and blocks awaiting the answer
+    /// routed by `tool_call_id` — instead of hitting the engine-only error stub
+    /// (`tools::user_input::RequestUserInputTool::execute`). The engine attaches
+    /// this; it propagates to children via `child_runtime()` clone.
+    pub user_input_tx: Option<broadcast::Sender<UserInputDecision>>,
 }
 
 impl SubAgentRuntime {
@@ -831,6 +849,7 @@ impl SubAgentRuntime {
             parent_completion_tx: None,
             fork_context: None,
             step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
+            user_input_tx: None,
         }
     }
 
@@ -854,6 +873,16 @@ impl SubAgentRuntime {
         tx: mpsc::UnboundedSender<SubAgentCompletion>,
     ) -> Self {
         self.parent_completion_tx = Some(tx);
+        self
+    }
+
+    /// [pinvou3-fork] Attach the engine's broadcast user-input sender so this
+    /// runtime's turn loop can intercept `request_user_input`, pop a card to
+    /// the GUI, and block awaiting the answer routed by `tool_call_id`.
+    /// Propagated to descendants via `child_runtime()` clone.
+    #[must_use]
+    pub fn with_user_input_tx(mut self, tx: broadcast::Sender<UserInputDecision>) -> Self {
+        self.user_input_tx = Some(tx);
         self
     }
 
@@ -965,6 +994,7 @@ impl SubAgentRuntime {
             parent_completion_tx: self.parent_completion_tx.clone(),
             fork_context: self.fork_context.clone(),
             step_api_timeout: self.step_api_timeout,
+            user_input_tx: self.user_input_tx.clone(),
         }
     }
 
@@ -1356,7 +1386,9 @@ impl SubAgentManager {
         agent.fork_context = options.fork_context;
         let agent_id = agent.id.clone();
         let started_at = agent.started_at;
-        let max_steps = self.max_steps;
+        // [pinvou3-fork] honor per-spawn max_steps (registry role budget) when
+        // provided; otherwise the manager default.
+        let max_steps = options.max_steps.unwrap_or(self.max_steps);
 
         if let Some(event_tx) = runtime.event_tx.clone() {
             let _ = event_tx.try_send(Event::AgentSpawned {
@@ -2415,6 +2447,8 @@ impl ToolSpec for AgentSpawnTool {
                     model: Some(effective_model),
                     nickname: None,
                     fork_context: spawn_request.fork_context,
+                    // model-driven agent_spawn keeps the manager default budget
+                    max_steps: None,
                 },
             )
             .map_err(|e| ToolError::execution_failed(format!("Failed to spawn sub-agent: {e}")))?;
@@ -3675,6 +3709,66 @@ async fn insert_subagent_full_transcript_handle(
     store.insert_json(format!("agent:{agent_id}"), "full_transcript", payload)
 }
 
+/// [pinvou3-fork] Pop a `request_user_input` card to the GUI from inside a
+/// sub-agent turn loop and block for the answer, routed by `tool_call_id`.
+///
+/// Mirrors the engine main loop's `await_user_input` (core/engine/approval.rs)
+/// but over the shared `broadcast` channel: subscribe first (so a fast answer
+/// is never missed), emit `Event::UserInputRequired` on the same event stream
+/// the forwarder watches, then await the matching `id`. Returns the
+/// JSON-serialized `UserInputResponse` (same shape the main loop feeds back to
+/// the model) or an `"Error: …"` string on cancel / parse failure / close.
+async fn await_subagent_user_input(
+    runtime: &SubAgentRuntime,
+    tool_id: &str,
+    tool_input: &Value,
+) -> String {
+    let request = match UserInputRequest::from_value(tool_input) {
+        Ok(r) => r,
+        Err(e) => return format!("Error: {e}"),
+    };
+    let Some(tx) = runtime.user_input_tx.as_ref() else {
+        return "Error: request_user_input is not wired for this sub-agent".to_string();
+    };
+    // Subscribe BEFORE emitting so an immediate answer cannot race past us.
+    let mut rx = tx.subscribe();
+    let Some(event_tx) = runtime.event_tx.as_ref() else {
+        return "Error: no event channel to surface request_user_input".to_string();
+    };
+    let _ = event_tx
+        .send(Event::UserInputRequired {
+            id: tool_id.to_string(),
+            request,
+        })
+        .await;
+
+    loop {
+        tokio::select! {
+            _ = runtime.cancel_token.cancelled() => {
+                return "Error: cancelled while awaiting user input".to_string();
+            }
+            decision = rx.recv() => {
+                match decision {
+                    Ok(UserInputDecision::Submitted { id, response }) if id == tool_id => {
+                        return serde_json::to_string(&response)
+                            .unwrap_or_else(|_| "{\"answers\":[]}".to_string());
+                    }
+                    Ok(UserInputDecision::Cancelled { id }) if id == tool_id => {
+                        return "Error: user input cancelled".to_string();
+                    }
+                    // A decision for a different tool_call_id (another live
+                    // agent / the main loop) — ignore and keep waiting.
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return "Error: user input channel closed".to_string();
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_subagent(
     runtime: &SubAgentRuntime,
@@ -3979,16 +4073,25 @@ async fn run_subagent(
                     step: steps,
                 });
             }
-            let result = match tokio::time::timeout(TOOL_TIMEOUT, async {
-                tool_registry
-                    .execute(&agent_id, &tool_name, tool_input)
-                    .await
-            })
-            .await
-            {
-                Ok(Ok(output)) => output,
-                Ok(Err(e)) => format!("Error: {e}"),
-                Err(_) => format!("Error: Tool {tool_name} timed out"),
+            // [pinvou3-fork] `request_user_input` must pop a GUI card and block
+            // for the answer routed by `tool_call_id`; the tool's own execute()
+            // is an engine-only error stub. Mirror the main turn loop
+            // (core/engine/turn_loop.rs → await_user_input). No tool timeout
+            // here — the user may take arbitrarily long to answer.
+            let result = if tool_name == "request_user_input" && runtime.user_input_tx.is_some() {
+                await_subagent_user_input(runtime, &tool_id, &tool_input).await
+            } else {
+                match tokio::time::timeout(TOOL_TIMEOUT, async {
+                    tool_registry
+                        .execute(&agent_id, &tool_name, tool_input)
+                        .await
+                })
+                .await
+                {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(e)) => format!("Error: {e}"),
+                    Err(_) => format!("Error: Tool {tool_name} timed out"),
+                }
             };
             let tool_ok = !result.starts_with("Error:");
             emit_agent_progress(

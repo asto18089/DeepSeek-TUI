@@ -11,6 +11,12 @@ use crate::tools::user_input::{UserInputRequest, UserInputResponse};
 
 use super::Engine;
 
+// [pinvou3-fork] `UserInputDecision` moved to `tools::user_input` (pub) so
+// sub-agent turn loops can subscribe to the same broadcast channel and route
+// answers by `tool_call_id`. Re-exported here so existing `super::approval::
+// UserInputDecision` import paths (handle.rs, engine.rs) keep working.
+pub(super) use crate::tools::user_input::UserInputDecision;
+
 #[derive(Debug, Clone)]
 pub(super) enum ApprovalDecision {
     Approved {
@@ -23,17 +29,6 @@ pub(super) enum ApprovalDecision {
     RetryWithPolicy {
         id: String,
         policy: crate::sandbox::SandboxPolicy,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub(super) enum UserInputDecision {
-    Submitted {
-        id: String,
-        response: UserInputResponse,
-    },
-    Cancelled {
-        id: String,
     },
 }
 
@@ -124,10 +119,16 @@ impl Engine {
                     ));
                 }
                 decision = self.rx_user_input.recv() => {
-                    let Some(decision) = decision else {
-                        return Err(ToolError::execution_failed(
-                            "User input channel closed".to_string(),
-                        ));
+                    // [pinvou3-fork] broadcast channel: skip Lagged (low-frequency
+                    // user input never realistically lags), error on Closed.
+                    let decision = match decision {
+                        Ok(d) => d,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return Err(ToolError::execution_failed(
+                                "User input channel closed".to_string(),
+                            ));
+                        }
                     };
                     match decision {
                         UserInputDecision::Submitted { id, response } if id == tool_id => {

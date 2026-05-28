@@ -503,6 +503,32 @@ fn model_tool_catalog_applies_native_and_mcp_deferral() {
     assert_eq!(defer_loading("mcp_server_write"), Some(true));
 }
 
+// [pinvou3-fork] hard tool whitelist (supervisor sessions): non-whitelisted
+// tools are removed from the catalog entirely (not just deferred), so they
+// cannot be re-surfaced by tool_search. None = no restriction.
+#[test]
+fn tool_whitelist_none_is_noop_some_hard_filters() {
+    let mut catalog = vec![
+        api_tool("read_file"),
+        api_tool("write_file"),
+        api_tool("exec_shell"),
+        api_tool("update_plan"),
+    ];
+
+    apply_tool_whitelist(&mut catalog, None);
+    assert_eq!(catalog.len(), 4, "None must not touch the catalog");
+
+    let whitelist: HashSet<String> = ["read_file", "update_plan"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    apply_tool_whitelist(&mut catalog, Some(&whitelist));
+    let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, vec!["read_file", "update_plan"]);
+    assert!(!catalog.iter().any(|t| t.name == "write_file"));
+    assert!(!catalog.iter().any(|t| t.name == "exec_shell"));
+}
+
 #[test]
 fn agent_catalog_keeps_edit_file_loaded_when_fuzz_is_omitted() {
     let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());

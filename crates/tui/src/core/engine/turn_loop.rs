@@ -37,6 +37,10 @@ impl Engine {
         if !tool_catalog.is_empty() {
             ensure_advanced_tooling(&mut tool_catalog, mode, &self.config.tools_always_load);
         }
+        // [pinvou3-fork] Hard tool whitelist (supervisor sessions). Applied AFTER
+        // ensure_advanced_tooling so the appended meta-tools (tool_search,
+        // code_execution) are subject to it too. None = no restriction.
+        apply_tool_whitelist(&mut tool_catalog, self.config.tool_whitelist.as_ref());
         let mut active_tool_names = initial_active_tools(&tool_catalog);
         let mut loop_guard = LoopGuard::default();
         let mut goal_continuations_this_turn = 0u32;

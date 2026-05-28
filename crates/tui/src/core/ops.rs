@@ -46,9 +46,27 @@ pub enum Op {
     #[allow(dead_code)]
     DenyToolCall { id: String },
 
-    /// Spawn a sub-agent
+    /// Spawn a sub-agent.
+    ///
+    /// [pinvou3-fork] Driven by the Harness Loop (Step C) to dispatch a
+    /// workflow role as a real isolated sub-agent — not by the model. The
+    /// extra fields carry the registry role config so the sub-agent runs as a
+    /// `Custom` agent with the role's tool whitelist and step budget.
+    /// `#[allow(dead_code)]` stays until the pinvou3 forwarder wires the call
+    /// site (stage 3); the base TUI never constructs this variant.
     #[allow(dead_code)]
-    SpawnSubAgent { prompt: String },
+    SpawnSubAgent {
+        prompt: String,
+        /// Workflow role id (e.g. `"requirements_analyst"`) — used as the
+        /// sub-agent name and for `workflow:agent_state_changed` correlation.
+        role_id: String,
+        /// Registry tool whitelist for this role. A `Custom` sub-agent
+        /// requires a non-empty list (enforced by `build_allowed_tools`).
+        allowed_tools: Vec<String>,
+        /// Registry `max_steps` (e.g. slide_writer=80). `None` falls back to
+        /// the manager default (`DEFAULT_MAX_STEPS`).
+        max_steps: Option<u32>,
+    },
 
     /// List current sub-agents and their status
     ListSubAgents,
