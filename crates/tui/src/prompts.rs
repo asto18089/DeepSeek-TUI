@@ -29,7 +29,7 @@ pub struct PromptSessionContext<'a> {
     /// the resolved session locale.
     pub translation_enabled: bool,
     /// Active model identifier injected into the Constitutional
-    /// preamble ("You are {model_id}, running inside pinvou3").
+    /// preamble ("You are {model_id}, running inside CodeWhale").
     /// Defaults to `"codewhale"` when the caller doesn't supply one,
     /// preserving backward compatibility with existing call sites
     /// that predate dynamic model injection.
@@ -417,7 +417,7 @@ pub(crate) fn locale_reinforcement_closer(locale_tag: &str) -> Option<&'static s
 }
 
 const LOCALE_PREAMBLE_ZH_HANS: &str = "## 语言要求\n\n\
-你正在 pinvou3 中运行。无论任务上下文（代码、错误日志、文件名）\
+你正在 codewhale 中运行。无论任务上下文（代码、错误日志、文件名）\
 是英文，无论系统提示的其余部分是英文，你都必须用简体中文进行 \
 `reasoning_content`（内部思考）和最终回复。代码、文件路径、工具名称\
 （例如 `read_file`、`exec_shell`）、环境变量、命令行参数和 URL \
@@ -605,7 +605,7 @@ fn apply_model_template(prompt: &str, model_id: &str) -> String {
 const AUTHORITY_RECAP: &str = "\
 ## Authority Recap
 
-The Constitution of pinvou3 (Articles I-VII) governs your behavior.
+The Constitution of CodeWhale (Articles I-VII) governs your behavior.
 Tier 1 rules — truthfulness, user agency, tool-use mandate, verification
 duty — are non-negotiable. The user's next message is the highest
 directive within Constitutional bounds. Personality, memory, and handoff
@@ -1024,39 +1024,9 @@ mod tests {
         );
     }
 
-    /// pinvou3 fork (P-brand): the Brother Whale preamble is upstream
-    /// branding philosophy that doesn't apply to pinvou3. The Constitution
-    /// title and Articles II / VII are still load-bearing — keep those
-    /// pinned, but make sure the deleted phrases don't resurface.
-    #[test]
-    fn forkguard_constitutional_preamble_uses_pinvou3_branding() {
-        // Anchors that must remain present.
-        for phrase in [
-            "future intelligences can better coordinate",
-            "Article II — The Primacy of Truth",
-            "Article VII — The Hierarchy of Law",
-            "CONSTITUTION OF PINVOU3",
-            "running inside pinvou3",
-        ] {
-            assert!(
-                BASE_PROMPT.contains(phrase),
-                "BASE_PROMPT missing required anchor {phrase:?}"
-            );
-        }
-        // Phrases pinvou3 fork dropped.
-        for phrase in [
-            "We begin with Brother Whale",
-            "Brother Whale is the founding intelligence",
-            "Every model that runs here is Brother Whale",
-            "CONSTITUTION OF CODEWHALE",
-            "running inside CodeWhale",
-        ] {
-            assert!(
-                !BASE_PROMPT.contains(phrase),
-                "BASE_PROMPT unexpectedly contains dropped CodeWhale-branding phrase {phrase:?}"
-            );
-        }
-    }
+    // NOTE: pinvou3 brand/slimming BASE_PROMPT forkguards moved to pinvou3-app.
+    // Submodule base.md is upstream-pristine; pinvou3 content is injected via
+    // `set_base_prompt_override`. Content assertions live in pinvou3-tauri.
 
     #[test]
     fn constitutional_hierarchy_keeps_case_command_above_local_law() {
@@ -1133,7 +1103,7 @@ mod tests {
             "full system prompt must contain the authority recap"
         );
         assert!(
-            text.contains("The Constitution of pinvou3 (Articles I-VII) governs your behavior"),
+            text.contains("The Constitution of CodeWhale (Articles I-VII) governs your behavior"),
             "authority recap must reference the Constitution"
         );
     }
@@ -1921,28 +1891,7 @@ mod tests {
         assert!(!prompt.contains("## Current Session Goal"));
     }
 
-    /// pinvou3 fork (patches #29-#33): Tool Selection Guide kept but
-    /// concrete tool names (`agent_eval` etc.) abstracted to
-    /// "the sub-agent's eval/poll variant" because pinvou3 exposes
-    /// `delegate_to_agent`, not the upstream `agent_*` family.
-    #[test]
-    fn forkguard_tool_selection_guide_is_embedder_aware() {
-        let prompt = compose_prompt(AppMode::Agent, Personality::Calm);
-        assert!(prompt.contains("Tool Selection Guide"));
-        assert!(
-            prompt.contains("Sub-agent tools (if exposed)"),
-            "pinvou3 fork rewrote the sub-agent guide to be embedder-aware"
-        );
-        // Defensive-tool-suppression rule from upstream: still enforced.
-        assert!(
-            !prompt.contains("When NOT to use certain tools"),
-            "the system prompt should steer tool choice without training the model to avoid available tools"
-        );
-        assert!(
-            !prompt.contains("Don't reach for"),
-            "avoid defensive anti-tool wording in the base prompt"
-        );
-    }
+    // NOTE: forkguard_tool_selection_guide_is_embedder_aware moved to pinvou3-app.
 
     /// #588: language-mirroring directive must ship in every mode so
     /// DeepSeek's `reasoning_content` and final reply follow the user's
@@ -2008,29 +1957,8 @@ mod tests {
         );
     }
 
-    /// #358: rlm guidance was reframed from "first-class" to "specialty
-    /// tool" — verify the structural markers are present so a future
-    /// change doesn't silently remove the RLM section entirely.
-    ///
-    /// Don't assert on prose. If you wouldn't fail a code review for
-    /// changing the wording, don't fail a test for it.
-    /// pinvou3 fork (patch #29): RLM section deleted from base.md.
-    /// pinvou3 does not expose `rlm_open` / `rlm_eval` / `rlm_configure`
-    /// / `rlm_close`. Reverse assertion: if the upstream RLM section
-    /// reappears after a sync, this test fails so we know to re-clean.
-    #[test]
-    fn forkguard_rlm_section_removed_by_pinvou3() {
-        let prompt = compose_prompt(AppMode::Agent, Personality::Calm);
-        assert!(
-            !prompt.contains("RLM — How to Use It"),
-            "RLM section must not be in BASE_PROMPT — pinvou3 doesn't expose RLM tools"
-        );
-        let rlm_count = prompt.to_lowercase().matches("rlm").count();
-        assert!(
-            rlm_count == 0,
-            "Expected 0 'rlm' mentions after pinvou3 fork removed the section, got {rlm_count}"
-        );
-    }
+    // NOTE: forkguard_rlm_section_removed_by_pinvou3 moved to pinvou3-app
+    // (RLM removal lives in the resources/bundle/base.md override).
 
     #[test]
     #[ignore = "pinvou3 fork (P-brand cleanup): Tier 5 段精简后不再裸列 AGENTS.md/CLAUDE.md 品牌路径,'Local Law' anchor 仍在但其它的不在;新断言见 forkguard_local_law_tier_covers_engine_config_instructions"]
@@ -2044,89 +1972,10 @@ mod tests {
         );
     }
 
-    /// pinvou3 fork-guard (P2-3, patch #28): Tier 5 Local Law must explicitly
-    /// cover `EngineConfig.instructions` files. Without this clause, embedders
-    /// that inject instructions via `EngineConfig.instructions` (e.g. pinvou3
-    /// writing `~/.pinvou3/sessions/<sid>/instructions.md`) get their files
-    /// classified by path — and since those paths aren't AGENTS.md / CLAUDE.md
-    /// / `.codewhale/instructions.md` / `.deepseek/instructions.md`, the model
-    /// can default-treat them as Tier 7 Memory (imperative memory = lowest
-    /// tier per Article VII, overridable by a single user sentence).
-    #[test]
-    fn forkguard_local_law_tier_covers_engine_config_instructions() {
-        let prompt = compose_prompt(AppMode::Agent, Personality::Calm);
-        assert!(
-            prompt.contains("files configured via `EngineConfig.instructions`"),
-            "Tier 5 Local Law must explicitly cover EngineConfig.instructions \
-             paths so embedder-injected instructions are not default-classified \
-             as Tier 7 Memory."
-        );
-        // 2026-05-28 simplification: 删了具体品牌路径名(AGENTS.md/CLAUDE.md/
-        // .codewhale/.deepseek)。Tier 5 不应再裸暴露这些品牌字串。
-        for brand_path in [
-            "AGENTS.md, CLAUDE.md",
-            "`.codewhale/instructions.md`, `.deepseek/instructions.md`",
-        ] {
-            assert!(
-                !prompt.contains(brand_path),
-                "Tier 5 不应裸列品牌路径 {brand_path:?}"
-            );
-        }
-    }
-
-    /// pinvou3 fork (patches #30-#33): Toolbox section deleted +
-    /// Tool Selection Guide abstracted. BASE_PROMPT no longer lists
-    /// upstream-specific concrete tool names. Anti-regression assertion:
-    /// if upstream re-introduces the Toolbox/agent_eval names, fail loud.
-    #[test]
-    fn forkguard_pinvou3_omitted_upstream_specific_tool_names_from_base_prompt() {
-        let prompt = compose_prompt(AppMode::Agent, Personality::Calm);
-        // The hard-listed Toolbox section is gone.
-        assert!(
-            !prompt.contains("## Toolbox (fast reference"),
-            "pinvou3 fork: Toolbox section removed — runtime tool schemas are authoritative"
-        );
-        // The retired-sub-agent block was originally there to scrub a
-        // historical migration. After we abstract the guide it should also
-        // not contain those names.
-        for retired in [
-            "agent_spawn",
-            "agent_wait",
-            "agent_result",
-            "agent_send_input",
-            "agent_assign",
-            "agent_resume",
-            "agent_list",
-            "spawn_agent",
-            "send_input",
-            "close_agent",
-        ] {
-            assert!(
-                !prompt.contains(retired),
-                "prompt should not advertise retired sub-agent tool `{retired}`"
-            );
-        }
-    }
-
-    /// pinvou3 fork (patch #31): Tool Selection Guide for `agent_open`
-    /// was rewritten as "Sub-agent tools (if exposed)" and the
-    /// DeepSeek-specific `fork_context: true` / `byte-identical` /
-    /// "DeepSeek prefix-cache reuse" prose was dropped because pinvou3
-    /// runs Qwen3.6 (not DeepSeek) and exposes `delegate_to_agent`
-    /// rather than `agent_open(fork_context: ...)`. This forkguard
-    /// fails if the upstream wording sneaks back in.
-    #[test]
-    fn forkguard_no_deepseek_specific_fork_context_prose_in_base_prompt() {
-        let prompt = compose_prompt(AppMode::Agent, Personality::Calm);
-        assert!(
-            !prompt.contains("DeepSeek prefix-cache reuse"),
-            "pinvou3 runs Qwen3.6 — no model-specific prefix-cache prose belongs in base prompt"
-        );
-        assert!(
-            !prompt.contains("fork_context: true"),
-            "pinvou3 doesn't expose `agent_open(fork_context: ...)`; guidance for it shouldn't ship"
-        );
-    }
+    // NOTE: three pinvou3 BASE_PROMPT forkguards moved to pinvou3-app — Tier-5
+    // EngineConfig.instructions wording, Toolbox-section removal, and
+    // DeepSeek-specific fork_context prose removal now live in the
+    // resources/bundle/base.md override + its pinvou3-tauri content tests.
 
     #[test]
     fn subagent_done_sentinel_section_present() {
