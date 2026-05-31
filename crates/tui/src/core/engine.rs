@@ -685,6 +685,7 @@ impl Engine {
                     role_id,
                     allowed_tools,
                     max_steps,
+                    output_schema,
                 } => {
                     // [pinvou3-fork] Custom sub-agents require a non-empty tool
                     // whitelist (build_allowed_tools enforces this); fail fast
@@ -757,7 +758,10 @@ impl Engine {
                             runtime,
                             SubAgentType::Custom,
                             prompt.clone(),
-                            SubAgentAssignment::new(prompt.clone(), None),
+                            // [pinvou3-fork] role=role_id(修 transcript role 显示 custom 的问题);
+                            // output_schema 透传以触发 submit_output 强制提交。
+                            SubAgentAssignment::new(prompt.clone(), Some(role_id.clone()))
+                                .with_output_schema(output_schema),
                             Some(allowed_tools),
                             SubAgentSpawnOptions {
                                 name: None,

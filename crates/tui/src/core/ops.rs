@@ -66,6 +66,9 @@ pub enum Op {
         /// Registry `max_steps` (e.g. slide_writer=80). `None` falls back to
         /// the manager default (`DEFAULT_MAX_STEPS`).
         max_steps: Option<u32>,
+        /// [pinvou3-fork] 结构化产出 schema(registry.output_schema)。`Some` 时
+        /// 强制 SubAgent 走 submit_output 提交合格产出才能结束(docs/SDAN/12)。
+        output_schema: Option<serde_json::Value>,
     },
 
     /// List current sub-agents and their status

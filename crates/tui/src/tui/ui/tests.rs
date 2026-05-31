@@ -2185,6 +2185,7 @@ fn make_subagent(
         assignment: crate::tools::subagent::SubAgentAssignment {
             objective: format!("objective-{id}"),
             role: Some("worker".to_string()),
+            output_schema: None,
         },
         model: "deepseek-v4-flash".to_string(),
         nickname: None,

@@ -327,11 +327,17 @@ fn wrap_with_deprecation_notice(
 // === Types ===
 
 /// Assignment metadata for sub-agent orchestration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SubAgentAssignment {
     pub objective: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// [pinvou3-fork] 结构化产出规格(JSON Schema)。`Some` 时,run_subagent 会
+    /// 合成一个 `submit_output` 工具(input_schema = 此 schema),并强制 SubAgent
+    /// 必须成功提交一次合格产出才能结束(见 docs/SDAN/12-structured-output.md)。
+    /// `None` = 自由文本角色,走原 write_file + break 逻辑,零影响。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
 }
 
 impl SubAgentAssignment {
@@ -339,7 +345,17 @@ impl SubAgentAssignment {
     // build an assignment when dispatching a workflow role via
     // spawn_background_with_assignment_options.
     pub(crate) fn new(objective: String, role: Option<String>) -> Self {
-        Self { objective, role }
+        Self {
+            objective,
+            role,
+            output_schema: None,
+        }
+    }
+
+    /// [pinvou3-fork] 链式设置结构化产出 schema。
+    pub(crate) fn with_output_schema(mut self, schema: Option<Value>) -> Self {
+        self.output_schema = schema;
+        self
     }
 }
 
@@ -3809,7 +3825,22 @@ async fn run_subagent(
             unavailable_tools.join(", ")
         ));
     }
-    let tools = tool_registry.tools_for_model(&agent_type);
+    let mut tools = tool_registry.tools_for_model(&agent_type);
+    // [pinvou3-fork] 结构化产出:有 output_schema 的角色,追加合成 submit_output 工具,
+    // 并强制它必须成功提交一次才能结束(见 docs/SDAN/12-structured-output.md)。
+    let output_schema = assignment.output_schema.clone();
+    if let Some(schema) = output_schema.as_ref() {
+        tools.push(build_submit_output_tool(schema));
+    }
+    // 落盘根 = 项目目录(12 号决策1):会话 workspace 下唯一的 ppt-* 子目录;找不到则退回 workspace。
+    let project_dir = find_project_dir_in_workspace(&runtime.context.workspace)
+        .unwrap_or_else(|| runtime.context.workspace.clone());
+    let mut output_submitted: Option<Value> = None;
+    let mut structured_retries: u32 = 0;
+    // [pinvou3-fork] 结构化产出重试耗尽标志:置位后 loop 结束按 Failed 收尾(修 codex BLOCKER1)。
+    let mut structured_failed = false;
+    // [codex Q2 复审修] 记最后一次结构化错误(字段校验/落盘),失败时带进 Failed reason 便于排障。
+    let mut last_structured_error: Option<String> = None;
     if let Some(mb) = runtime.mailbox.as_ref() {
         let _ = mb.send(MailboxMessage::started(&agent_id, agent_type.clone()));
     }
@@ -3823,6 +3854,17 @@ async fn run_subagent(
     let mut steps = 0;
     let mut final_result: Option<String> = None;
     let mut pending_inputs: VecDeque<SubAgentInput> = VecDeque::new();
+
+    // [pinvou3-fork] 记 transcript 起点:本轮任务的初始输入(role 名 + prompt),
+    // 之后每个 loop 增量追加 LLM 输出 + 工具结果。
+    let transcript_ws = runtime.context.workspace.clone();
+    let transcript_role = assignment.role.clone().unwrap_or_else(|| agent_type.as_str().to_string());
+    append_subagent_transcript(
+        &transcript_ws,
+        &agent_id,
+        &transcript_role,
+        json!({ "kind": "task_start", "prompt": prompt }),
+    );
 
     for _step in 0..max_steps {
         // [pinvou3-fork] C: elapsed hard cap. 防 subagent 内部死磕重试拖垮整个任务。
@@ -4011,10 +4053,12 @@ async fn run_subagent(
             ));
         }
 
+        let mut step_texts: Vec<String> = Vec::new();
         for block in &response.content {
             match block {
                 ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
                     final_result = Some(text.clone());
+                    step_texts.push(text.clone());
                 }
                 ContentBlock::ToolUse {
                     id, name, input, ..
@@ -4024,6 +4068,24 @@ async fn run_subagent(
                 _ => {}
             }
         }
+
+        // [pinvou3-fork] transcript:记本轮 LLM 输出(说了什么文字 + 调了哪些工具/入参),
+        // 不含 system / 累积 messages。这就是复盘 "agent 到底问没问、问了什么" 的真相源。
+        append_subagent_transcript(
+            &transcript_ws,
+            &agent_id,
+            &transcript_role,
+            json!({
+                "kind": "llm_out",
+                "step": steps,
+                "finish_reason": response.stop_reason.clone(),
+                "text": if step_texts.is_empty() { Value::Null } else { json!(step_texts.join("\n")) },
+                "tool_calls": tool_uses
+                    .iter()
+                    .map(|(_, name, input)| json!({ "name": name, "input": input }))
+                    .collect::<Vec<_>>(),
+            }),
+        );
 
         messages.push(Message {
             role: "assistant".to_string(),
@@ -4038,6 +4100,48 @@ async fn run_subagent(
                 pending_inputs.push_back(input);
             }
             if pending_inputs.is_empty() {
+                // [pinvou3-fork] 结构化产出 stop 拦截:有 output_schema 的角色,模型想结束
+                // 但还没成功 submit_output → 不放它走,催它提交(对齐 Claude Code stop-hook)。
+                if output_schema.is_some() && output_submitted.is_none() {
+                    // [codex MAJOR 修] 催促也计入同一重试预算:否则模型反复纯文本 stop
+                    // 不调工具时 structured_retries 永不递增,会一直耗 max_steps。
+                    if structured_retries < MAX_STRUCTURED_OUTPUT_RETRIES {
+                        structured_retries += 1;
+                        messages.push(Message {
+                            role: "user".to_string(),
+                            content: vec![ContentBlock::Text {
+                                text: "你还没有提交最终产出。必须调用 submit_output 工具,\
+                                    把任务结果按 schema 一次性提交,系统会替你落盘。\
+                                    这是完成任务的唯一方式,请现在调用 submit_output。"
+                                    .to_string(),
+                                cache_control: None,
+                            }],
+                        });
+                        emit_agent_progress(
+                            runtime.event_tx.as_ref(),
+                            runtime.mailbox.as_ref(),
+                            &agent_id,
+                            format!("step {steps}/{max_steps}: 催促 submit_output({structured_retries}/{MAX_STRUCTURED_OUTPUT_RETRIES})"),
+                        );
+                        continue;
+                    } else {
+                        // [codex BLOCKER1 修] 重试预算耗尽 → 标记 failed,loop 后按 Failed 收尾。
+                        emit_agent_progress(
+                            runtime.event_tx.as_ref(),
+                            runtime.mailbox.as_ref(),
+                            &agent_id,
+                            format!("step {steps}/{max_steps}: submit_output 重试耗尽,失败"),
+                        );
+                        structured_failed = true;
+                        // [codex Q2 复审修] 带上最后一次具体错误,便于上层排障。
+                        final_result = Some(format!(
+                            "max_structured_output_retries: 角色 {} 经 {MAX_STRUCTURED_OUTPUT_RETRIES} 次仍未提交合格产出。最后错误:\n{}",
+                            assignment.role.as_deref().unwrap_or("?"),
+                            last_structured_error.as_deref().unwrap_or("(模型始终未调用 submit_output)")
+                        ));
+                        break;
+                    }
+                }
                 emit_agent_progress(
                     runtime.event_tx.as_ref(),
                     runtime.mailbox.as_ref(),
@@ -4059,7 +4163,23 @@ async fn run_subagent(
             ),
         );
         let mut tool_results: Vec<ContentBlock> = Vec::new();
+        // [codex BLOCKER2 复审修] 预扫:本轮只要含 submit_output,就跳过同轮所有其他工具
+        // (不管 submit 在前在后)。防"先 write_file 再 submit"时前置工具仍执行。
+        let round_has_submit = output_schema.is_some()
+            && tool_uses
+                .iter()
+                .any(|(_, name, _)| name == SUBMIT_OUTPUT_TOOL);
         for (tool_id, tool_name, tool_input) in tool_uses {
+            // 本轮有 submit_output 时,其余工具一律不执行,只回占位 tool_result 保 messages 配对合法。
+            if round_has_submit && tool_name != SUBMIT_OUTPUT_TOOL {
+                tool_results.push(ContentBlock::ToolResult {
+                    tool_use_id: tool_id,
+                    content: "本轮已提交最终产出(submit_output),其他工具未执行。".to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                });
+                continue;
+            }
             emit_agent_progress(
                 runtime.event_tx.as_ref(),
                 runtime.mailbox.as_ref(),
@@ -4078,7 +4198,44 @@ async fn run_subagent(
             // is an engine-only error stub. Mirror the main turn loop
             // (core/engine/turn_loop.rs → await_user_input). No tool timeout
             // here — the user may take arbitrarily long to answer.
-            let result = if tool_name == "request_user_input" && runtime.user_input_tx.is_some() {
+            let result = if tool_name == SUBMIT_OUTPUT_TOOL && output_schema.is_some() {
+                // [pinvou3-fork] 结构化产出提交:校验 → 合格落盘 / 不合格字段级中文打回。
+                let schema = output_schema.as_ref().unwrap();
+                match validate_against_schema(&tool_input, schema) {
+                    Ok(()) => match persist_structured_output(&project_dir, &tool_input, schema) {
+                        // [codex MAJOR 修] 落盘成功才置 output_submitted;失败则打回,不算提交成功。
+                        // [codex Q5 复审修] written 为空 = schema 没标 x-output-file,等于没产出文件,
+                        // 不能算完成,打回(让 registry schema 补 x-output-file)。
+                        Ok(written) if !written.is_empty() => {
+                            output_submitted = Some(tool_input.clone());
+                            format!(
+                                "✅ 产出已接受并落盘({})。任务完成,你可以结束了。",
+                                written.join(", ")
+                            )
+                        }
+                        Ok(_) => {
+                            structured_retries += 1;
+                            let e = "schema 未声明 x-output-file,无法落盘任何文件(请检查 registry 配置)".to_string();
+                            last_structured_error = Some(e.clone());
+                            format!("Error: 产出未落盘任何文件(第 {structured_retries}/{MAX_STRUCTURED_OUTPUT_RETRIES} 次): {e}")
+                        }
+                        Err(write_err) => {
+                            structured_retries += 1;
+                            last_structured_error = Some(write_err.clone());
+                            format!(
+                                "Error: 产出校验通过但落盘失败(第 {structured_retries}/{MAX_STRUCTURED_OUTPUT_RETRIES} 次): {write_err}"
+                            )
+                        }
+                    },
+                    Err(field_errors) => {
+                        structured_retries += 1;
+                        last_structured_error = Some(field_errors.clone());
+                        format!(
+                            "提交未通过校验(第 {structured_retries}/{MAX_STRUCTURED_OUTPUT_RETRIES} 次),请修正后重新调用 submit_output:\n{field_errors}"
+                        )
+                    }
+                }
+            } else if tool_name == "request_user_input" && runtime.user_input_tx.is_some() {
                 await_subagent_user_input(runtime, &tool_id, &tool_input).await
             } else {
                 match tokio::time::timeout(TOOL_TIMEOUT, async {
@@ -4093,7 +4250,13 @@ async fn run_subagent(
                     Err(_) => format!("Error: Tool {tool_name} timed out"),
                 }
             };
-            let tool_ok = !result.starts_with("Error:");
+            // [codex MINOR 修] submit_output 的成败以"是否真提交成功"为准,不靠 "Error:" 前缀
+            // (校验失败的中文打回消息不带该前缀,否则会被误标 ok=true)。
+            let tool_ok = if tool_name == SUBMIT_OUTPUT_TOOL && output_schema.is_some() {
+                output_submitted.is_some()
+            } else {
+                !result.starts_with("Error:")
+            };
             emit_agent_progress(
                 runtime.event_tx.as_ref(),
                 runtime.mailbox.as_ref(),
@@ -4109,10 +4272,26 @@ async fn run_subagent(
                 });
             }
 
+            // [pinvou3-fork] transcript:记本工具的返回(截断防超长),配合上面的 llm_out
+            // 就能完整还原一轮 "agent 调了什么 → 工具回了什么"。
+            append_subagent_transcript(
+                &transcript_ws,
+                &agent_id,
+                &transcript_role,
+                json!({
+                    "kind": "tool_result",
+                    "step": steps,
+                    "tool": tool_name,
+                    "ok": tool_ok,
+                    "output": result.chars().take(2000).collect::<String>(),
+                }),
+            );
+
             tool_results.push(ContentBlock::ToolResult {
                 tool_use_id: tool_id,
                 content: result,
-                is_error: None,
+                // [codex MINOR 修] 失败的工具结果标 is_error,便于 UI/日志区分。
+                is_error: if tool_ok { None } else { Some(true) },
                 content_blocks: None,
             });
         }
@@ -4126,7 +4305,16 @@ async fn run_subagent(
     }
 
     release_resident_leases_for(&agent_id);
-    let status = SubAgentStatus::Completed;
+    // [codex BLOCKER1 修] 结构化重试耗尽 → Failed(原来无条件 Completed,设计的"超3次→Failed"不生效)。
+    let status = if structured_failed {
+        SubAgentStatus::Failed(
+            final_result
+                .clone()
+                .unwrap_or_else(|| "max_structured_output_retries".to_string()),
+        )
+    } else {
+        SubAgentStatus::Completed
+    };
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     insert_subagent_full_transcript_handle(
         runtime,
@@ -5100,6 +5288,290 @@ fn build_allowed_tools(
     // registry execution guard still blocks approval-gated tools unless the
     // parent runtime is auto-approved.
     Ok(None)
+}
+
+/// [pinvou3-fork] 增量 transcript 落盘:每个 SubAgent loop 追加一条 JSONL 到
+/// `<workspace>/_state/agent_transcripts/<role>_<agent_id>.jsonl`,像 chat session
+/// 一样只记本轮 LLM 输入/输出增量(不含 system prompt / 累积上下文),便于复盘
+/// SubAgent 内部到底问了什么、LLM 吐了什么、工具回了什么。best-effort,失败不影响主流程。
+fn append_subagent_transcript(workspace: &Path, agent_id: &str, role: &str, record: Value) {
+    let dir = workspace.join("_state").join("agent_transcripts");
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join(format!("{role}_{agent_id}.jsonl"));
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut line = json!({ "ts": ts, "agent": agent_id, "role": role });
+    if let (Some(obj), Some(rec)) = (line.as_object_mut(), record.as_object()) {
+        for (k, v) in rec {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    if let Ok(mut s) = serde_json::to_string(&line) {
+        s.push('\n');
+        use std::io::Write as _;
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = f.write_all(s.as_bytes());
+        }
+    }
+}
+
+// ===== [pinvou3-fork] 结构化产出(submit_output)机制 =====
+// 设计见 docs/SDAN/12-structured-output.md。照搬 Claude Code StructuredOutput:
+// 有 output_schema 的角色,合成一个 submit_output 工具,强制 SubAgent 必须成功提交
+// 一次合格产出才能结束;不合格→字段级中文打回让它改(最多 3 次);合格→代码落盘。
+
+/// submit_output 合成工具名。
+const SUBMIT_OUTPUT_TOOL: &str = "submit_output";
+/// 校验失败最多重试次数(弱模型:3 次后基本是 schema/prompt 问题,见 12 号文档决策2)。
+const MAX_STRUCTURED_OUTPUT_RETRIES: u32 = 3;
+
+/// 合成 submit_output 工具:input_schema = 角色的 output_schema。
+/// 模型必须调它提交最终结构化产出,合格后由代码落盘(它不用自己 write_file)。
+fn build_submit_output_tool(output_schema: &Value) -> Tool {
+    Tool {
+        tool_type: None,
+        name: SUBMIT_OUTPUT_TOOL.to_string(),
+        description: "提交本角色的最终结构化产出。你收集/分析完成后,必须调用此工具一次性\
+            提交所有结果(不要用 write_file 自己写产出文件——由系统替你落盘)。参数必须\
+            严格符合 schema;字段不全或类型不对会被打回让你修正。这是完成任务的唯一出口。"
+            .to_string(),
+        input_schema: output_schema.clone(),
+        allowed_callers: None,
+        defer_loading: None,
+        input_examples: None,
+        strict: None,
+        cache_control: None,
+    }
+}
+
+/// 轻量 JSON Schema 校验(不引重依赖,见 12 号文档决策:必填+类型+enum)。
+/// [codex MAJOR 修] 递归校验:对象的嵌套 properties.required、数组的 items、
+/// 嵌套 type/enum 都会被检查(原来只查顶层)。返回字段级中文错误,直接回喂弱模型修。
+fn validate_against_schema(value: &Value, schema: &Value) -> Result<(), String> {
+    let mut errs: Vec<String> = Vec::new();
+    validate_node(value, schema, "", 0, &mut errs);
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("\n"))
+    }
+}
+
+fn type_cn(t: &str) -> &str {
+    match t {
+        "object" => "对象",
+        "array" => "数组",
+        "string" => "字符串",
+        "number" | "integer" => "数字",
+        "boolean" => "布尔",
+        other => other,
+    }
+}
+
+fn value_cn(v: &Value) -> &'static str {
+    match v {
+        Value::Object(_) => "对象",
+        Value::Array(_) => "数组",
+        Value::String(_) => "字符串",
+        Value::Number(_) => "数字",
+        Value::Bool(_) => "布尔",
+        Value::Null => "null",
+    }
+}
+
+/// 递归校验单个节点。`path` 是给弱模型看的字段路径(如 `inventory[].type`)。
+/// [codex Q3 复审修] `depth` 防超深 schema 栈溢出;`$ref` 暂不支持,显式报错而非静默跳过。
+fn validate_node(value: &Value, schema: &Value, path: &str, depth: usize, errs: &mut Vec<String>) {
+    let label = if path.is_empty() { "(根)".to_string() } else { format!("「{path}」") };
+    if depth > 32 {
+        errs.push(format!("❌ 字段{label}:schema 嵌套过深(>32 层),拒绝校验。"));
+        return;
+    }
+    if schema.get("$ref").is_some() {
+        errs.push(format!("❌ 字段{label}:schema 用了 $ref,当前轻量校验器不支持,请改用内联 schema。"));
+        return;
+    }
+
+    // 1. 类型校验
+    if let Some(expected) = schema.get("type").and_then(|t| t.as_str()) {
+        if !value.is_null() {
+            let ok = match expected {
+                "object" => value.is_object(),
+                "array" => value.is_array(),
+                "string" => value.is_string(),
+                "number" => value.is_number(),
+                "integer" => value.is_i64() || value.is_u64(),
+                "boolean" => value.is_boolean(),
+                _ => true,
+            };
+            if !ok {
+                let hint = if expected == "array" && value.is_string() {
+                    "(注意:要真数组 [...],不是字符串化的 \"[...]\")"
+                } else if expected == "object" && value.is_string() {
+                    "(注意:要真对象 {...},不是字符串化的 \"{...}\")"
+                } else {
+                    ""
+                };
+                errs.push(format!(
+                    "❌ 字段{label}类型错:期望{},你给的是{}{hint}。",
+                    type_cn(expected),
+                    value_cn(value)
+                ));
+                return; // 类型都不对,不再深入校验子结构
+            }
+        }
+    }
+
+    // 2. enum 校验
+    if let Some(allowed) = schema.get("enum").and_then(|e| e.as_array()) {
+        if !value.is_null() && !allowed.iter().any(|a| a == value) {
+            let opts: Vec<String> = allowed
+                .iter()
+                .filter_map(|a| a.as_str().map(String::from))
+                .collect();
+            errs.push(format!(
+                "❌ 字段{label}取值不在允许范围,只能是: {}。",
+                opts.join(" / ")
+            ));
+        }
+    }
+
+    // 3. 对象:required + 递归 properties
+    if let Some(obj) = value.as_object() {
+        if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+            for rf in required {
+                if let Some(field) = rf.as_str() {
+                    let fpath = if path.is_empty() { field.to_string() } else { format!("{path}.{field}") };
+                    match obj.get(field) {
+                        None => errs.push(format!("❌ 缺必填字段「{fpath}」,请补上。")),
+                        Some(Value::Null) => errs.push(format!("❌ 必填字段「{fpath}」是 null,请填真实内容。")),
+                        Some(Value::String(s)) if s.trim().is_empty() => {
+                            errs.push(format!("❌ 必填字段「{fpath}」是空字符串,请填真实内容。"))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+            for (field, fschema) in props {
+                let Some(actual) = obj.get(field) else { continue };
+                if actual.is_null() {
+                    continue;
+                }
+                let fpath = if path.is_empty() { field.clone() } else { format!("{path}.{field}") };
+                validate_node(actual, fschema, &fpath, depth + 1, errs);
+            }
+        }
+    }
+
+    // 4. 数组:递归 items(对每个元素)
+    if let Some(arr) = value.as_array() {
+        if let Some(items_schema) = schema.get("items") {
+            let ipath = format!("{path}[]");
+            for el in arr {
+                validate_node(el, items_schema, &ipath, depth + 1, errs);
+            }
+        }
+    }
+}
+
+/// [pinvou3-fork] 在会话 workspace 下找 `ppt-*` 项目子目录(会话与项目 1:1)。
+/// 用于把结构化产出落盘到项目目录而非会话根(12 号决策1)。
+/// [codex MAJOR 修] 多个 ppt-* 时不取"遍历第一个"(顺序不定会写错项目),
+/// 而是取 mtime 最新的那个(同会话重跑/换场景会留旧目录,最新即当前 run)。
+fn find_project_dir_in_workspace(workspace: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(workspace).ok()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let is_ppt = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.starts_with("ppt-"));
+        if !is_ppt {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            best = Some((mtime, path));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// 把合格的结构化产出落盘。落盘根 = 项目目录(12 号决策1)。路径靠 schema 里的
+/// `x-output-file` **显式标注**(不靠猜),配 registry.outputs:
+/// - schema 顶层有 `x-output-file` → 整个对象写该文件(单文件角色,如 brief.json)。
+/// - 否则遍历顶层 property:每个 property 的 schema 若有 `x-output-file` → 把该
+///   property 的值写到那个相对路径(多文件角色,如 inventory→materials_inventory.json)。
+/// - 没标 `x-output-file` 的字段(如 completion_status 元字段)不单独落盘。
+/// 返回写出的文件相对路径列表(供 transcript/日志)。
+/// [codex MAJOR 修] 校验 x-output-file 是安全相对路径:必须相对、不含 `..`/根,
+/// 规范化后仍落在 project_dir 内。防 schema 里写 `../x` 或绝对路径穿越出项目目录。
+fn safe_output_path(project_dir: &Path, rel: &str) -> Result<PathBuf, String> {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return Err(format!("x-output-file 不能是绝对路径: {rel}"));
+    }
+    for comp in rel_path.components() {
+        use std::path::Component;
+        match comp {
+            Component::Normal(_) | Component::CurDir => {}
+            _ => return Err(format!("x-output-file 含非法路径段(.. 或根): {rel}")),
+        }
+    }
+    Ok(project_dir.join(rel_path))
+}
+
+/// [codex MAJOR 修] 返回 Result:任一文件写失败 → Err,调用方不置 output_submitted、打回模型。
+fn persist_structured_output(
+    project_dir: &Path,
+    value: &Value,
+    schema: &Value,
+) -> Result<Vec<String>, String> {
+    let mut written: Vec<String> = Vec::new();
+    let mut write_one = |rel: &str, content: &Value| -> Result<(), String> {
+        let path = safe_output_path(project_dir, rel)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("建目录失败 {rel}: {e}"))?;
+        }
+        let s = serde_json::to_string_pretty(content)
+            .map_err(|e| format!("序列化失败 {rel}: {e}"))?;
+        fs::write(&path, s).map_err(|e| format!("写文件失败 {rel}: {e}"))?;
+        written.push(rel.to_string());
+        Ok(())
+    };
+    // 单文件模式:schema 顶层声明了 x-output-file → 整个对象写该文件。
+    if let Some(file) = schema.get("x-output-file").and_then(|f| f.as_str()) {
+        write_one(file, value)?;
+        return Ok(written);
+    }
+    // 多文件模式:每个顶层 property 按自己的 x-output-file 落盘。
+    let props = schema.get("properties").and_then(|p| p.as_object());
+    if let (Some(obj), Some(props)) = (value.as_object(), props) {
+        for (key, val) in obj {
+            let Some(file) = props
+                .get(key)
+                .and_then(|p| p.get("x-output-file"))
+                .and_then(|f| f.as_str())
+            else {
+                continue; // 没标输出文件的字段(completion_status 等)跳过
+            };
+            write_one(file, val)?;
+        }
+    }
+    Ok(written)
 }
 
 fn summarize_subagent_result(result: &SubAgentResult) -> String {
