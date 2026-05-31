@@ -39,16 +39,17 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     "rlm_eval",
     "rlm_configure",
     "rlm_close",
-    // git（模型用 `exec_shell git ...` 替代）
-    "git_status",
-    "git_diff",
+    // 状态管理 - goal（GUI 单 session 不需要持久化目标跟踪）
+    "create_goal",
+    "get_goal",
+    "update_goal",
+    // git（模型用 `exec_shell git ...` 替代；git_status/git_diff 已释放）
     "git_log",
     "git_show",
     "git_blame",
-    // patch / fim（edit_file 已覆盖；patch DSL 弱模型用不好）
+    // patch / fim（edit_file 已覆盖；patch DSL 弱模型用不好；revert_turn 已释放）
     "apply_patch",
     "fim_edit",
-    "revert_turn",
     // 附件预处理（应移到 bridge 上传 pipeline，见文档 §6.1）
     "pandoc_convert",
     "image_ocr",
@@ -59,9 +60,8 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     "todo_add",
     "todo_update",
     "todo_list",
-    // Shell 后台管理 + 异步交互变体（同步 exec_shell 已够）
+    // Shell 后台管理 + 异步交互变体（exec_shell_wait 已释放供后台轮询）
     "exec_shell_cancel",
-    "exec_shell_wait",
     "exec_shell_interact",
     "exec_wait",
     "exec_interact",
@@ -82,10 +82,9 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     // 杂项 - 金融数据 + 旧版 web_run（保留 fetch_url）
     "finance",
     "web.run",
-    // 元工具（pinvou3 普通用户场景用不到）
+    // 元工具（pinvou3 普通用户场景用不到；diagnostics 已释放）
     "multi_tool_use.parallel",
     "note",
-    "diagnostics",
     "validate_data",
     "run_tests",
     "handle_read",
