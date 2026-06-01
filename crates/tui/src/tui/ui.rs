@@ -2319,7 +2319,7 @@ async fn run_event_loop(
                         }
                         app.status_message = Some(format!("Sub-agent {id}: {display}"));
                     }
-                    EngineEvent::AgentComplete { id, result } => {
+                    EngineEvent::AgentComplete { id, result, .. } => {
                         execute_subagent_observer_hook(
                             app,
                             HookEvent::SubagentComplete,

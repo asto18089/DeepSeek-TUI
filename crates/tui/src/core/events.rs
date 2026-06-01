@@ -202,8 +202,14 @@ pub enum Event {
     /// Sub-agent progress update
     AgentProgress { id: String, status: String },
 
-    /// Sub-agent completed
-    AgentComplete { id: String, result: String },
+    /// Sub-agent completed.
+    /// [pinvou3-fork] `role` = 派发时 SubAgentAssignment.role（workflow 角色 id）。
+    /// SDAN 的 Result 信封带 `from`：让宿主靠它把结果关联回节点，不必猜。
+    AgentComplete {
+        id: String,
+        result: String,
+        role: Option<String>,
+    },
 
     /// Sub-agent listing
     AgentList { agents: Vec<SubAgentResult> },
