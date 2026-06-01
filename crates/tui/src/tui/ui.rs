@@ -1820,7 +1820,7 @@ async fn run_event_loop(
                         }
                         app.status_message = Some(format!("Sub-agent {id}: {display}"));
                     }
-                    EngineEvent::AgentComplete { id, result } => {
+                    EngineEvent::AgentComplete { id, result, .. } => {
                         let subagent_elapsed = app
                             .agent_activity_started_at
                             .or(app.turn_started_at)

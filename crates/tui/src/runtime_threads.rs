@@ -2579,7 +2579,7 @@ impl RuntimeThreadManager {
                     )
                     .await?;
                 }
-                EngineEvent::AgentComplete { id, result } => {
+                EngineEvent::AgentComplete { id, result, .. } => {
                     let message = format!(
                         "Sub-agent {id} completed: {}",
                         summarize_text(&result, SUMMARY_LIMIT)

@@ -3571,6 +3571,9 @@ struct SubAgentTask {
 
 #[allow(clippy::too_many_lines)]
 async fn run_subagent_task(task: SubAgentTask) {
+    // [pinvou3-fork] 在 assignment 被移入 run_subagent 前捕获 workflow 角色，
+    // 随完成事件回传（SDAN Result.from）。
+    let role = task.assignment.role.clone();
     let result = run_subagent(
         &task.runtime,
         task.agent_id.clone(),
@@ -3636,6 +3639,7 @@ async fn run_subagent_task(task: SubAgentTask) {
         let _ = event_tx.try_send(Event::AgentComplete {
             id: agent_id.clone(),
             result: payload,
+            role,
         });
     }
 }
