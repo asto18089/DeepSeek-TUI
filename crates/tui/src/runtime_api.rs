@@ -4317,12 +4317,17 @@ mod tests {
             description: String::new(),
             body: String::new(),
             path: bundled_skill_path,
+            // [pinvou3-fork] phase/demo 特性给 Skill 加的字段,测试用默认值。
+            phases: Vec::new(),
+            demo: crate::skills::DemoInfo::default(),
         };
         let override_skill = crate::skills::Skill {
             name: "delegate".to_string(),
             description: String::new(),
             body: String::new(),
             path: override_skill_path,
+            phases: Vec::new(),
+            demo: crate::skills::DemoInfo::default(),
         };
 
         assert!(skill_entry_is_bundled(&bundled_skill, &bundled_skills_dir));
