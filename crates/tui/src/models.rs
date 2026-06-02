@@ -235,6 +235,10 @@ pub fn context_window_for_model(model: &str) -> Option<u32> {
     if lower.contains("claude") {
         return Some(200_000);
     }
+    // Qwen2.5 / Qwen3 系列通用识别；带 _Nk 后缀的已被 explicit hint 优先处理
+    if lower.contains("qwen") {
+        return Some(128_000);
+    }
     None
 }
 
@@ -452,6 +456,14 @@ pub struct MessageDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen_models_map_to_128k_context_window() {
+        assert_eq!(context_window_for_model("Qwen2.5-72B-Instruct"), Some(128_000));
+        assert_eq!(context_window_for_model("qwen3-32b"), Some(128_000));
+        // _Nk 后缀优先于通用 qwen 识别
+        assert_eq!(context_window_for_model("qwen36_35b_256k"), Some(256_000));
+    }
 
     #[test]
     fn v4_snapshots_preserve_context_window() {
