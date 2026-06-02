@@ -25,7 +25,7 @@ use std::time::Duration;
 const DUCKDUCKGO_HOST: &str = "html.duckduckgo.com";
 const BING_HOST: &str = "www.bing.com";
 const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
-const BOCHA_ENDPOINT: &str = "https://api.bochaai.com/v1/ai-search";
+const BOCHA_ENDPOINT: &str = "https://api.bochaai.com/v1/web-search";
 const METASO_ENDPOINT: &str = "https://metaso.cn/api/v1";
 /// Intentionally public default key provided by Metaso for open-source/community use.
 /// Last-resort fallback after config and env var. Rate-limited to ~100 searches/day.
@@ -492,10 +492,11 @@ impl WebSearchTool {
             ToolError::execution_failed(format!("Failed to parse Bocha response: {e}"))
         })?;
 
-        // Bocha returns `{"code": 200, "data": {"pages": [...]}}`
+        // Bocha /v1/web-search returns `{"code": 200, "data": {"webPages": {"value": [...]}}}`
         let results: Vec<WebSearchEntry> = parsed
             .get("data")
-            .and_then(|d| d.get("pages"))
+            .and_then(|d| d.get("webPages"))
+            .and_then(|w| w.get("value"))
             .or_else(|| parsed.get("pages"))
             .and_then(|v| v.as_array())
             .into_iter()
