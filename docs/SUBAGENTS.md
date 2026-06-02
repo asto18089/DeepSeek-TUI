@@ -99,7 +99,7 @@ the next turn.
 ## Concurrency cap
 
 The dispatcher caps concurrent sub-agents at 10 by default
-(configurable via `[subagents].max_concurrent` in `~/.deepseek/config.toml`,
+(configurable via `[subagents].max_concurrent` in `~/.codewhale/config.toml`,
 hard ceiling 20). When the parent hits the cap, `agent_open` returns
 an error with the cap value; the parent should use `agent_eval` to wait for a
 running agent to complete, or `agent_close` to cancel a running agent, before
@@ -117,7 +117,7 @@ per-step timeout so a single stuck request can't pin the parent's
 completion wakeup channel indefinitely. The default is `120` seconds,
 which matches the legacy hardcoded value. Long-thinking children that
 legitimately exceed that, for example heavy plan or review work behind
-`agent_open`, can extend the timeout in `~/.deepseek/config.toml`:
+`agent_open`, can extend the timeout in `~/.codewhale/config.toml`:
 
 ```toml
 [subagents]
@@ -137,7 +137,7 @@ Pending → Running → (Completed | Failed(reason) | Cancelled | Interrupted(re
 
 `Interrupted` fires when the manager detects a `Running` agent whose task
 handle is gone — typically after a process restart that loaded the workspace's
-persisted state from `.deepseek/state/subagents.v1.json`. The parent can open a
+persisted state from `.codewhale/state/subagents.v1.json`. The parent can open a
 replacement session with the same assignment or treat it as a terminal state.
 
 ### Session boundaries (#405)
@@ -185,7 +185,7 @@ don't go through the standard write-approval flow.
 ## Implementation notes
 
 - Source: `crates/tui/src/tools/subagent/mod.rs`.
-- Persisted state: `<workspace>/.deepseek/state/subagents.v1.json`. Schema
+- Persisted state: `<workspace>/.codewhale/state/subagents.v1.json`. Schema
   version `1` (forward-compatible — new optional fields use
   `#[serde(default)]`).
 - `SubAgentRuntime::background_runtime()` starts from `child_runtime()` but

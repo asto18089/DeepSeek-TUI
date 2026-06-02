@@ -2,7 +2,7 @@
 //! System prompts for different modes.
 //!
 //! Prompts are assembled from composable layers loaded at compile time:
-//!   base.md → personality overlay → mode delta → approval policy
+//!   tool taxonomy → base.md → personality overlay → mode delta → approval policy
 //!
 //! This keeps each concern in its own file and makes prompt tuning
 //! a single-file operation.
@@ -106,6 +106,8 @@ fn translation_target_language_for_tag(locale_tag: &str) -> &'static str {
         "Simplified Chinese (简体中文)"
     } else if normalized.starts_with("pt") {
         "Brazilian Portuguese (Português do Brasil)"
+    } else if normalized.starts_with("vi") {
+        "Vietnamese (Tiếng Việt)"
     } else {
         "English"
     }
@@ -147,7 +149,10 @@ for the current turn."
 /// compatibility; rename to `_locale_tag` to silence unused warning.
 fn render_environment_block(workspace: &Path, _locale_tag: &str) -> String {
     let platform = std::env::consts::OS;
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string());
+    let shell = crate::shell_dispatcher::global_dispatcher()
+        .kind()
+        .binary()
+        .to_string();
     let pwd = workspace.display();
 
     format!(
@@ -163,17 +168,20 @@ fn render_environment_block(workspace: &Path, _locale_tag: &str) -> String {
 /// at render time, original semantics) or an inline string (content baked into
 /// `EngineConfig`, no disk I/O at render time).
 ///
-/// **pinvou3 fork (P-no-disk)**: original API was `Vec<PathBuf>`, which forced
-/// embedders that wanted to inject runtime-computed instructions (like pinvou3
-/// rendering its `INSTRUCTIONS_MD` const with workspace placeholder
-/// substituted) to first write the content to a disk file, then pass the path.
-/// That disk file was both confusing for users (looked like editable config
-/// but was overwritten on boot) and a race surface in multi-engine setups
-/// (rehydrate re-reads from disk, so concurrent writes can leak across
-/// sessions). Adding an `Inline` variant lets embedders skip disk entirely.
+/// The inline variant is useful for embedders that compute instructions at
+/// runtime (e.g. rendering a template with workspace-specific substitutions)
+/// and don't want to stage the content to a disk file just to satisfy a path
+/// API. Staging adds two problems the inline path avoids:
 ///
-/// `From<PathBuf>` is provided so existing callers can keep writing `paths`
-/// and let `.into()` upgrade transparently.
+///   1. The disk file looks like editable config but gets overwritten on
+///      every launch — confusing for users browsing the install dir.
+///   2. Multi-engine setups need per-engine paths to avoid `rehydrate`
+///      reading another session's instructions; with inline sources the
+///      content lives in the per-engine `EngineConfig` and the race
+///      surface goes away.
+///
+/// `From<PathBuf>` is provided so existing callers passing `Vec<PathBuf>` can
+/// keep working with a `.into()` upgrade at the call site.
 #[derive(Debug, Clone)]
 pub enum InstructionSource {
     /// Load this file from disk at prompt-render time. Original behavior:
@@ -182,8 +190,8 @@ pub enum InstructionSource {
     /// marker.
     File(PathBuf),
     /// Use the provided string directly. `name` becomes the
-    /// `<instructions source="…">` attribute (typically a synthetic path
-    /// like `embedded:pinvou3-instructions` or a logical identifier).
+    /// `<instructions source="…">` attribute (typically a synthetic
+    /// identifier like `embedded:my-template` or a logical path).
     Inline { name: String, content: String },
 }
 
@@ -272,51 +280,124 @@ fn load_handoff_block(workspace: &Path) -> Option<String> {
 /// "When NOT to use" guidance, sub-agent sentinel protocol.
 pub const BASE_PROMPT: &str = include_str!("prompts/base.md");
 
-// ── Embedder prompt overrides (pinvou3 fork; upstream-PR candidate) ──
+// ── Embedder prompt overrides ──
 // Let an embedder replace these compile-time prompt constants at startup,
 // so brand / slimming customizations live in the embedder crate instead of
-// editing these files in-tree. Unset → the upstream constant (fully
+// editing these files in-tree. Unset → the bundled constant (fully
 // backward compatible). Intended to be set once at process start, before
-// any engine spawns; later sets are ignored (OnceLock semantics).
+// any engine spawns; later sets return the rejected override string.
 static BASE_PROMPT_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static LOCALE_PREAMBLE_ZH_HANS_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static LOCALE_PREAMBLE_JA_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static LOCALE_PREAMBLE_PT_BR_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static LOCALE_PREAMBLE_VI_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static LOCALE_CLOSER_ZH_HANS_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static LOCALE_CLOSER_JA_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static LOCALE_CLOSER_PT_BR_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static LOCALE_CLOSER_VI_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static AUTHORITY_RECAP_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Replace `BASE_PROMPT` for all subsequent prompt composition. First call
-/// wins; later calls are no-ops. Set before spawning any engine.
-pub fn set_base_prompt_override(s: String) {
-    let _ = BASE_PROMPT_OVERRIDE.set(s);
+/// wins; later calls return the rejected string. Set before spawning any
+/// engine.
+pub fn set_base_prompt_override(s: String) -> Result<(), String> {
+    set_prompt_override(&BASE_PROMPT_OVERRIDE, s)
 }
 
 /// Replace the Simplified-Chinese locale preamble (`## 语言要求`).
-pub fn set_locale_preamble_zh_hans_override(s: String) {
-    let _ = LOCALE_PREAMBLE_ZH_HANS_OVERRIDE.set(s);
+pub fn set_locale_preamble_zh_hans_override(s: String) -> Result<(), String> {
+    set_prompt_override(&LOCALE_PREAMBLE_ZH_HANS_OVERRIDE, s)
+}
+
+/// Replace the Japanese locale preamble.
+pub fn set_locale_preamble_ja_override(s: String) -> Result<(), String> {
+    set_prompt_override(&LOCALE_PREAMBLE_JA_OVERRIDE, s)
+}
+
+/// Replace the Brazilian-Portuguese locale preamble.
+pub fn set_locale_preamble_pt_br_override(s: String) -> Result<(), String> {
+    set_prompt_override(&LOCALE_PREAMBLE_PT_BR_OVERRIDE, s)
+}
+
+/// Replace the Vietnamese locale preamble.
+pub fn set_locale_preamble_vi_override(s: String) -> Result<(), String> {
+    set_prompt_override(&LOCALE_PREAMBLE_VI_OVERRIDE, s)
+}
+
+/// Replace the Simplified-Chinese locale closer (`## 语言再次提醒`).
+pub fn set_locale_closer_zh_hans_override(s: String) -> Result<(), String> {
+    set_prompt_override(&LOCALE_CLOSER_ZH_HANS_OVERRIDE, s)
+}
+
+/// Replace the Japanese locale closer.
+pub fn set_locale_closer_ja_override(s: String) -> Result<(), String> {
+    set_prompt_override(&LOCALE_CLOSER_JA_OVERRIDE, s)
+}
+
+/// Replace the Brazilian-Portuguese locale closer.
+pub fn set_locale_closer_pt_br_override(s: String) -> Result<(), String> {
+    set_prompt_override(&LOCALE_CLOSER_PT_BR_OVERRIDE, s)
+}
+
+/// Replace the Vietnamese locale closer.
+pub fn set_locale_closer_vi_override(s: String) -> Result<(), String> {
+    set_prompt_override(&LOCALE_CLOSER_VI_OVERRIDE, s)
 }
 
 /// Replace the trailing `## Authority Recap` block.
-pub fn set_authority_recap_override(s: String) {
-    let _ = AUTHORITY_RECAP_OVERRIDE.set(s);
+pub fn set_authority_recap_override(s: String) -> Result<(), String> {
+    set_prompt_override(&AUTHORITY_RECAP_OVERRIDE, s)
+}
+
+fn set_prompt_override(cell: &std::sync::OnceLock<String>, s: String) -> Result<(), String> {
+    cell.set(s)
+}
+
+fn effective_prompt_override<'a>(
+    cell: &'a std::sync::OnceLock<String>,
+    fallback: &'static str,
+) -> &'a str {
+    cell.get().map(String::as_str).unwrap_or(fallback)
 }
 
 fn effective_base_prompt() -> &'static str {
-    BASE_PROMPT_OVERRIDE
-        .get()
-        .map(String::as_str)
-        .unwrap_or(BASE_PROMPT)
+    effective_prompt_override(&BASE_PROMPT_OVERRIDE, BASE_PROMPT)
 }
 
 fn effective_locale_preamble_zh_hans() -> &'static str {
-    LOCALE_PREAMBLE_ZH_HANS_OVERRIDE
-        .get()
-        .map(String::as_str)
-        .unwrap_or(LOCALE_PREAMBLE_ZH_HANS)
+    effective_prompt_override(&LOCALE_PREAMBLE_ZH_HANS_OVERRIDE, LOCALE_PREAMBLE_ZH_HANS)
+}
+
+fn effective_locale_preamble_ja() -> &'static str {
+    effective_prompt_override(&LOCALE_PREAMBLE_JA_OVERRIDE, LOCALE_PREAMBLE_JA)
+}
+
+fn effective_locale_preamble_pt_br() -> &'static str {
+    effective_prompt_override(&LOCALE_PREAMBLE_PT_BR_OVERRIDE, LOCALE_PREAMBLE_PT_BR)
+}
+
+fn effective_locale_preamble_vi() -> &'static str {
+    effective_prompt_override(&LOCALE_PREAMBLE_VI_OVERRIDE, LOCALE_PREAMBLE_VI)
+}
+
+fn effective_locale_closer_zh_hans() -> &'static str {
+    effective_prompt_override(&LOCALE_CLOSER_ZH_HANS_OVERRIDE, LOCALE_CLOSER_ZH_HANS)
+}
+
+fn effective_locale_closer_ja() -> &'static str {
+    effective_prompt_override(&LOCALE_CLOSER_JA_OVERRIDE, LOCALE_CLOSER_JA)
+}
+
+fn effective_locale_closer_pt_br() -> &'static str {
+    effective_prompt_override(&LOCALE_CLOSER_PT_BR_OVERRIDE, LOCALE_CLOSER_PT_BR)
+}
+
+fn effective_locale_closer_vi() -> &'static str {
+    effective_prompt_override(&LOCALE_CLOSER_VI_OVERRIDE, LOCALE_CLOSER_VI)
 }
 
 fn effective_authority_recap() -> &'static str {
-    AUTHORITY_RECAP_OVERRIDE
-        .get()
-        .map(String::as_str)
-        .unwrap_or(AUTHORITY_RECAP)
+    effective_prompt_override(&AUTHORITY_RECAP_OVERRIDE, AUTHORITY_RECAP)
 }
 
 /// Optional locale-native reinforcement preamble prepended to the system
@@ -385,8 +466,9 @@ fn effective_authority_recap() -> &'static str {
 pub(crate) fn locale_reinforcement_preamble(locale_tag: &str) -> Option<&'static str> {
     match locale_tag {
         "zh-Hans" | "zh-CN" | "zh" => Some(effective_locale_preamble_zh_hans()),
-        "ja" | "ja-JP" => Some(LOCALE_PREAMBLE_JA),
-        "pt-BR" | "pt" => Some(LOCALE_PREAMBLE_PT_BR),
+        "ja" | "ja-JP" => Some(effective_locale_preamble_ja()),
+        "pt-BR" | "pt" => Some(effective_locale_preamble_pt_br()),
+        "vi" | "vi-VN" => Some(effective_locale_preamble_vi()),
         _ => None,
     }
 }
@@ -409,9 +491,10 @@ pub(crate) fn locale_reinforcement_preamble(locale_tag: &str) -> Option<&'static
 /// behavior.
 pub(crate) fn locale_reinforcement_closer(locale_tag: &str) -> Option<&'static str> {
     match locale_tag {
-        "zh-Hans" | "zh-CN" | "zh" => Some(LOCALE_CLOSER_ZH_HANS),
-        "ja" | "ja-JP" => Some(LOCALE_CLOSER_JA),
-        "pt-BR" | "pt" => Some(LOCALE_CLOSER_PT_BR),
+        "zh-Hans" | "zh-CN" | "zh" => Some(effective_locale_closer_zh_hans()),
+        "ja" | "ja-JP" => Some(effective_locale_closer_ja()),
+        "pt-BR" | "pt" => Some(effective_locale_closer_pt_br()),
+        "vi" | "vi-VN" => Some(effective_locale_closer_vi()),
         _ => None,
     }
 }
@@ -478,6 +561,24 @@ requisito rígido em nível de sessão — o idioma do usuário define seu \
 idioma. A menos que o usuário peça explicitamente a troca (por exemplo, \
 \"think in English\"), continue pensando e respondendo em português do \
 Brasil.";
+
+const LOCALE_PREAMBLE_VI: &str = "## Yêu cầu ngôn ngữ\n\n\
+Bạn đang chạy trong codewhale. Cho dù ngữ cảnh tác vụ (mã nguồn, nhật ký lỗi, tên tệp) \
+là tiếng Anh, cho dù phần còn lại của system prompt là tiếng Anh, bạn đều phải sử dụng \
+tiếng Việt cho phần `reasoning_content` (suy nghĩ nội bộ) và câu trả lời cuối cùng. Các từ \
+mã nguồn, đường dẫn tệp, tên công cụ (ví dụ `read_file`, `exec_shell`), biến môi trường, \
+tham số dòng lệnh và URL giữ nguyên dạng gốc —— chỉ các văn bản giải thích bằng ngôn ngữ \
+tự nhiên mới được chuyển sang tiếng Việt.\n\n\
+Nếu người dùng chuyển sang ngôn ngữ khác trong phiên làm việc, hãy chuyển theo từ lượt tiếp theo. \
+Nếu người dùng yêu cầu rõ ràng (ví dụ \"think in English\"), hãy ghi đè quy tắc này.";
+
+const LOCALE_CLOSER_VI: &str = "## Nhắc nhở ngôn ngữ một lần nữa\n\n\
+**Quan trọng: phần `reasoning_content` (suy nghĩ nội bộ) và phản hồi cuối cùng của bạn phải được viết bằng tiếng Việt.** \
+Dù bạn có đọc bao nhiêu mã nguồn tiếng Anh, nhật ký lỗi hay tài liệu trong phiên làm việc này, và dù ngữ cảnh \
+dự án có là tiếng Anh, quá trình suy nghĩ của bạn cũng không được chuyển sang tiếng Anh. Đây là yêu cầu cứng \
+ở cấp phiên làm việc —— ngôn ngữ của người dùng quyết định ngôn ngữ của bạn, không phụ thuộc vào nội dung tiếng Anh \
+tích lũy trong ngữ cảnh. Trừ khi người dùng yêu cầu rõ ràng việc chuyển đổi (ví dụ \"think in English\"), \
+hãy tiếp tục suy nghĩ và trả lời bằng tiếng Việt.";
 
 /// Personality overlays — voice and tone.
 pub const CALM_PERSONALITY: &str = include_str!("prompts/personalities/calm.md");
@@ -581,10 +682,11 @@ fn approval_prompt_for_mode(mode: AppMode, approval_mode: ApprovalMode) -> &'sta
 }
 
 /// Compose the full system prompt in deterministic order:
-///   1. base.md        — core identity, toolbox, execution contract
-///   2. personality    — voice and tone overlay
-///   3. mode delta     — mode-specific permissions and workflow
-///   4. approval policy — tool-approval behavior
+///   1. tool taxonomy  — compact hints generated from the eager core tools
+///   2. base.md        — core identity, toolbox, execution contract
+///   3. personality    — voice and tone overlay
+///   4. mode delta     — mode-specific permissions and workflow
+///   5. approval policy — tool-approval behavior
 ///
 /// Each layer is separated by a blank line for readability in the
 /// rendered prompt (the model sees them as contiguous sections).
@@ -595,6 +697,51 @@ fn approval_prompt_for_mode(mode: AppMode, approval_mode: ApprovalMode) -> &'sta
 /// of a static placeholder.
 fn apply_model_template(prompt: &str, model_id: &str) -> String {
     prompt.replace("{model_id}", model_id)
+}
+
+const TOOL_TAXONOMY_DISCOVERY: &[&str] = &["grep_files", "file_search"];
+const TOOL_TAXONOMY_GIT: &[&str] = &["git_status", "git_diff"];
+const TOOL_TAXONOMY_VERIFICATION: &[&str] = &["run_tests"];
+
+fn render_core_tool_taxonomy_block(mode: AppMode) -> String {
+    let core_tools = core_taxonomy_tools_for_mode(mode);
+    let mut sentences = Vec::new();
+
+    if let Some(discovery) = render_core_tool_group(TOOL_TAXONOMY_DISCOVERY, &core_tools) {
+        sentences.push(format!("Use {discovery} for discovery."));
+    }
+    if let Some(git) = render_core_tool_group(TOOL_TAXONOMY_GIT, &core_tools) {
+        sentences.push(format!("Use {git} for git inspection."));
+    }
+    if let Some(verification) = render_core_tool_group(TOOL_TAXONOMY_VERIFICATION, &core_tools) {
+        sentences.push(format!("Use {verification} for verification."));
+    }
+
+    debug_assert!(
+        !sentences.is_empty(),
+        "core tool taxonomy has no active tool groups"
+    );
+    format!("## Core Tool Taxonomy\n\n{}", sentences.join(" "))
+}
+
+fn core_taxonomy_tools_for_mode(mode: AppMode) -> Vec<&'static str> {
+    let core_tools = crate::core::engine::default_active_native_tool_names();
+    core_tools
+        .iter()
+        .copied()
+        .filter(|tool| mode != AppMode::Plan || *tool != "run_tests")
+        .collect()
+}
+
+fn render_core_tool_group(group: &[&str], core_tools: &[&str]) -> Option<String> {
+    let rendered = group
+        .iter()
+        .copied()
+        .filter(|tool| core_tools.contains(tool))
+        .map(|tool| format!("`{tool}`"))
+        .collect::<Vec<_>>()
+        .join("/");
+    (!rendered.is_empty()).then_some(rendered)
 }
 
 /// Authority recap block — appended at the end of the system prompt,
@@ -632,8 +779,11 @@ pub fn compose_prompt_with_approval_and_model(
     approval_mode: ApprovalMode,
     model_id: &str,
 ) -> String {
-    let parts: [&str; 4] = [
-        &apply_model_template(effective_base_prompt().trim(), model_id),
+    let tool_taxonomy = render_core_tool_taxonomy_block(mode);
+    let base_prompt = apply_model_template(effective_base_prompt().trim(), model_id);
+    let parts: [&str; 5] = [
+        tool_taxonomy.as_str(),
+        base_prompt.as_str(),
         personality.prompt().trim(),
         mode_prompt(mode).trim(),
         approval_prompt_for_mode(mode, approval_mode).trim(),
@@ -878,20 +1028,19 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
     // so DeepSeek's KV prefix cache can hit on the entire system prompt
     // regardless of per-session edits to memory, goals, or instructions.
 
-    // 6 (was 2.25). Environment block — platform / shell / pwd.
+    // 6. Environment block — platform, shell, pwd, locale.
     //
-    // **pinvou3 fork (P2-2)**: moved from above the volatile boundary
-    // (was static layer #2.25) to below it. The upstream comment claimed
-    // "workspace path is fixed for the run" → static-cacheable. That's
-    // true for the codewhale-tui terminal use case (one process,
-    // one workspace), but **false for pinvou3**: each engine instance
-    // is bound to a per-session workspace (`~/.pinvou3/sessions/<sid>/
-    // workspace`), so `pwd` is volatile across sessions, dragging the
-    // entire static prefix out of cache reuse for every new session.
-    // Moving the block below the boundary keeps mode / project /
-    // skills / context-mgmt / compact-template byte-stable across
-    // sessions while preserving the pwd info the model needs for
-    // `exec_shell`.
+    // Placed below the volatile-content boundary. The original comment claimed
+    // "workspace path is fixed for the run" → static-cacheable, which is true
+    // for the terminal use case (one process owns one workspace for its
+    // lifetime). It is **not** true for embedders that swap workspaces between
+    // sessions (the Op::SyncSession path, multi-engine pools, IDE
+    // integrations binding the engine to a per-tab workspace, etc.):
+    // `pwd` drifts session-to-session and drags the entire static prefix
+    // out of cache reuse. Moving the block below the volatile boundary keeps
+    // mode / project / skills / context-mgmt / compact-template byte-stable
+    // across sessions while preserving the pwd info the model needs for
+    // `exec_shell` and structured search tools.
     full_prompt = format!(
         "{full_prompt}\n\n{}",
         render_environment_block(workspace, session_context.locale_tag),
@@ -925,7 +1074,7 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
         && !goal_objective.trim().is_empty()
     {
         full_prompt = format!(
-            "{full_prompt}\n\n## Current Session Goal\n\n<session_goal>\n{}\n</session_goal>",
+            "{full_prompt}\n\n## Current Hunt\n\n<session_goal>\n{}\n</session_goal>",
             goal_objective.trim()
         );
     }
@@ -988,6 +1137,20 @@ mod tests {
     /// Discriminator unique to the injected relay block (not present in the
     /// agent prompt's own discussion of the convention).
     const HANDOFF_BLOCK_MARKER: &str = "left a relay artifact at `.codewhale/handoff.md`";
+
+    #[test]
+    fn prompt_override_storage_reports_duplicate_sets() {
+        let cell = std::sync::OnceLock::new();
+
+        assert_eq!(effective_prompt_override(&cell, "fallback"), "fallback");
+        assert!(set_prompt_override(&cell, "first".to_string()).is_ok());
+        assert_eq!(effective_prompt_override(&cell, "fallback"), "first");
+        assert_eq!(
+            set_prompt_override(&cell, "second".to_string()),
+            Err("second".to_string())
+        );
+        assert_eq!(effective_prompt_override(&cell, "fallback"), "first");
+    }
 
     fn contains_cjk(text: &str) -> bool {
         text.chars().any(|ch| {
@@ -1081,6 +1244,64 @@ mod tests {
             !prompt.contains("{model_id}"),
             "composed prompt must not contain the raw template placeholder"
         );
+    }
+
+    #[test]
+    fn composed_prompt_starts_with_core_tool_taxonomy() {
+        let prompt = compose_prompt_with_approval_and_model(
+            AppMode::Agent,
+            Personality::Calm,
+            ApprovalMode::Suggest,
+            "deepseek-v4-pro",
+        );
+        let expected_taxonomy = render_core_tool_taxonomy_block(AppMode::Agent);
+
+        assert!(
+            prompt.starts_with(&expected_taxonomy),
+            "composed prompt should start with the compact generated tool taxonomy"
+        );
+    }
+
+    #[test]
+    fn plan_prompt_taxonomy_omits_run_tests() {
+        let prompt = compose_prompt_with_approval_and_model(
+            AppMode::Plan,
+            Personality::Calm,
+            ApprovalMode::Never,
+            "deepseek-v4-pro",
+        );
+        let expected_taxonomy = render_core_tool_taxonomy_block(AppMode::Plan);
+
+        assert!(
+            prompt.starts_with(&expected_taxonomy),
+            "Plan prompt should start with its mode-specific tool taxonomy"
+        );
+        assert!(
+            expected_taxonomy.contains("for discovery")
+                && expected_taxonomy.contains("for git inspection"),
+            "Plan taxonomy should keep read-only discovery and git guidance"
+        );
+        assert!(
+            !expected_taxonomy.contains("run_tests")
+                && !expected_taxonomy.contains("for verification")
+                && !expected_taxonomy.contains("Use  "),
+            "Plan taxonomy must not advertise unavailable verification tools: {expected_taxonomy:?}"
+        );
+    }
+
+    #[test]
+    fn core_tool_taxonomy_only_references_default_active_tools() {
+        let core_tools = crate::core::engine::default_active_native_tool_names();
+        for tool in TOOL_TAXONOMY_DISCOVERY
+            .iter()
+            .chain(TOOL_TAXONOMY_GIT)
+            .chain(TOOL_TAXONOMY_VERIFICATION)
+        {
+            assert!(
+                core_tools.contains(tool),
+                "tool taxonomy references {tool}, but it is not in the eager native-tool list"
+            );
+        }
     }
 
     #[test]
@@ -1435,9 +1656,20 @@ mod tests {
             "English locale must not get a pt-BR closer: {text:?}"
         );
         assert!(
-            !contains_cjk(&text),
-            "English system prompt should avoid native-script priming tokens: {text:?}"
+            !contains_cjk(BASE_PROMPT),
+            "base prompt must not contain static CJK priming tokens"
         );
+        for mode in [AppMode::Agent, AppMode::Plan, AppMode::Yolo] {
+            let taxonomy = render_core_tool_taxonomy_block(mode);
+            assert!(
+                !contains_cjk(&taxonomy),
+                "tool taxonomy must not contain static CJK priming tokens: {taxonomy:?}"
+            );
+        }
+        // Do not assert on arbitrary CJK in the full system prompt: project
+        // context may legitimately contain localized file names, README text,
+        // or user-authored instructions. The locale bookend markers above are
+        // the priming tokens this test is meant to guard.
     }
 
     #[test]
@@ -1888,7 +2120,7 @@ mod tests {
         };
 
         assert!(!prompt.contains("<session_goal>"));
-        assert!(!prompt.contains("## Current Session Goal"));
+        assert!(!prompt.contains("## Current Hunt"));
     }
 
     // NOTE: forkguard_tool_selection_guide_is_embedder_aware moved to pinvou3-app.
@@ -1959,6 +2191,24 @@ mod tests {
 
     // NOTE: forkguard_rlm_section_removed_by_pinvou3 moved to pinvou3-app
     // (RLM removal lives in the resources/bundle/base.md override).
+
+    /// Tier 5 Local Law must explicitly cover `EngineConfig.instructions`
+    /// files. Without this clause, embedders that inject instructions via the
+    /// config field (rather than via the four hard-coded path conventions)
+    /// get their files classified by path — and since those embedder-supplied
+    /// paths aren't `AGENTS.md` / `CLAUDE.md` / `.codewhale/instructions.md` /
+    /// `.deepseek/instructions.md`, the model defaults to treating their
+    /// imperatives as Tier 7 Memory (the lowest tier per Article VII),
+    /// overridable by a single user sentence.
+    #[test]
+    fn local_law_tier_covers_engine_config_instructions() {
+        let prompt = compose_prompt(AppMode::Agent, Personality::Calm);
+        assert!(
+            prompt.contains("any file configured via `EngineConfig.instructions`"),
+            "Tier 5 must explicitly cover EngineConfig.instructions so \
+             embedder-injected instructions are not default-classified as Tier 7 Memory."
+        );
+    }
 
     #[test]
     #[ignore = "pinvou3 fork (P-brand cleanup): Tier 5 段精简后不再裸列 AGENTS.md/CLAUDE.md 品牌路径,'Local Law' anchor 仍在但其它的不在;新断言见 forkguard_local_law_tier_covers_engine_config_instructions"]
@@ -2230,17 +2480,18 @@ mod tests {
         );
     }
 
-    /// pinvou3 fork (C / P-no-disk): InstructionSource::Inline 不读 disk,
-    /// 直接用 `content`,`name` 作 `<instructions source="…">` 属性。
+    /// `InstructionSource::Inline` bypasses disk reads — the content is used
+    /// directly and `name` becomes the `<instructions source="…">` attribute.
+    /// Empty / oversize handling mirrors `File` variant.
     #[test]
-    fn forkguard_render_instructions_block_handles_inline_source() {
+    fn render_instructions_block_handles_inline_source() {
         let block = super::render_instructions_block(&[super::InstructionSource::Inline {
-            name: "pinvou3:test/embedded".to_string(),
+            name: "embedded:test/template".to_string(),
             content: "INLINE_MARKER_CONTENT".to_string(),
         }])
         .expect("non-empty");
         assert!(block.contains("INLINE_MARKER_CONTENT"));
-        assert!(block.contains("source=\"pinvou3:test/embedded\""));
+        assert!(block.contains("source=\"embedded:test/template\""));
 
         // Empty inline → skipped just like empty file.
         let empty_inline = super::InstructionSource::Inline {

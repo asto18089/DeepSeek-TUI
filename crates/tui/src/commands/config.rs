@@ -6,7 +6,8 @@ use std::time::Duration;
 use super::CommandResult;
 use crate::client::DeepSeekClient;
 use crate::config::{
-    COMMON_DEEPSEEK_MODELS, Config, clear_api_key, expand_path, normalize_model_name_for_provider,
+    COMMON_DEEPSEEK_MODELS, Config, clear_api_key, effective_home_dir, expand_path,
+    normalize_model_name_for_provider,
 };
 use crate::config_ui::{ConfigUiMode, parse_mode};
 use crate::llm_client::LlmClient;
@@ -93,6 +94,7 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
             crate::localization::Locale::Ja => "ja",
             crate::localization::Locale::PtBr => "pt-BR",
             crate::localization::Locale::Es419 => "es-419",
+            crate::localization::Locale::Vi => "vi",
         }
     }
     fn density_display(d: crate::tui::app::ComposerDensity) -> &'static str {
@@ -286,7 +288,7 @@ pub fn verbose(app: &mut App, arg: Option<&str>) -> CommandResult {
     })
 }
 
-/// Persist `tui.status_items` to `~/.deepseek/config.toml` without disturbing
+/// Persist `tui.status_items` to `~/.codewhale/config.toml` without disturbing
 /// the rest of the file. We round-trip through `toml::Value` so any keys we
 /// don't know about (provider blocks, MCP, etc.) survive the write
 /// untouched.
@@ -364,13 +366,19 @@ pub fn persist_root_string_key(
     Ok(path)
 }
 
-/// Resolve the path to `~/.deepseek/config.toml` (or
-/// `$DEEPSEEK_CONFIG_PATH`). Mirrors what `Config::load` accepts so we
+/// Resolve the path to `~/.codewhale/config.toml` (or
+/// `$CODEWHALE_CONFIG_PATH` / `$DEEPSEEK_CONFIG_PATH`). Mirrors what `Config::load` accepts so we
 /// never write to a different file than the one we read.
 pub(super) fn config_toml_path(config_path: Option<&Path>) -> anyhow::Result<PathBuf> {
     use anyhow::Context;
     if let Some(path) = config_path {
         return Ok(expand_path(path.to_string_lossy().as_ref()));
+    }
+    if let Ok(env) = std::env::var("CODEWHALE_CONFIG_PATH") {
+        let trimmed = env.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
     }
     if let Ok(env) = std::env::var("DEEPSEEK_CONFIG_PATH") {
         let trimmed = env.trim();
@@ -378,12 +386,17 @@ pub(super) fn config_toml_path(config_path: Option<&Path>) -> anyhow::Result<Pat
             return Ok(PathBuf::from(trimmed));
         }
     }
-    let home = dirs::home_dir().context("failed to resolve home directory for config.toml path")?;
+    let home =
+        effective_home_dir().context("failed to resolve home directory for config.toml path")?;
     let primary = home.join(".codewhale").join("config.toml");
     if primary.exists() {
         return Ok(primary);
     }
-    Ok(home.join(".deepseek").join("config.toml"))
+    let legacy = home.join(".deepseek").join("config.toml");
+    if legacy.exists() {
+        return Ok(legacy);
+    }
+    Ok(primary)
 }
 
 /// Modify a setting at runtime
@@ -473,9 +486,9 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                     Err(err) => return CommandResult::error(format!("Failed to save: {err}")),
                 }
             }
-            return CommandResult::error(format!(
-                "base_url must be saved with --save; client base URL is loaded from config on startup. Restart and re-open your session after saving."
-            ));
+            return CommandResult::error(
+                "base_url must be saved with --save; client base URL is loaded from config on startup. Restart and re-open your session after saving.",
+            );
         }
         _ => {}
     }
@@ -576,6 +589,16 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             if !app.use_paste_burst_detection {
                 app.paste_burst.clear_after_explicit_paste();
             }
+        }
+        "mention_menu_limit" | "mention_limit" => {
+            app.mention_menu_limit = settings.mention_menu_limit;
+            app.composer.mention_completion_cache = None;
+            app.needs_redraw = true;
+        }
+        "mention_walk_depth" | "mention_depth" | "completions_walk_depth" => {
+            app.mention_walk_depth = settings.mention_walk_depth;
+            app.composer.mention_completion_cache = None;
+            app.needs_redraw = true;
         }
         "transcript_spacing" | "spacing" => {
             app.transcript_spacing =
@@ -740,6 +763,47 @@ pub fn theme(app: &mut App, arg: Option<&str>) -> CommandResult {
     match arg.map(str::trim).filter(|s| !s.is_empty()) {
         None => CommandResult::action(AppAction::OpenThemePicker),
         Some(name) => set_config_value(app, "theme", name, true),
+    }
+}
+
+/// `/slop [query|export]` — inspect or export the slop ledger (#2127).
+/// With no arguments, prints a summary. `query` shows filtered results;
+/// `export` outputs the full ledger as Markdown.
+pub fn slop(_app: &mut App, arg: Option<&str>) -> CommandResult {
+    let arg = arg.map(str::trim).unwrap_or("");
+    let ledger = match crate::slop_ledger::SlopLedger::load() {
+        Ok(l) => l,
+        Err(e) => return CommandResult::error(format!("Failed to load slop ledger: {e}")),
+    };
+
+    match arg {
+        "" => CommandResult::message(ledger.summary()),
+        "query" | "q" => {
+            if ledger.is_empty() {
+                return CommandResult::message("Slop ledger is empty.");
+            }
+            let mut out = String::new();
+            for entry in &ledger.query(&Default::default()) {
+                use std::fmt::Write;
+                let _ = writeln!(
+                    out,
+                    "[{}] {} ({:?} | {:?}) — {}",
+                    crate::slop_ledger::short_id(&entry.id),
+                    entry.bucket.as_str(),
+                    entry.severity,
+                    entry.status,
+                    entry.title
+                );
+            }
+            CommandResult::message(out)
+        }
+        "export" | "e" => {
+            let md = ledger.export_markdown(None, None);
+            CommandResult::message(md)
+        }
+        _ => CommandResult::error(format!(
+            "Unknown /slop action '{arg}'. Use /slop, /slop query, or /slop export."
+        )),
     }
 }
 
@@ -1308,6 +1372,7 @@ mod tests {
     struct EnvGuard {
         home: Option<OsString>,
         userprofile: Option<OsString>,
+        codewhale_config_path: Option<OsString>,
         deepseek_config_path: Option<OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
@@ -1320,18 +1385,21 @@ mod tests {
             let config_str = OsString::from(config_path.as_os_str());
             let home_prev = env::var_os("HOME");
             let userprofile_prev = env::var_os("USERPROFILE");
+            let codewhale_config_prev = env::var_os("CODEWHALE_CONFIG_PATH");
             let deepseek_config_prev = env::var_os("DEEPSEEK_CONFIG_PATH");
 
             // Safety: test-only environment mutation guarded by process-wide mutex.
             unsafe {
                 env::set_var("HOME", &home_str);
                 env::set_var("USERPROFILE", &home_str);
+                env::remove_var("CODEWHALE_CONFIG_PATH");
                 env::set_var("DEEPSEEK_CONFIG_PATH", &config_str);
             }
 
             Self {
                 home: home_prev,
                 userprofile: userprofile_prev,
+                codewhale_config_path: codewhale_config_prev,
                 deepseek_config_path: deepseek_config_prev,
                 _lock: lock,
             }
@@ -1361,6 +1429,18 @@ mod tests {
                 // Safety: test-only environment mutation guarded by a global mutex.
                 unsafe {
                     env::remove_var("USERPROFILE");
+                }
+            }
+
+            if let Some(value) = self.codewhale_config_path.take() {
+                // Safety: test-only environment mutation guarded by a global mutex.
+                unsafe {
+                    env::set_var("CODEWHALE_CONFIG_PATH", value);
+                }
+            } else {
+                // Safety: test-only environment mutation guarded by a global mutex.
+                unsafe {
+                    env::remove_var("CODEWHALE_CONFIG_PATH");
                 }
             }
 
@@ -1400,7 +1480,15 @@ mod tests {
             resume_session_id: None,
             initial_input: None,
         };
-        App::new(options, &Config::default())
+        let mut app = App::new(options, &Config::default());
+        // App::new folds in saved TUI settings from the developer machine.
+        // Pin command tests back to DeepSeek semantics so model aliases are
+        // not normalized through a provider selected in an interactive run.
+        app.model = "test-model".to_string();
+        app.auto_model = false;
+        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.model_ids_passthrough = false;
+        app
     }
 
     #[test]
@@ -2127,6 +2215,77 @@ mod tests {
         );
         assert!(body.contains("\"mode\""), "expected mode key in {body}");
         assert!(body.contains("\"cost\""), "expected cost key in {body}");
+    }
+
+    #[test]
+    fn config_toml_path_uses_codewhale_home_for_fresh_installs() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-config-path-fresh-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+
+        unsafe {
+            env::remove_var("DEEPSEEK_CONFIG_PATH");
+        }
+
+        assert_eq!(
+            config_toml_path(None).unwrap(),
+            temp_root.join(".codewhale").join("config.toml")
+        );
+    }
+
+    #[test]
+    fn config_toml_path_preserves_legacy_config_when_it_exists() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-config-path-legacy-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        let legacy_config = temp_root.join(".deepseek").join("config.toml");
+        fs::create_dir_all(legacy_config.parent().unwrap()).unwrap();
+        fs::write(&legacy_config, "").unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+
+        unsafe {
+            env::remove_var("DEEPSEEK_CONFIG_PATH");
+        }
+
+        assert_eq!(config_toml_path(None).unwrap(), legacy_config);
+    }
+
+    #[test]
+    fn config_toml_path_prefers_codewhale_env_over_legacy_env() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-config-path-env-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let preferred = temp_root.join("preferred.toml");
+        let legacy = temp_root.join("legacy.toml");
+
+        unsafe {
+            env::set_var("CODEWHALE_CONFIG_PATH", &preferred);
+            env::set_var("DEEPSEEK_CONFIG_PATH", &legacy);
+        }
+
+        assert_eq!(config_toml_path(None).unwrap(), preferred);
     }
 
     #[test]

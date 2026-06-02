@@ -12,6 +12,8 @@ use dotenvy::dotenv;
 use tempfile::NamedTempFile;
 use wait_timeout::ChildExt;
 
+use crate::dependencies::ExternalTool;
+
 mod acp_server;
 mod artifacts;
 mod audit;
@@ -51,7 +53,9 @@ mod prefix_cache;
 mod pricing;
 mod project_context;
 mod project_doc;
+mod prompt_zones;
 mod prompts;
+mod purge;
 pub mod repl;
 mod retry_status;
 pub mod rlm;
@@ -65,8 +69,10 @@ mod seam_manager;
 mod session_failure_classifier;
 mod session_manager;
 mod settings;
+mod shell_dispatcher;
 mod skill_state;
 mod skills;
+mod slop_ledger;
 mod snapshot;
 mod task_manager;
 #[cfg(test)]
@@ -78,6 +84,7 @@ mod tui;
 mod utils;
 mod vision;
 mod working_set;
+mod workspace_discovery;
 mod workspace_trust;
 
 use crate::config::{Config, DEFAULT_TEXT_MODEL, MAX_SUBAGENTS, effective_home_dir};
@@ -120,7 +127,7 @@ struct Cli {
     #[command(flatten)]
     feature_toggles: FeatureToggles,
 
-    /// Send a one-shot prompt (non-interactive)
+    /// Initial prompt to submit in the interactive TUI. Use `exec` for non-interactive runs.
     #[arg(short, long, value_name = "PROMPT", num_args = 1..)]
     prompt: Vec<String>,
 
@@ -179,7 +186,7 @@ struct Cli {
     #[arg(long = "fresh")]
     fresh: bool,
 
-    /// Skip loading project-level config from $WORKSPACE/.deepseek/config.toml
+    /// Skip loading project-level config from $WORKSPACE/.codewhale/config.toml
     #[arg(long = "no-project-config")]
     no_project_config: bool,
 }
@@ -426,6 +433,18 @@ fn join_prompt_parts(parts: &[String]) -> String {
     parts.join(" ")
 }
 
+fn resolve_exec_model(config: &Config, explicit_model: Option<&str>) -> String {
+    explicit_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| config.default_model())
+}
+
+fn top_level_prompt_initial_input(parts: &[String]) -> Option<tui::InitialInput> {
+    (!parts.is_empty()).then(|| tui::InitialInput::Submit(join_prompt_parts(parts)))
+}
+
 fn resolve_exec_resume_session_id(args: &ExecArgs, workspace: &Path) -> Result<Option<String>> {
     if let Some(id) = args.resume.as_ref().or(args.session_id.as_ref()) {
         return Ok(Some(id.clone()));
@@ -572,12 +591,18 @@ struct ServeArgs {
     /// Start runtime HTTP/SSE API server
     #[arg(long)]
     http: bool,
+    /// Start runtime HTTP/SSE API server with the built-in mobile control page
+    #[arg(long)]
+    mobile: bool,
+    /// Show a QR code for the mobile URL in the terminal (requires --mobile)
+    #[arg(long, requires = "mobile")]
+    qr: bool,
     /// Start ACP server over stdio for editor clients such as Zed
     #[arg(long)]
     acp: bool,
-    /// Bind host for HTTP server (default localhost)
-    #[arg(long, default_value = "127.0.0.1")]
-    host: String,
+    /// Bind host for HTTP server (default localhost; --mobile defaults to 0.0.0.0)
+    #[arg(long)]
+    host: Option<String>,
     /// Bind port for HTTP server
     #[arg(long, default_value_t = 7878)]
     port: u16,
@@ -597,6 +622,44 @@ struct ServeArgs {
     /// Disable runtime API auth when no token is configured. Only use on a trusted loopback.
     #[arg(long = "insecure")]
     insecure_no_auth: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServeBindHost {
+    host: String,
+    mobile_rebound_to_lan: bool,
+}
+
+fn resolve_serve_bind_host(mobile: bool, host: Option<String>) -> ServeBindHost {
+    match (mobile, host) {
+        (true, None) => ServeBindHost {
+            host: "0.0.0.0".to_string(),
+            mobile_rebound_to_lan: true,
+        },
+        (_, Some(host)) => ServeBindHost {
+            host,
+            mobile_rebound_to_lan: false,
+        },
+        (false, None) => ServeBindHost {
+            host: "127.0.0.1".to_string(),
+            mobile_rebound_to_lan: false,
+        },
+    }
+}
+
+fn validate_serve_mode_selection(mcp: bool, http: bool, mobile: bool, acp: bool) -> Result<bool> {
+    if http && mobile {
+        bail!("--http and --mobile are mutually exclusive; choose one");
+    }
+    let http_selected = http || mobile;
+    let selected_modes = [mcp, http_selected, acp]
+        .into_iter()
+        .filter(|selected| *selected)
+        .count();
+    if selected_modes != 1 {
+        bail!("Choose exactly one server mode: --mcp, --http/--mobile, or --acp");
+    }
+    Ok(http_selected)
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -631,6 +694,9 @@ enum McpCommand {
         /// URL for streamable HTTP/SSE server
         #[arg(long, conflicts_with = "command")]
         url: Option<String>,
+        /// Explicit URL transport override. Use "sse" for legacy SSE endpoints.
+        #[arg(long, requires = "url")]
+        transport: Option<String>,
         /// Arguments for command-based servers
         #[arg(long = "arg")]
         args: Vec<String>,
@@ -652,13 +718,13 @@ enum McpCommand {
     },
     /// Validate MCP config and required servers
     Validate,
-    /// Register this DeepSeek binary as a local MCP stdio server.
+    /// Register this CodeWhale binary as a local MCP stdio server.
     ///
     /// This adds a config entry that runs `codewhale serve --mcp` (stdio protocol).
     /// For the HTTP/SSE runtime API, use `codewhale serve --http` directly instead.
     #[command(
         name = "add-self",
-        long_about = "Register this DeepSeek binary as a local MCP stdio server.\n\nAdds a config entry to ~/.deepseek/mcp.json that launches `codewhale serve --mcp`\nvia the stdio transport. Other DeepSeek sessions (or any MCP client) can then\ndiscover and call tools exposed by this server.\n\nUse `codewhale serve --http` instead if you need the HTTP/SSE runtime API."
+        long_about = "Register this CodeWhale binary as a local MCP stdio server.\n\nAdds a config entry to ~/.codewhale/mcp.json that launches `codewhale serve --mcp`\nvia the stdio transport. Other CodeWhale sessions (or any MCP client) can then\ndiscover and call tools exposed by this server.\n\nUse `codewhale serve --http` instead if you need the HTTP/SSE runtime API."
     )]
     AddSelf {
         /// Server name in mcp.json (default: "codewhale")
@@ -832,11 +898,7 @@ async fn main() -> Result<()> {
             }
             Commands::Exec(args) => {
                 let config = load_config_from_cli(&cli)?;
-                let model = args
-                    .model
-                    .clone()
-                    .or_else(|| config.default_text_model.clone())
-                    .unwrap_or_else(|| config.default_model());
+                let model = resolve_exec_model(&config, args.model.as_deref());
                 let prompt = join_prompt_parts(&args.prompt);
                 let workspace = cli.workspace.clone().unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -926,28 +988,31 @@ async fn main() -> Result<()> {
                 let workspace = cli.workspace.clone().unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
                 });
-                let selected_modes = [args.mcp, args.http, args.acp]
-                    .into_iter()
-                    .filter(|selected| *selected)
-                    .count();
-                if selected_modes != 1 {
-                    bail!("Choose exactly one server mode: --mcp, --http, or --acp");
-                }
+                let http_selected =
+                    validate_serve_mode_selection(args.mcp, args.http, args.mobile, args.acp)?;
                 if args.mcp {
-                    mcp_server::run_mcp_server(workspace)
-                } else if args.http {
+                    tokio::task::block_in_place(|| mcp_server::run_mcp_server(workspace))
+                } else if http_selected {
                     let config = load_config_from_cli(&cli)?;
                     let cors_origins = resolve_cors_origins(&config, &args.cors_origin);
+                    let bind_host = resolve_serve_bind_host(args.mobile, args.host);
+                    if bind_host.mobile_rebound_to_lan {
+                        println!(
+                            "WARNING: --mobile is binding to 0.0.0.0 so LAN devices can reach the mobile control page. Use --host 127.0.0.1 to keep mobile loopback-only."
+                        );
+                    }
                     runtime_api::run_http_server(
                         config,
                         workspace,
                         runtime_api::RuntimeApiOptions {
-                            host: args.host,
+                            host: bind_host.host,
                             port: args.port,
                             workers: args.workers.clamp(1, 8),
                             cors_origins,
                             auth_token: args.auth_token,
                             insecure_no_auth: args.insecure_no_auth,
+                            mobile: args.mobile,
+                            show_qr: args.qr,
                         },
                     )
                     .await
@@ -974,12 +1039,12 @@ async fn main() -> Result<()> {
         };
     }
 
-    // One-shot prompt mode
+    // Top-level prompt mode: submit the initial prompt, then keep the TUI alive
+    // for follow-up messages. Use `codewhale exec` for explicit non-interactive
+    // one-shot behavior (#2370).
     let config = load_config_from_cli(&cli)?;
-    if !cli.prompt.is_empty() {
-        let prompt = join_prompt_parts(&cli.prompt);
-        let model = config.default_model();
-        return run_one_shot(&config, &model, &prompt).await;
+    if let Some(initial_input) = top_level_prompt_initial_input(&cli.prompt) {
+        return run_interactive(&cli, &config, None, Some(initial_input)).await;
     }
 
     // Handle session resume. Plain `codewhale` starts fresh: interrupted
@@ -1417,6 +1482,7 @@ fn mcp_template_json() -> Result<String> {
             args: vec!["./path/to/your-mcp-server.js".to_string()],
             env: std::collections::HashMap::new(),
             url: None,
+            transport: None,
             connect_timeout: None,
             execute_timeout: None,
             read_timeout: None,
@@ -1469,8 +1535,12 @@ fn tools_readme_template() -> &'static str {
     "# Local tools\n\n\
      Drop self-describing scripts here so they can be discovered by\n\
      `codewhale-tui setup --status` and surfaced in `codewhale-tui doctor`.\n\n\
+     When `[tools.plugin_dir]` is set in config.toml (or when the default\n\
+     `~/.codewhale/tools/` directory exists), they are auto-discovered and\n\
+     registered as model-visible tools.\n\n\
      Each script should start with a frontmatter-style header so the\n\
-     description is visible without executing the file:\n\n\
+     description is visible without executing the file and the agent knows\n\
+     the tool name, description, and input schema:\n\n\
      ```\n\
      # name: my-tool\n\
      # description: One-line summary of what this tool does\n\
@@ -1507,7 +1577,7 @@ fn plugins_readme_template() -> &'static str {
      Plugins are richer than tools: each one lives in its own subdirectory\n\
      with a `PLUGIN.md` describing what it does and how to enable it. The\n\
      directory is created so users have a documented place to drop\n\
-     experiments without touching `~/.deepseek/skills/`.\n\n\
+     experiments without touching `~/.codewhale/skills/`.\n\n\
      A plugin layout looks like:\n\n\
      ```\n\
      plugins/\n\
@@ -1866,6 +1936,10 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                     "OPENROUTER_API_KEY",
                     "codewhale auth set --provider openrouter --api-key \"...\"",
                 ),
+                crate::config::ApiProvider::XiaomiMimo => (
+                    "XIAOMI_MIMO_API_KEY/XIAOMI_API_KEY/MIMO_API_KEY",
+                    "codewhale auth set --provider xiaomi-mimo --api-key \"...\"",
+                ),
                 crate::config::ApiProvider::Novita => (
                     "NOVITA_API_KEY",
                     "codewhale auth set --provider novita --api-key \"...\"",
@@ -1873,6 +1947,10 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                 crate::config::ApiProvider::Fireworks => (
                     "FIREWORKS_API_KEY",
                     "codewhale auth set --provider fireworks --api-key \"...\"",
+                ),
+                crate::config::ApiProvider::Siliconflow => (
+                    "SILICONFLOW_API_KEY",
+                    "codewhale auth set --provider siliconflow --api-key \"...\"",
                 ),
                 crate::config::ApiProvider::Moonshot => (
                     "MOONSHOT_API_KEY/KIMI_API_KEY",
@@ -1889,21 +1967,28 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                 crate::config::ApiProvider::Ollama => {
                     ("OLLAMA_API_KEY", "codewhale auth set --provider ollama")
                 }
+                crate::config::ApiProvider::Volcengine => (
+                    "VOLCENGINE_API_KEY",
+                    "codewhale auth set --provider volcengine",
+                ),
                 crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN => {
                     ("DEEPSEEK_API_KEY", "codewhale auth set --provider deepseek")
                 }
             };
             println!(
-                "  {} api_key: missing  (set {env_var} or `[providers.{}].api_key` in ~/.deepseek/config.toml; or run `{login_hint}`)",
+                "  {} api_key: missing  (set {env_var} or `[providers.{}].api_key` in ~/.codewhale/config.toml; or run `{login_hint}`)",
                 "✗".truecolor(red_r, red_g, red_b),
                 match config.api_provider() {
                     crate::config::ApiProvider::NvidiaNim => "nvidia_nim",
                     crate::config::ApiProvider::Openai => "openai",
                     crate::config::ApiProvider::Atlascloud => "atlascloud",
                     crate::config::ApiProvider::WanjieArk => "wanjie_ark",
+                    crate::config::ApiProvider::Volcengine => "volcengine",
                     crate::config::ApiProvider::Openrouter => "openrouter",
+                    crate::config::ApiProvider::XiaomiMimo => "xiaomi_mimo",
                     crate::config::ApiProvider::Novita => "novita",
                     crate::config::ApiProvider::Fireworks => "fireworks",
+                    crate::config::ApiProvider::Siliconflow => "siliconflow",
                     crate::config::ApiProvider::Moonshot => "moonshot",
                     crate::config::ApiProvider::Sglang => "sglang",
                     crate::config::ApiProvider::Vllm => "vllm",
@@ -2065,6 +2150,51 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
     println!("  rust: {}", rustc_version());
     println!();
 
+    println!("{}", "Updates:".bold());
+    let current_version = env!("CARGO_PKG_VERSION");
+    println!("  · current: v{current_version}");
+    match codewhale_release::latest_release_tag_async(codewhale_release::ReleaseChannel::Stable)
+        .await
+    {
+        Ok(latest_tag) => {
+            match codewhale_release::compare_release_versions(current_version, &latest_tag) {
+                Ok(std::cmp::Ordering::Less) => {
+                    println!(
+                        "  {} latest: {latest_tag}",
+                        "!".truecolor(sky_r, sky_g, sky_b)
+                    );
+                    println!("    Update available. Run `codewhale update` to install.");
+                }
+                Ok(std::cmp::Ordering::Equal) => {
+                    println!(
+                        "  {} latest: {latest_tag}",
+                        "✓".truecolor(aqua_r, aqua_g, aqua_b)
+                    );
+                    println!("    Already up to date.");
+                }
+                Ok(std::cmp::Ordering::Greater) => {
+                    println!("  {} latest: {latest_tag}", "·".dimmed());
+                    println!("    Current build is newer than the latest published release.");
+                }
+                Err(err) => {
+                    println!(
+                        "  {} latest: {latest_tag}",
+                        "!".truecolor(sky_r, sky_g, sky_b)
+                    );
+                    println!("    Version comparison failed: {err}");
+                }
+            }
+        }
+        Err(err) => {
+            println!(
+                "  {} latest release check failed: {err}",
+                "!".truecolor(sky_r, sky_g, sky_b)
+            );
+            println!("    Run `codewhale update --check` to retry.");
+        }
+    }
+    println!();
+
     // Configuration summary
     println!("{}", "Configuration:".bold());
     let config_path = config_path_override
@@ -2164,6 +2294,11 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
             &["OPENROUTER_API_KEY"][..],
         ),
         (
+            crate::config::ApiProvider::XiaomiMimo,
+            "xiaomi-mimo",
+            &["XIAOMI_MIMO_API_KEY", "XIAOMI_API_KEY", "MIMO_API_KEY"][..],
+        ),
+        (
             crate::config::ApiProvider::Novita,
             "novita",
             &["NOVITA_API_KEY"][..],
@@ -2172,6 +2307,11 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
             crate::config::ApiProvider::Fireworks,
             "fireworks",
             &["FIREWORKS_API_KEY"][..],
+        ),
+        (
+            crate::config::ApiProvider::Siliconflow,
+            "siliconflow",
+            &["SILICONFLOW_API_KEY"][..],
         ),
         (
             crate::config::ApiProvider::Moonshot,
@@ -2226,7 +2366,7 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
             if in_config { "yes" } else { "no" }
         );
     }
-    println!("  · credential precedence: ~/.deepseek/config.toml, OS keyring, then env");
+    println!("  · credential precedence: ~/.codewhale/config.toml, OS keyring, then env");
 
     let api_key_source = resolve_api_key_source(config);
     let has_api_key = if config.deepseek_api_key().is_ok() {
@@ -2257,7 +2397,7 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
             "✗".truecolor(red_r, red_g, red_b)
         );
         println!(
-            "    Run 'codewhale auth set --provider <name>' to save a key to ~/.deepseek/config.toml."
+            "    Run 'codewhale auth set --provider <name>' to save a key to ~/.codewhale/config.toml."
         );
         false
     };
@@ -3300,7 +3440,7 @@ fn doctor_timeout_recovery_lines(config: &Config) -> Vec<String> {
                 && !target.base_url.contains("api.deepseeki.com") =>
         {
             lines.push(
-                "If this is a custom DeepSeek-compatible endpoint, set its HTTPS base URL in ~/.deepseek/config.toml and rerun `codewhale doctor`."
+                "If this is a custom DeepSeek-compatible endpoint, set its HTTPS base URL in ~/.codewhale/config.toml and rerun `codewhale doctor`."
                     .to_string(),
             );
         }
@@ -3412,13 +3552,15 @@ async fn test_api_connectivity(config: &Config) -> Result<()> {
 }
 
 fn rustc_version() -> String {
-    // Try to get rustc version, fall back to "unknown"
-    std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string())
+    let Some(mut cmd) = crate::dependencies::RustC::command() else {
+        return "unknown".to_string();
+    };
+    let Ok(output) = cmd.arg("--version").output() else {
+        return "unknown".to_string();
+    };
+    String::from_utf8(output.stdout)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 /// List saved sessions
@@ -3782,7 +3924,13 @@ async fn run_pr(
     } else {
         cli.resume.clone()
     };
-    run_interactive(cli, config, resume_session_id, Some(prompt)).await
+    run_interactive(
+        cli,
+        config,
+        resume_session_id,
+        Some(tui::InitialInput::Prefill(prompt)),
+    )
+    .await
 }
 
 /// Return true if `name` resolves to an executable on the current `PATH`.
@@ -3830,7 +3978,8 @@ struct GhPullRequest {
 }
 
 fn run_gh_pr_view(number: u32, repo: Option<&str>) -> Result<GhPullRequest> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = crate::dependencies::Gh::command()
+        .ok_or_else(|| anyhow::anyhow!("gh not found on PATH"))?;
     cmd.arg("pr").arg("view").arg(number.to_string());
     if let Some(r) = repo {
         cmd.arg("--repo").arg(r);
@@ -3864,7 +4013,8 @@ fn run_gh_pr_view(number: u32, repo: Option<&str>) -> Result<GhPullRequest> {
 }
 
 fn run_gh_pr_diff(number: u32, repo: Option<&str>) -> Result<String> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = crate::dependencies::Gh::command()
+        .ok_or_else(|| anyhow::anyhow!("gh not found on PATH"))?;
     cmd.arg("pr").arg("diff").arg(number.to_string());
     if let Some(r) = repo {
         cmd.arg("--repo").arg(r);
@@ -3880,7 +4030,8 @@ fn run_gh_pr_diff(number: u32, repo: Option<&str>) -> Result<String> {
 }
 
 fn run_gh_pr_checkout(number: u32, repo: Option<&str>) -> Result<()> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = crate::dependencies::Gh::command()
+        .ok_or_else(|| anyhow::anyhow!("gh not found on PATH"))?;
     cmd.arg("pr").arg("checkout").arg(number.to_string());
     if let Some(r) = repo {
         cmd.arg("--repo").arg(r);
@@ -3954,7 +4105,8 @@ fn format_pr_prompt(number: u32, view: &GhPullRequest, diff: &str) -> String {
 }
 
 fn collect_diff(args: &ReviewArgs) -> Result<String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::dependencies::Git::command()
+        .ok_or_else(|| anyhow::anyhow!("git not found on PATH"))?;
     cmd.arg("diff");
     if args.staged {
         cmd.arg("--cached");
@@ -3995,7 +4147,8 @@ fn run_apply(args: ApplyArgs) -> Result<()> {
     tmp.write_all(patch.as_bytes())?;
     let tmp_path = tmp.path().to_path_buf();
 
-    let output = Command::new("git")
+    let output = crate::dependencies::Git::command()
+        .ok_or_else(|| anyhow::anyhow!("git not found on PATH"))?
         .arg("apply")
         .arg("--whitespace=nowarn")
         .arg(&tmp_path)
@@ -4131,10 +4284,16 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
             name,
             command,
             url,
+            transport,
             args,
         } => {
             if command.is_none() && url.is_none() {
                 bail!("Provide either --command or --url for `mcp add`.");
+            }
+            if let Some(transport) = transport.as_deref()
+                && !transport.trim().eq_ignore_ascii_case("sse")
+            {
+                bail!("Unsupported MCP transport '{transport}'. Supported values: sse");
             }
             let mut cfg = load_mcp_config(&config_path)?;
             cfg.servers.insert(
@@ -4144,6 +4303,7 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
                     args,
                     env: std::collections::HashMap::new(),
                     url,
+                    transport,
                     connect_timeout: None,
                     execute_timeout: None,
                     read_timeout: None,
@@ -4230,6 +4390,7 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
                     args,
                     env: std::collections::HashMap::new(),
                     url: None,
+                    transport: None,
                     connect_timeout: None,
                     execute_timeout: None,
                     read_timeout: None,
@@ -4519,7 +4680,7 @@ fn should_use_mouse_capture_with(
 /// Off elsewhere only for JetBrains' JediTerm, which advertises mouse
 /// support but forwards the same SGR escape sequences as raw input. The
 /// user can still opt back in with `[tui] mouse_capture = true` in
-/// `~/.deepseek/config.toml` or `--mouse-capture`.
+/// `~/.codewhale/config.toml` or `--mouse-capture`.
 fn default_mouse_capture_enabled(
     terminal_emulator: Option<&str>,
     wt_session: Option<&str>,
@@ -4652,8 +4813,9 @@ fn preserve_interrupted_checkpoint_for_explicit_resume(launch_workspace: &Path) 
     }
 }
 
-/// Load project-level config from `$WORKSPACE/.deepseek/config.toml` and
-/// apply its fields as overrides on top of the global config (#485).
+/// Load project-level config from `$WORKSPACE/.codewhale/config.toml`, with
+/// legacy `$WORKSPACE/.deepseek/config.toml` fallback, then apply its fields as
+/// overrides on top of the global config (#485).
 /// Only explicitly set fields in the project file are applied; everything
 /// else falls back to the global value.
 fn merge_project_config(config: &mut Config, workspace: &Path) {
@@ -4714,7 +4876,7 @@ fn merge_project_config(config: &mut Config, workspace: &Path) {
         if table.contains_key(*key) {
             eprintln!(
                 "warning: project-scope config key `{key}` is ignored — \
-                 set it in `~/.deepseek/config.toml` instead. \
+                 set it in `~/.codewhale/config.toml` instead. \
                  (See #417 for the deny-list rationale.)"
             );
         }
@@ -4794,14 +4956,15 @@ async fn run_interactive(
     cli: &Cli,
     config: &Config,
     resume_session_id: Option<String>,
-    initial_input: Option<String>,
+    initial_input: Option<tui::InitialInput>,
 ) -> Result<()> {
     let workspace = cli
         .workspace
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    // Merge project-level config from $WORKSPACE/.deepseek/config.toml
+    // Merge project-level config from $WORKSPACE/.codewhale/config.toml
+    // or legacy $WORKSPACE/.deepseek/config.toml
     // unless --no-project-config was passed (#485).
     let mut merged_config = config.clone();
     if !cli.no_project_config {
@@ -5215,6 +5378,7 @@ async fn run_exec_agent(
         vision_config: config.vision_model_config(),
         strict_tool_mode: config.strict_tool_mode.unwrap_or(false),
         goal_objective: None,
+        allowed_tools: None,
         locale_tag: crate::localization::resolve_locale(&settings.locale)
             .tag()
             .to_string(),
@@ -5222,6 +5386,7 @@ async fn run_exec_agent(
         search_provider: config.search_provider(),
         search_api_key: config.search.as_ref().and_then(|s| s.api_key.clone()),
         tools_always_load: config.tools_always_load(),
+        tools: config.tools.clone(),
     };
 
     let engine_handle = spawn_engine(engine_config, config);
@@ -5269,6 +5434,7 @@ async fn run_exec_agent(
             mode,
             model: effective_model.clone(),
             goal_objective: None,
+            allowed_tools: None,
             reasoning_effort: effective_reasoning_effort,
             reasoning_effort_auto: auto_model,
             auto_model,
@@ -5576,6 +5742,53 @@ async fn run_exec_agent(
 }
 
 #[cfg(test)]
+mod serve_bind_host_tests {
+    use super::*;
+
+    #[test]
+    fn http_defaults_to_loopback() {
+        assert_eq!(
+            resolve_serve_bind_host(false, None),
+            ServeBindHost {
+                host: "127.0.0.1".to_string(),
+                mobile_rebound_to_lan: false,
+            }
+        );
+    }
+
+    #[test]
+    fn mobile_default_rebinds_to_lan_with_warning_flag() {
+        assert_eq!(
+            resolve_serve_bind_host(true, None),
+            ServeBindHost {
+                host: "0.0.0.0".to_string(),
+                mobile_rebound_to_lan: true,
+            }
+        );
+    }
+
+    #[test]
+    fn mobile_respects_explicit_loopback_host() {
+        assert_eq!(
+            resolve_serve_bind_host(true, Some("127.0.0.1".to_string())),
+            ServeBindHost {
+                host: "127.0.0.1".to_string(),
+                mobile_rebound_to_lan: false,
+            }
+        );
+    }
+
+    #[test]
+    fn http_and_mobile_are_mutually_exclusive() {
+        let err = validate_serve_mode_selection(false, true, true, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--http and --mobile are mutually exclusive")
+        );
+    }
+}
+
+#[cfg(test)]
 mod doctor_endpoint_tests {
     use super::*;
 
@@ -5842,8 +6055,43 @@ mod terminal_mode_tests {
     }
 
     #[test]
+    fn prompt_flag_starts_interactive_submit_input() {
+        let cli = parse_cli(&["codewhale", "-p", "read", "the", "project"]);
+
+        assert_eq!(
+            top_level_prompt_initial_input(&cli.prompt),
+            Some(tui::InitialInput::Submit("read the project".to_string()))
+        );
+    }
+
+    #[test]
     fn companion_binary_reports_its_own_name() {
         assert_eq!(Cli::command().get_name(), "codewhale-tui");
+    }
+
+    #[test]
+    fn exec_model_resolution_uses_provider_scoped_default() {
+        let config = Config {
+            provider: Some("openrouter".to_string()),
+            default_text_model: Some("deepseek/deepseek-v4-pro".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                openrouter: crate::config::ProviderConfig {
+                    model: Some("arcee-ai/trinity-large-thinking".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_exec_model(&config, None),
+            "arcee-ai/trinity-large-thinking"
+        );
+        assert_eq!(
+            resolve_exec_model(&config, Some("arcee-ai/trinity-large-thinking")),
+            "arcee-ai/trinity-large-thinking"
+        );
     }
 
     #[test]
@@ -6722,6 +6970,7 @@ mod doctor_mcp_tests {
             args: args.iter().map(|s| s.to_string()).collect(),
             env: std::collections::HashMap::new(),
             url: url.map(String::from),
+            transport: None,
             connect_timeout: None,
             execute_timeout: None,
             read_timeout: None,

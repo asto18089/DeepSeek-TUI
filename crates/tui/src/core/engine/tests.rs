@@ -5,7 +5,7 @@ use crate::models::SystemBlock;
 use crate::test_support::lock_test_env;
 use crate::tools::spec::ToolCapability;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -113,6 +113,52 @@ fn config_auth_error_does_not_blame_env() {
         engine.decorate_auth_error_message("Authentication failed: invalid API key".to_string());
 
     assert_eq!(message, "Authentication failed: invalid API key");
+}
+
+#[test]
+fn plugin_tools_dir_honors_missing_custom_directory_without_fallback() {
+    let missing = PathBuf::from("definitely-missing-codewhale-plugin-dir");
+    let tools_config = crate::config::ToolsConfig {
+        plugin_dir: Some(missing.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(plugin_tools_dir(Some(&tools_config)), missing);
+}
+
+#[test]
+fn configure_plugin_tools_applies_overrides_after_discovered_plugins() {
+    let tmp = tempdir().expect("tempdir");
+    let plugin_dir = tmp.path().join("tools");
+    fs::create_dir(&plugin_dir).expect("plugin dir");
+    fs::write(
+        plugin_dir.join("same-name.sh"),
+        "# name: same_tool\n# description: discovered plugin\n",
+    )
+    .expect("plugin script");
+
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "same_tool".to_string(),
+        crate::config::ToolOverride::Command {
+            command: "configured-command".to_string(),
+            args: None,
+        },
+    );
+    let tools_config = crate::config::ToolsConfig {
+        plugin_dir: Some(plugin_dir.to_string_lossy().to_string()),
+        overrides: Some(overrides),
+        ..Default::default()
+    };
+
+    let ctx = crate::tools::ToolContext::new(tmp.path().to_path_buf());
+    let mut registry = crate::tools::ToolRegistry::new(ctx);
+
+    let plugin_names = configure_plugin_tools(&mut registry, Some(&tools_config));
+
+    let tool = registry.get("same_tool").expect("same_tool registered");
+    assert!(tool.description().contains("configured-command"));
+    assert!(plugin_names.contains("same_tool"));
 }
 
 fn make_plan(
@@ -445,6 +491,26 @@ fn non_yolo_mode_retains_default_defer_policy() {
         &always_load
     ));
     assert!(!should_default_defer_tool(
+        "apply_patch",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
+        "fetch_url",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
+        "git_diff",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
+        "git_status",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
         "run_tests",
         AppMode::Agent,
         &always_load
@@ -460,7 +526,22 @@ fn non_yolo_mode_retains_default_defer_policy() {
         &always_load
     ));
     assert!(!should_default_defer_tool(
+        "web_search",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
         "write_file",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
+        "task_shell_start",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
+        "task_shell_wait",
         AppMode::Agent,
         &always_load
     ));
@@ -1473,6 +1554,32 @@ fn turn_metadata_includes_current_local_date_without_working_set() {
 }
 
 #[test]
+fn turn_metadata_includes_auto_model_route() {
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let (engine, _handle) = Engine::new(config, &Config::default());
+
+    let user_msg = engine.user_text_message_with_turn_metadata_for_route(
+        "debug this regression".to_string(),
+        "deepseek-v4-pro",
+        true,
+        Some("max"),
+        true,
+    );
+    let first_block = user_msg.content.first().expect("turn metadata block");
+    let ContentBlock::Text { text, .. } = first_block else {
+        panic!("expected text metadata block");
+    };
+
+    assert!(text.contains("Auto model route: deepseek-v4-pro"));
+    assert!(text.contains("Auto reasoning effort: max"));
+    assert!(!text.contains("debug this regression"));
+}
+
+#[test]
 fn user_text_message_keeps_current_turn_input_after_turn_metadata() {
     let tmp = tempdir().expect("tempdir");
     let config = EngineConfig {
@@ -2137,6 +2244,96 @@ fn tool_search_activates_discovered_deferred_tools() {
     assert!(active.contains("read_file"));
 }
 
+fn tool_search_catalog_with_matches(count: usize) -> Vec<Tool> {
+    let mut catalog = (0..count)
+        .map(|idx| Tool {
+            tool_type: None,
+            name: format!("matching_tool_{idx:03}"),
+            description: "Matching deferred test tool".to_string(),
+            input_schema: json!({"type":"object","properties":{"query":{"type":"string"}}}),
+            allowed_callers: Some(vec!["direct".to_string()]),
+            defer_loading: Some(true),
+            input_examples: None,
+            strict: None,
+            cache_control: None,
+        })
+        .collect::<Vec<_>>();
+    let always_load = HashSet::new();
+    ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
+    catalog
+}
+
+fn tool_search_reference_count(result: &ToolResult) -> usize {
+    result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("tool_references"))
+        .and_then(|references| references.as_array())
+        .map_or(0, Vec::len)
+}
+
+#[test]
+fn tool_search_defaults_to_twenty_results_for_regex_and_bm25() {
+    let catalog = tool_search_catalog_with_matches(25);
+
+    for tool_name in [TOOL_SEARCH_REGEX_NAME, TOOL_SEARCH_BM25_NAME] {
+        let mut active = initial_active_tools(&catalog);
+        let result = execute_tool_search(
+            tool_name,
+            &json!({"query":"matching"}),
+            &catalog,
+            &mut active,
+        )
+        .expect("search succeeds");
+
+        assert_eq!(tool_search_reference_count(&result), 20);
+    }
+}
+
+#[test]
+fn tool_search_respects_and_caps_max_results() {
+    let catalog = tool_search_catalog_with_matches(120);
+
+    let mut active = initial_active_tools(&catalog);
+    let limited = execute_tool_search(
+        TOOL_SEARCH_BM25_NAME,
+        &json!({"query":"matching","max_results":7}),
+        &catalog,
+        &mut active,
+    )
+    .expect("search succeeds");
+    assert_eq!(tool_search_reference_count(&limited), 7);
+
+    let mut active = initial_active_tools(&catalog);
+    let capped = execute_tool_search(
+        TOOL_SEARCH_REGEX_NAME,
+        &json!({"query":"matching","max_results":999}),
+        &catalog,
+        &mut active,
+    )
+    .expect("search succeeds");
+    assert_eq!(tool_search_reference_count(&capped), 100);
+}
+
+#[test]
+fn tool_search_schema_exposes_max_results_default_and_cap() {
+    let mut catalog = Vec::new();
+    let always_load = HashSet::new();
+    ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
+
+    for tool_name in [TOOL_SEARCH_REGEX_NAME, TOOL_SEARCH_BM25_NAME] {
+        let tool = catalog
+            .iter()
+            .find(|tool| tool.name == tool_name)
+            .expect("tool search definition exists");
+        let schema = &tool.input_schema["properties"]["max_results"];
+
+        assert_eq!(schema["default"], 20);
+        assert_eq!(schema["maximum"], 100);
+        assert_eq!(schema["minimum"], 1);
+    }
+}
+
 #[tokio::test]
 async fn code_execution_runs_python_and_returns_result_payload() {
     let tmp = tempdir().expect("tempdir");
@@ -2245,6 +2442,44 @@ fn missing_tool_error_message_includes_discovery_guidance_when_no_match() {
 
     let message = missing_tool_error_message("totally_unknown_tool", &catalog);
     assert!(message.contains("not available in the current tool catalog"));
+    assert!(message.contains(TOOL_SEARCH_BM25_NAME));
+}
+
+#[test]
+fn missing_shell_tool_error_message_names_allow_shell_gate() {
+    let catalog = vec![api_tool("read_file")];
+
+    for tool_name in [
+        "exec_shell",
+        "exec_shell_wait",
+        "exec_shell_interact",
+        "task_shell_start",
+        "task_shell_wait",
+    ] {
+        let message = missing_tool_error_message(tool_name, &catalog);
+        assert!(message.contains("not available in the current tool catalog"));
+        assert!(message.contains("allow_shell"), "{tool_name}: {message}");
+        assert!(
+            message.contains("trusted workspaces"),
+            "{tool_name}: {message}"
+        );
+        assert!(
+            message.contains(TOOL_SEARCH_BM25_NAME),
+            "{tool_name}: {message}"
+        );
+    }
+}
+
+#[test]
+fn missing_shell_tool_error_message_keeps_allow_shell_hint_with_suggestions() {
+    let catalog = vec![api_tool("exec")];
+
+    let message = missing_tool_error_message("exec_shell", &catalog);
+
+    assert!(message.contains("Did you mean:"));
+    assert!(message.contains("exec"));
+    assert!(message.contains("allow_shell"));
+    assert!(message.contains("trusted workspaces"));
     assert!(message.contains(TOOL_SEARCH_BM25_NAME));
 }
 

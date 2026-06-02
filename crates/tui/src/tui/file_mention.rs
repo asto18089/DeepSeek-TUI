@@ -166,7 +166,11 @@ pub fn find_file_mention_completions(
 /// captures the process CWD so the resolver and completion walker honor the
 /// user's launch directory when it differs from `--workspace`.
 fn workspace_for_app(app: &App) -> Workspace {
-    Workspace::with_cwd(app.workspace.clone(), std::env::current_dir().ok())
+    Workspace::with_cwd_and_depth(
+        app.workspace.clone(),
+        std::env::current_dir().ok(),
+        app.mention_walk_depth,
+    )
 }
 
 /// Resolve the `@`-mention completion popup contents for the current
@@ -197,16 +201,18 @@ pub fn visible_mention_menu_entries(app: &mut App, limit: usize) -> Vec<String> 
 
     let workspace = app.workspace.clone();
     let cwd = std::env::current_dir().ok();
+    let walk_depth = app.mention_walk_depth;
     if let Some(ref cache) = app.composer.mention_completion_cache
         && cache.workspace == workspace
         && cache.cwd == cwd
         && cache.partial == partial
         && cache.limit == limit
+        && cache.walk_depth == walk_depth
     {
         return cache.entries.clone();
     }
 
-    let ws = Workspace::with_cwd(workspace.clone(), cwd.clone());
+    let ws = Workspace::with_cwd_and_depth(workspace.clone(), cwd.clone(), walk_depth);
     let entries = find_file_mention_completions(&ws, &partial, limit);
 
     app.composer.mention_completion_cache = Some(MentionCompletionCache {
@@ -214,6 +220,7 @@ pub fn visible_mention_menu_entries(app: &mut App, limit: usize) -> Vec<String> 
         cwd,
         partial,
         limit,
+        walk_depth,
         entries: entries.clone(),
     });
 

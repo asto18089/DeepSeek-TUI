@@ -5,6 +5,7 @@ use ratatui::layout::Rect;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::localization::MessageId;
 use crate::tui::app::App;
 use crate::tui::command_palette::{
     CommandPaletteView, build_entries as build_command_palette_entries,
@@ -23,6 +24,8 @@ use crate::tui::ui::{
     copy_cell_to_clipboard, detail_target_label, open_context_inspector,
     open_details_pager_for_cell, open_pager_for_selection,
 };
+
+const COMPOSER_MOUSE_SCROLL_LINES: usize = 3;
 
 pub(crate) fn should_drop_loading_mouse_motion(app: &App, mouse: MouseEvent) -> bool {
     if !app.is_loading {
@@ -78,6 +81,68 @@ fn mouse_pos_to_char_index(app: &App, col: u16, row: u16, inner: Rect) -> Option
     Some(line_start + char_offset)
 }
 
+fn composer_wrapped_cursor_row_col(
+    input: &str,
+    cursor: usize,
+    wrapped: &[(usize, String)],
+) -> (usize, usize) {
+    let total = input.chars().count();
+    let cursor = cursor.min(total);
+
+    for (idx, (line_start, line_text)) in wrapped.iter().enumerate() {
+        let next_start = wrapped
+            .get(idx + 1)
+            .map(|(start, _)| *start)
+            .unwrap_or_else(|| total.saturating_add(1));
+
+        if cursor >= *line_start && cursor < next_start {
+            let line_len = line_text.chars().count();
+            return (idx, cursor.saturating_sub(*line_start).min(line_len));
+        }
+    }
+
+    let row = wrapped.len().saturating_sub(1);
+    let col = wrapped
+        .get(row)
+        .map(|(_, line_text)| line_text.chars().count())
+        .unwrap_or(0);
+    (row, col)
+}
+
+fn move_composer_cursor_by_wrapped_rows(app: &mut App, inner: Rect, rows: isize) {
+    if app.input.is_empty() || rows == 0 {
+        return;
+    }
+
+    let width = inner.width.max(1) as usize;
+    let wrapped = crate::tui::widgets::wrap_input_lines_for_mouse(&app.input, width);
+    if wrapped.len() <= 1 {
+        return;
+    }
+
+    let (current_row, current_col) =
+        composer_wrapped_cursor_row_col(&app.input, app.cursor_position, &wrapped);
+    let max_row = wrapped.len().saturating_sub(1);
+    let target_row = if rows.is_negative() {
+        current_row.saturating_sub(rows.unsigned_abs())
+    } else {
+        current_row.saturating_add(rows as usize).min(max_row)
+    };
+
+    if target_row == current_row {
+        return;
+    }
+
+    let (target_start, target_text) = &wrapped[target_row];
+    let target_len = target_text.chars().count();
+    let total = app.input.chars().count();
+    app.clear_selection();
+    app.cursor_position = target_start
+        .saturating_add(current_col.min(target_len))
+        .min(total);
+    app.needs_redraw = true;
+}
+
 /// Handle mouse events within the composer area.
 /// Returns true if the event was consumed.
 pub(crate) fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {
@@ -96,6 +161,18 @@ pub(crate) fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {
     let inner = app.viewport.last_composer_content.unwrap_or(area);
 
     match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            move_composer_cursor_by_wrapped_rows(
+                app,
+                inner,
+                -(COMPOSER_MOUSE_SCROLL_LINES as isize),
+            );
+            true
+        }
+        MouseEventKind::ScrollDown => {
+            move_composer_cursor_by_wrapped_rows(app, inner, COMPOSER_MOUSE_SCROLL_LINES as isize);
+            true
+        }
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(pos) = mouse_pos_to_char_index(app, mouse.column, mouse.row, inner) {
                 app.cursor_position = pos;
@@ -434,8 +511,13 @@ pub(crate) fn open_context_menu(app: &mut App, mouse: MouseEvent) {
     if entries.is_empty() {
         return;
     }
-    app.view_stack
-        .push(ContextMenuView::new(entries, mouse.column, mouse.row));
+    let title = app.tr(MessageId::CtxMenuTitle).to_string();
+    app.view_stack.push(ContextMenuView::new(
+        entries,
+        mouse.column,
+        mouse.row,
+        title,
+    ));
     app.needs_redraw = true;
 }
 
@@ -444,17 +526,17 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
 
     if selection_has_content(app) {
         entries.push(ContextMenuEntry {
-            label: "Copy selection".to_string(),
-            description: "write selected transcript text".to_string(),
+            label: app.tr(MessageId::CtxMenuCopySelection).to_string(),
+            description: app.tr(MessageId::CtxMenuCopySelectionDesc).to_string(),
             action: ContextMenuAction::CopySelection,
         });
         entries.push(ContextMenuEntry {
-            label: "Open selection".to_string(),
-            description: "show selected text in pager".to_string(),
+            label: app.tr(MessageId::CtxMenuOpenSelection).to_string(),
+            description: app.tr(MessageId::CtxMenuOpenSelectionDesc).to_string(),
             action: ContextMenuAction::OpenSelection,
         });
         entries.push(ContextMenuEntry {
-            label: "Clear selection".to_string(),
+            label: app.tr(MessageId::CtxMenuClearSelection).to_string(),
             description: String::new(),
             action: ContextMenuAction::ClearSelection,
         });
@@ -474,31 +556,31 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
             .map(|label| truncate_line_to_width(label.as_str(), 28))
             .unwrap_or_else(|| "message".to_string());
         entries.push(ContextMenuEntry {
-            label: "Open details".to_string(),
+            label: app.tr(MessageId::CtxMenuOpenDetails).to_string(),
             description: target,
             action: ContextMenuAction::OpenDetails { cell_index },
         });
         entries.push(ContextMenuEntry {
-            label: "Copy message".to_string(),
-            description: "write clicked transcript cell".to_string(),
+            label: app.tr(MessageId::CtxMenuCopyMessage).to_string(),
+            description: app.tr(MessageId::CtxMenuCopyMessageDesc).to_string(),
             action: ContextMenuAction::CopyCell { cell_index },
         });
         entries.push(ContextMenuEntry {
-            label: "Open in editor".to_string(),
-            description: "open file:line in $EDITOR".to_string(),
+            label: app.tr(MessageId::CtxMenuOpenInEditor).to_string(),
+            description: app.tr(MessageId::CtxMenuOpenInEditorDesc).to_string(),
             action: ContextMenuAction::OpenFileAtLine { cell_index },
         });
         // Hide/show cell toggle.
         if app.collapsed_cells.contains(&cell_index) {
             entries.push(ContextMenuEntry {
-                label: "Show cell".to_string(),
-                description: "unhide this transcript cell".to_string(),
+                label: app.tr(MessageId::CtxMenuShowCell).to_string(),
+                description: app.tr(MessageId::CtxMenuShowCellDesc).to_string(),
                 action: ContextMenuAction::ShowCell { cell_index },
             });
         } else {
             entries.push(ContextMenuEntry {
-                label: "Hide cell".to_string(),
-                description: "collapse this transcript cell".to_string(),
+                label: app.tr(MessageId::CtxMenuHideCell).to_string(),
+                description: app.tr(MessageId::CtxMenuHideCellDesc).to_string(),
                 action: ContextMenuAction::HideCell { cell_index },
             });
         }
@@ -507,31 +589,32 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
     // When cells are hidden, offer a way to show them all.
     if !app.collapsed_cells.is_empty() {
         let count = app.collapsed_cells.len();
+        let label = app.tr(MessageId::CtxMenuShowHidden).to_string();
         entries.push(ContextMenuEntry {
-            label: format!("Show hidden ({count})"),
-            description: "unhide all collapsed cells".to_string(),
+            label: format!("{label} ({count})"),
+            description: app.tr(MessageId::CtxMenuShowHiddenDesc).to_string(),
             action: ContextMenuAction::ShowAllHidden,
         });
     }
 
     entries.push(ContextMenuEntry {
-        label: "Paste".to_string(),
-        description: "insert clipboard into composer".to_string(),
+        label: app.tr(MessageId::CtxMenuPaste).to_string(),
+        description: app.tr(MessageId::CtxMenuPasteDesc).to_string(),
         action: ContextMenuAction::Paste,
     });
     entries.push(ContextMenuEntry {
-        label: "Command palette".to_string(),
-        description: "commands, skills, and tools".to_string(),
+        label: app.tr(MessageId::CtxMenuCmdPalette).to_string(),
+        description: app.tr(MessageId::CtxMenuCmdPaletteDesc).to_string(),
         action: ContextMenuAction::OpenCommandPalette,
     });
     entries.push(ContextMenuEntry {
-        label: "Context inspector".to_string(),
-        description: "active context and cache hints".to_string(),
+        label: app.tr(MessageId::CtxMenuContextInspector).to_string(),
+        description: app.tr(MessageId::CtxMenuContextInspectorDesc).to_string(),
         action: ContextMenuAction::OpenContextInspector,
     });
     entries.push(ContextMenuEntry {
-        label: "Help".to_string(),
-        description: "keybindings and commands".to_string(),
+        label: app.tr(MessageId::CtxMenuHelp).to_string(),
+        description: app.tr(MessageId::CtxMenuHelpDesc).to_string(),
         action: ContextMenuAction::OpenHelp,
     });
 

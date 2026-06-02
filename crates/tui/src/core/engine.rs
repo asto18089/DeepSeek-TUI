@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -41,6 +41,7 @@ use crate::models::{
     MessageRequest, StreamEvent, SystemPrompt, Tool, Usage,
 };
 use crate::prompts;
+use crate::purge::{emit_purge_completed, emit_purge_failed, emit_purge_started, run_purge};
 use crate::seam_manager::{SeamConfig, SeamManager};
 use crate::tools::goal::{SharedGoalState, new_shared_goal_state};
 use crate::tools::plan::{SharedPlanState, new_shared_plan_state};
@@ -91,16 +92,14 @@ pub struct EngineConfig {
     pub mcp_config_path: PathBuf,
     /// Directory containing discoverable skills.
     pub skills_dir: PathBuf,
-    /// Additional instruction files concatenated into the system
     /// Sources injected as `<instructions source="…">` blocks in the system
     /// prompt (#454). Each entry is either a disk path (read at render time)
     /// or an inline string. Loaded in declared order from the user's
     /// `instructions = [...]` config or constructed by embedders.
     ///
-    /// pinvou3 fork (P-no-disk): originally `Vec<PathBuf>`, generalized to
-    /// `Vec<InstructionSource>` so embedders can inject inline content without
-    /// staging a disk file. `From<PathBuf>` impl keeps existing callers working
-    /// with `.into()`.
+    /// Generalized from `Vec<PathBuf>` so embedders can inject inline content
+    /// without staging a disk file. `From<PathBuf>` impl keeps existing callers
+    /// working with `.into()` at the call site.
     pub instructions: Vec<crate::prompts::InstructionSource>,
     pub project_context_pack_enabled: bool,
     /// When true, the model is instructed to respond in the current locale
@@ -164,6 +163,9 @@ pub struct EngineConfig {
     pub memory_path: PathBuf,
     pub vision_config: Option<crate::config::VisionModelConfig>,
     pub goal_objective: Option<String>,
+    /// Tool restriction from custom slash command frontmatter.
+    /// `None` means the current turn may use the normal tool set.
+    pub allowed_tools: Option<Vec<String>>,
     /// Resolved BCP-47 locale tag (e.g. `"en"`, `"zh-Hans"`, `"ja"`)
     /// for the `## Environment` block in the system prompt. The
     /// caller resolves this from `Settings` once at engine
@@ -176,8 +178,9 @@ pub struct EngineConfig {
     pub workshop: Option<crate::tools::large_output_router::WorkshopConfig>,
     /// Which search backend `web_search` should use. Default: DuckDuckGo.
     pub search_provider: crate::config::SearchProvider,
-    /// API key for Tavily, Bocha, or Metaso. `None` for Bing or DuckDuckGo.
+    /// API key for Tavily, Bocha, Metaso, or Baidu. `None` for Bing or DuckDuckGo.
     /// Metaso also falls back to `METASO_API_KEY` env var, then a built-in key.
+    /// Baidu also falls back to `BAIDU_SEARCH_API_KEY`.
     pub search_api_key: Option<String>,
     /// Per-step DeepSeek API timeout for sub-agent `create_message` requests.
     /// Resolved from `[subagents] api_timeout_secs` (clamped to 1..=1800)
@@ -191,6 +194,10 @@ pub struct EngineConfig {
     /// through bubblewrap instead of relying solely on Landlock (#2184).
     #[allow(dead_code)] // Wired through ShellManager in follow-up PR
     pub prefer_bwrap: bool,
+    /// Tool override and plugin configuration (`[tools]` table in config.toml).
+    /// Applied to the per-turn tool registry after built-in tools are registered.
+    /// When `None`, no overrides or plugin loading occurs.
+    pub tools: Option<crate::config::ToolsConfig>,
 }
 
 impl Default for EngineConfig {
@@ -229,6 +236,7 @@ impl Default for EngineConfig {
             vision_config: None,
             strict_tool_mode: false,
             goal_objective: None,
+            allowed_tools: None,
             locale_tag: "en".to_string(),
             workshop: None,
             search_provider: crate::config::SearchProvider::default(),
@@ -238,6 +246,7 @@ impl Default for EngineConfig {
             ),
             tools_always_load: HashSet::new(),
             prefer_bwrap: false,
+            tools: None,
         }
     }
 }
@@ -355,6 +364,10 @@ pub struct Engine {
     /// Diagnostics collected during the current step's tool calls. Drained
     /// and forwarded as a synthetic user message before the next API call.
     pending_lsp_blocks: Vec<crate::lsp::DiagnosticBlock>,
+    /// Cached SlopLedger gate block keyed by the ledger file's modified time.
+    /// This keeps prompt refreshes cheap while still noticing append/update
+    /// writes from slop ledger tools during the same session.
+    slop_ledger_gate_cache: Option<(Option<SystemTime>, Option<String>)>,
 }
 
 // === Internal tool helpers ===
@@ -392,9 +405,12 @@ impl Engine {
             ApiProvider::Openai => "OPENAI_API_KEY",
             ApiProvider::Atlascloud => "ATLASCLOUD_API_KEY",
             ApiProvider::WanjieArk => "WANJIE_ARK_API_KEY/WANJIE_API_KEY/WANJIE_MAAS_API_KEY",
+            ApiProvider::Volcengine => "VOLCENGINE_API_KEY/VOLCENGINE_ARK_API_KEY/ARK_API_KEY",
             ApiProvider::Openrouter => "OPENROUTER_API_KEY",
+            ApiProvider::XiaomiMimo => "XIAOMI_MIMO_API_KEY/XIAOMI_API_KEY/MIMO_API_KEY",
             ApiProvider::Novita => "NOVITA_API_KEY",
             ApiProvider::Fireworks => "FIREWORKS_API_KEY",
+            ApiProvider::Siliconflow => "SILICONFLOW_API_KEY",
             ApiProvider::Moonshot => "MOONSHOT_API_KEY/KIMI_API_KEY",
             ApiProvider::Sglang => "SGLANG_API_KEY",
             ApiProvider::Vllm => "VLLM_API_KEY",
@@ -404,7 +420,7 @@ impl Engine {
         Some(format!(
             "The rejected key came from {env_var}; no saved config key is present.\n\
              Run `codewhale auth status` to inspect credential sources, then \
-             `codewhale auth set --provider {provider}` to save a valid key in ~/.deepseek/config.toml, \
+             `codewhale auth set --provider {provider}` to save a valid key in ~/.codewhale/config.toml, \
              or remove the stale export and open a fresh shell.",
             provider = provider.as_str()
         ))
@@ -595,6 +611,7 @@ impl Engine {
             turn_counter: 0,
             lsp_manager,
             pending_lsp_blocks: Vec::new(),
+            slop_ledger_gate_cache: None,
             workshop_vars,
             sandbox_backend,
         };
@@ -632,6 +649,7 @@ impl Engine {
                     approval_mode,
                     translation_enabled,
                     show_thinking,
+                    allowed_tools,
                 } => {
                     self.handle_send_message(
                         content,
@@ -647,6 +665,7 @@ impl Engine {
                         approval_mode,
                         translation_enabled,
                         show_thinking,
+                        allowed_tools,
                     )
                     .await;
                 }
@@ -683,6 +702,12 @@ impl Engine {
                         continue;
                     };
 
+                    let mcp_pool = if self.config.features.enabled(Feature::Mcp) {
+                        self.ensure_mcp_pool().await.ok()
+                    } else {
+                        None
+                    };
+
                     let mut runtime = SubAgentRuntime::new(
                         client,
                         self.session.model.clone(),
@@ -700,6 +725,7 @@ impl Engine {
                     )
                     .with_max_spawn_depth(self.config.max_spawn_depth)
                     .with_step_api_timeout(self.config.subagent_api_timeout)
+                    .with_mcp_pool(mcp_pool)
                     .background_runtime();
                     let route = resolve_subagent_assignment_route(
                         &runtime,
@@ -821,6 +847,9 @@ impl Engine {
                 Op::CompactContext => {
                     self.handle_manual_compaction().await;
                 }
+                Op::PurgeContext => {
+                    self.handle_purge().await;
+                }
                 Op::EditLastTurn { new_message } => {
                     // #383: /edit — remove the last user+assistant exchange
                     // from the session, then re-send with the new content.
@@ -854,6 +883,7 @@ impl Engine {
                         self.session.approval_mode,
                         self.config.translation_enabled,
                         self.config.show_thinking,
+                        self.config.allowed_tools.clone(),
                     )
                     .await;
                 }
@@ -892,7 +922,13 @@ impl Engine {
         self.emit_session_updated().await;
     }
 
-    fn turn_metadata_block(&self) -> ContentBlock {
+    fn turn_metadata_block(
+        &self,
+        routed_model: &str,
+        auto_model: bool,
+        reasoning_effort: Option<&str>,
+        reasoning_effort_auto: bool,
+    ) -> ContentBlock {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let working_set_summary = self
             .session
@@ -901,11 +937,17 @@ impl Engine {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let summary = if let Some(working_set_summary) = working_set_summary {
-            format!("Current local date: {today}\n{working_set_summary}")
-        } else {
-            format!("Current local date: {today}")
-        };
+        let mut lines = vec![format!("Current local date: {today}")];
+        if auto_model {
+            lines.push(format!("Auto model route: {routed_model}"));
+        }
+        if reasoning_effort_auto && let Some(reasoning_effort) = reasoning_effort {
+            lines.push(format!("Auto reasoning effort: {reasoning_effort}"));
+        }
+        if let Some(working_set_summary) = working_set_summary {
+            lines.push(working_set_summary);
+        }
+        let summary = lines.join("\n");
 
         ContentBlock::Text {
             text: format!("<turn_meta>\n{summary}\n</turn_meta>"),
@@ -914,10 +956,32 @@ impl Engine {
     }
 
     fn user_text_message_with_turn_metadata(&self, text: String) -> Message {
+        self.user_text_message_with_turn_metadata_for_route(
+            text,
+            &self.session.model,
+            self.session.auto_model,
+            self.session.reasoning_effort.as_deref(),
+            self.session.reasoning_effort_auto,
+        )
+    }
+
+    fn user_text_message_with_turn_metadata_for_route(
+        &self,
+        text: String,
+        routed_model: &str,
+        auto_model: bool,
+        reasoning_effort: Option<&str>,
+        reasoning_effort_auto: bool,
+    ) -> Message {
         Message {
             role: "user".to_string(),
             content: vec![
-                self.turn_metadata_block(),
+                self.turn_metadata_block(
+                    routed_model,
+                    auto_model,
+                    reasoning_effort,
+                    reasoning_effort_auto,
+                ),
                 ContentBlock::Text {
                     text,
                     cache_control: None,
@@ -943,6 +1007,7 @@ impl Engine {
         approval_mode: crate::tui::approval::ApprovalMode,
         translation_enabled: bool,
         show_thinking: bool,
+        allowed_tools: Option<Vec<String>>,
     ) {
         // Reset cancel token for fresh turn (in case previous was cancelled)
         self.reset_cancel_token();
@@ -970,7 +1035,7 @@ impl Engine {
         // failure is non-fatal (the helper logs at WARN).
         if self.config.snapshots_enabled {
             // Clone the user prompt now — `content` is moved into
-            // `user_text_message_with_turn_metadata` below, so we need
+            // `user_text_message_with_turn_metadata_for_route` below, so we need
             // a copy for both pre- and post-turn snapshot labels. The
             // label carries a truncated first line so `/restore`
             // listings are human-readable.
@@ -991,7 +1056,7 @@ impl Engine {
         crate::retry_status::clear();
 
         // Clone user prompt for post-turn snapshot label before `content`
-        // is moved into `user_text_message_with_turn_metadata` below.
+        // is moved into `user_text_message_with_turn_metadata_for_route` below.
         let snapshot_prompt_post = content.clone();
 
         // Check if we have the appropriate client
@@ -1011,6 +1076,8 @@ impl Engine {
                     usage: turn.usage.clone(),
                     status: TurnOutcomeStatus::Failed,
                     error: Some(message),
+                    tool_catalog: None,
+                    base_url: None,
                 })
                 .await;
             return;
@@ -1022,7 +1089,13 @@ impl Engine {
         let force_update_plan_first = should_force_update_plan_first(mode, &content);
 
         // Add user message to session
-        let user_msg = self.user_text_message_with_turn_metadata(content);
+        let user_msg = self.user_text_message_with_turn_metadata_for_route(
+            content,
+            &model,
+            auto_model,
+            reasoning_effort.as_deref(),
+            reasoning_effort_auto,
+        );
         self.session.add_message(user_msg);
 
         let previous_goal_objective = self.config.goal_objective.clone();
@@ -1040,6 +1113,7 @@ impl Engine {
                 false,
             );
         }
+        self.config.allowed_tools = allowed_tools;
         self.session.reasoning_effort = reasoning_effort;
         self.session.reasoning_effort_auto = reasoning_effort_auto;
         self.session.auto_model = auto_model;
@@ -1119,7 +1193,13 @@ impl Engine {
             None
         };
 
-        let tool_registry = match mode {
+        let mcp_pool = if self.config.features.enabled(Feature::Mcp) {
+            self.ensure_mcp_pool().await.ok()
+        } else {
+            None
+        };
+
+        let mut tool_registry = match mode {
             AppMode::Agent | AppMode::Yolo => {
                 if self.config.features.enabled(Feature::Subagents) {
                     let runtime = if let Some(client) = self.deepseek_client.clone() {
@@ -1139,6 +1219,7 @@ impl Engine {
                         )
                         .with_max_spawn_depth(self.config.max_spawn_depth)
                         .with_step_api_timeout(self.config.subagent_api_timeout)
+                        .with_mcp_pool(mcp_pool.clone())
                         .with_parent_completion_tx(self.tx_subagent_completion.clone());
                         if let Some(context) = fork_context_for_runtime.clone() {
                             rt = rt.with_fork_context(context);
@@ -1167,19 +1248,39 @@ impl Engine {
             _ => Some(builder.build(tool_context)),
         };
 
+        // Load plugin tools from the user's tools directory and apply any
+        // config.toml overrides. Explicit overrides win over auto-discovered
+        // scripts with the same tool name.
+        let mut plugin_tool_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        if let Some(ref mut tool_registry) = tool_registry {
+            plugin_tool_names = configure_plugin_tools(tool_registry, self.config.tools.as_ref());
+        }
+
         let mcp_tools = if self.config.features.enabled(Feature::Mcp) {
             self.mcp_tools().await
         } else {
             Vec::new()
         };
         let tools = tool_registry.as_ref().map(|registry| {
-            build_model_tool_catalog(
+            let mut catalog = build_model_tool_catalog(
                 registry.to_api_tools_with_cache(true),
                 mcp_tools,
                 mode,
                 &self.config.tools_always_load,
-            )
+            );
+            for tool in &mut catalog {
+                if plugin_tool_names.contains(&tool.name) {
+                    tool.defer_loading = Some(false);
+                }
+            }
+            catalog
         });
+        let tool_catalog_for_event = tools.clone();
+        let base_url_for_event = self
+            .deepseek_client
+            .as_ref()
+            .map(|client| client.base_url().to_string());
 
         // Main turn loop
         let (status, error) = self
@@ -1213,6 +1314,8 @@ impl Engine {
                 usage: turn.usage,
                 status,
                 error,
+                tool_catalog: tool_catalog_for_event,
+                base_url: base_url_for_event,
             })
             .await;
 
@@ -1258,6 +1361,8 @@ impl Engine {
                     usage: zero_usage,
                     status: TurnOutcomeStatus::Failed,
                     error: Some(message),
+                    tool_catalog: None,
+                    base_url: None,
                 })
                 .await;
             return;
@@ -1335,6 +1440,89 @@ impl Engine {
                 usage: zero_usage,
                 status: turn_status,
                 error: turn_error,
+                tool_catalog: None,
+                base_url: None,
+            })
+            .await;
+    }
+
+    async fn handle_purge(&mut self) {
+        let zero_usage = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            ..Usage::default()
+        };
+        let Some(client) = self.deepseek_client.clone() else {
+            let message = "Purge unavailable: API client not configured".to_string();
+            emit_purge_failed(&self.tx_event, message.clone()).await;
+            let _ = self
+                .tx_event
+                .send(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
+                .await;
+            let _ = self
+                .tx_event
+                .send(Event::TurnComplete {
+                    usage: zero_usage,
+                    status: TurnOutcomeStatus::Failed,
+                    error: Some(message),
+                    tool_catalog: None,
+                    base_url: None,
+                })
+                .await;
+            return;
+        };
+
+        emit_purge_started(
+            &self.tx_event,
+            "Agent context purge in progress\u{2026}".to_string(),
+        )
+        .await;
+        let messages_before = self.session.messages.len();
+
+        let (status, error) = match run_purge(
+            &client,
+            &self.session.messages,
+            &self.session.model,
+            self.session.reasoning_effort.clone(),
+            effective_max_output_tokens(&self.session.model),
+        )
+        .await
+        {
+            Ok(result) => {
+                let messages_after = result.messages.len();
+                self.session.messages = result.messages;
+                self.emit_session_updated().await;
+
+                let summary = format!(
+                    "Purge complete: {messages_before} → {messages_after} messages \
+                         ({} removed, {} condensed)",
+                    result.removed_count, result.replaced_count,
+                );
+                emit_purge_completed(
+                    &self.tx_event,
+                    messages_before,
+                    messages_after,
+                    result.removed_count,
+                    result.replaced_count,
+                    summary,
+                )
+                .await;
+                (TurnOutcomeStatus::Completed, None)
+            }
+            Err(e) => {
+                emit_purge_failed(&self.tx_event, e.clone()).await;
+                (TurnOutcomeStatus::Failed, Some(e))
+            }
+        };
+
+        let _ = self
+            .tx_event
+            .send(Event::TurnComplete {
+                usage: zero_usage,
+                status,
+                error,
+                tool_catalog: None,
+                base_url: None,
             })
             .await;
     }
@@ -1898,8 +2086,20 @@ impl Engine {
             },
             self.session.approval_mode,
         );
-        let stable_prompt =
+        let mut stable_prompt =
             merge_system_prompts(Some(&base), self.session.compaction_summary_prompt.clone());
+
+        // SlopLedger completion-gate: inject unresolved slop entries into the
+        // system prompt so the agent can autonomously review them before
+        // claiming the task is done (#2127).
+        let gate_block = self.slop_ledger_gate_block();
+        if let Some(ref block) = gate_block
+            && let Some(SystemPrompt::Text(prompt_text)) = &mut stable_prompt
+        {
+            prompt_text.push_str("\n\n");
+            prompt_text.push_str(block);
+        }
+
         let stable_hash = system_prompt_hash(stable_prompt.as_ref());
         if self.session.system_prompt_override {
             self.session.last_system_prompt_hash = Some(stable_hash);
@@ -1911,6 +2111,38 @@ impl Engine {
         }
     }
 
+    fn slop_ledger_gate_block(&mut self) -> Option<String> {
+        let modified = crate::slop_ledger::SlopLedger::default_path()
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|metadata| metadata.modified().ok());
+
+        if let Some((cached_modified, cached_block)) = &self.slop_ledger_gate_cache
+            && *cached_modified == modified
+        {
+            return cached_block.clone();
+        }
+
+        let loaded = crate::slop_ledger::SlopLedger::load()
+            .ok()
+            .and_then(|ledger| {
+                if ledger.has_open_entries() {
+                    ledger.completion_gate_summary()
+                } else {
+                    None
+                }
+            });
+        self.slop_ledger_gate_cache = Some((modified, loaded.clone()));
+        loaded
+    }
+
+    /// Merge a compaction summary into the system prompt.
+    ///
+    /// **Zone affiliation (#2264)**: this mutates the system prompt, which is
+    /// part of the `PinnedPrefix` zone in the three-zone contract. Compaction
+    /// is the one intentional mid-session prefix mutation — the engine
+    /// intentionally accepts the cache-invalidation cost because the
+    /// context-reduction benefit outweighs it.
     fn merge_compaction_summary(&mut self, summary_prompt: Option<SystemPrompt>) {
         if summary_prompt.is_none() {
             return;
@@ -1923,6 +2155,50 @@ impl Engine {
         self.session.last_system_prompt_hash = Some(system_prompt_hash(merged.as_ref()));
         self.session.system_prompt = merged;
     }
+}
+
+fn default_plugin_tools_dir() -> PathBuf {
+    codewhale_config::codewhale_home()
+        .unwrap_or_else(|_| {
+            dirs::home_dir().map_or_else(|| PathBuf::from(".codewhale"), |h| h.join(".codewhale"))
+        })
+        .join("tools")
+}
+
+fn plugin_tools_dir(tools_config: Option<&crate::config::ToolsConfig>) -> PathBuf {
+    if let Some(tools_config) = tools_config
+        && let Some(custom_dir) = tools_config.plugin_dir.as_deref()
+    {
+        return PathBuf::from(shellexpand::tilde(custom_dir).as_ref());
+    }
+    default_plugin_tools_dir()
+}
+
+fn configure_plugin_tools(
+    tool_registry: &mut crate::tools::ToolRegistry,
+    tools_config: Option<&crate::config::ToolsConfig>,
+) -> std::collections::HashSet<String> {
+    let names_before: std::collections::HashSet<String> = tool_registry
+        .names()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let plugin_dir = plugin_tools_dir(tools_config);
+    tool_registry.load_plugins(&plugin_dir);
+
+    if let Some(tools_config) = tools_config
+        && let Some(ref overrides) = tools_config.overrides
+    {
+        tool_registry.apply_overrides(overrides, &plugin_dir);
+    }
+
+    let names_after: std::collections::HashSet<String> = tool_registry
+        .names()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+    &names_after - &names_before
 }
 
 fn system_prompt_hash(prompt: Option<&SystemPrompt>) -> u64 {
@@ -2091,6 +2367,10 @@ mod tool_execution;
 mod tool_setup;
 mod turn_loop;
 
+pub(crate) fn default_active_native_tool_names() -> &'static [&'static str] {
+    tool_catalog::DEFAULT_ACTIVE_NATIVE_TOOLS
+}
+
 use self::approval::{ApprovalDecision, ApprovalResult, UserInputDecision};
 #[cfg(test)]
 use self::dispatch::should_parallelize_tool_batch;
@@ -2122,7 +2402,7 @@ use self::tool_catalog::{
 };
 #[cfg(test)]
 use self::tool_catalog::{
-    TOOL_SEARCH_BM25_NAME, maybe_activate_requested_deferred_tool,
+    TOOL_SEARCH_BM25_NAME, TOOL_SEARCH_REGEX_NAME, maybe_activate_requested_deferred_tool,
     pinvou3_should_defer_native_tool, preflight_requested_deferred_tool, should_default_defer_tool,
 };
 use self::tool_execution::emit_tool_audit;

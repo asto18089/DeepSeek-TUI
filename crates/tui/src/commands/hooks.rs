@@ -3,7 +3,7 @@
 //!
 //! The full picker / persisted enable-disable surface in #460 is
 //! still M-sized. This MVP gives the user a no-typing view of what's
-//! actually configured in `~/.deepseek/config.toml`'s `[hooks]`
+//! actually configured in `~/.codewhale/config.toml`'s `[hooks]`
 //! table — the most-asked question once hooks start firing.
 
 use crate::hooks::HookEvent;
@@ -45,7 +45,7 @@ fn events() -> CommandResult {
         (HookEvent::SessionEnd, "fires once on graceful shutdown"),
         (
             HookEvent::MessageSubmit,
-            "fires when the user submits a turn (before model dispatch)",
+            "fires before model dispatch; can transform or block submitted text",
         ),
         (
             HookEvent::ToolCallBefore,
@@ -74,7 +74,7 @@ fn list(app: &App) -> CommandResult {
     let config = app.hooks.config();
     if config.hooks.is_empty() {
         return CommandResult::message(
-            "No hooks configured. Add a `[[hooks.hooks]]` entry to `~/.deepseek/config.toml` to define one.",
+            "No hooks configured. Add a `[[hooks.hooks]]` entry to `~/.codewhale/config.toml` to define one.",
         );
     }
 

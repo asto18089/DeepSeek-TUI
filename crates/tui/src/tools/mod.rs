@@ -34,6 +34,7 @@ pub mod pandoc;
 pub mod parallel;
 pub mod pinvou3_blocklist;
 pub mod plan;
+pub mod plugin;
 pub mod project;
 pub mod recall_archive;
 pub mod registry;

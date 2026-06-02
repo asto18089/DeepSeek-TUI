@@ -62,14 +62,13 @@ fn release_resident_leases_for(agent_id: &str) {
     }
 }
 
-// [pinvou3-fork] C+: 100→20。参考 CrewAI Agent(max_iter=15) / OpenHands max_iterations=30 折中。
-// 100 步太宽,弱模型可能死磕 17+ 分钟。20 步足够 single-task subagent,且 cargo test 内可结束。
-// 注:上游 #2034 改为 `u32::MAX`(取消固定 cap,靠 explicit budget / final-response 终止)。
-// pinvou3 保留固定 cap 作本地弱模型(Qwen3.6)死磕兜底;subagent owner 可评估是否跟进 u32::MAX。
+/// Default maximum steps for sub-agent loops. Upstream removed the fixed cap
+/// (#2034, `u32::MAX`), but pinvou3 keeps a hard bound for local weak models.
+/// [pinvou3-fork] C+: 100→20。参考 CrewAI Agent(max_iter=15) / OpenHands
+/// max_iterations=30 折中,防弱模型(本地 Qwen)死磕拖垮整个任务。
 const DEFAULT_MAX_STEPS: u32 = 20;
-// [pinvou3-fork] C: 单 subagent 内部 elapsed 硬上限 300s (5min)。参考 CrewAI Task(max_execution_time=300)。
-// 防 subagent 内部死磕反复重试任何场景 (web_search 失败 / LLM verbose / tool 卡死)。
-// (上游 #2034 一并移除了 elapsed cap;pinvou3 保留。)
+/// [pinvou3-fork] C: 单 subagent 内部 elapsed 硬上限 300s (5min)。参考 CrewAI
+/// Task(max_execution_time=300),配合 DEFAULT_MAX_STEPS 防死磕。
 const DEFAULT_SUBAGENT_ELAPSED_MAX: Duration = Duration::from_secs(300);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Per-step LLM API call timeout. Each `create_message` request must complete
@@ -435,7 +434,6 @@ impl SubAgentType {
                 "list_dir",
                 "read_file",
                 "write_file",
-                "append_file",
                 "edit_file",
                 "apply_patch",
                 "grep_files",
@@ -493,7 +491,6 @@ impl SubAgentType {
                 "list_dir",
                 "read_file",
                 "write_file",
-                "append_file",
                 "edit_file",
                 "apply_patch",
                 "grep_files",
@@ -791,6 +788,8 @@ pub struct SubAgentRuntime {
     pub parent_completion_tx: Option<mpsc::UnboundedSender<SubAgentCompletion>>,
     /// Snapshot of the request prefix visible to an opt-in forked child.
     pub fork_context: Option<SubAgentForkContext>,
+    /// The parent's MCP pool if available.
+    pub mcp_pool: Option<std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpPool>>>,
     /// Per-step DeepSeek API timeout for the child's `create_message` call.
     /// Resolved from `[subagents] api_timeout_secs` (clamped to 1..=1800) at
     /// engine construction so a slow but legitimate model turn does not
@@ -830,8 +829,19 @@ impl SubAgentRuntime {
             mailbox: None,
             parent_completion_tx: None,
             fork_context: None,
+            mcp_pool: None,
             step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
         }
+    }
+
+    /// Attach an MCP pool so the subagent can execute MCP tools.
+    #[must_use]
+    pub fn with_mcp_pool(
+        mut self,
+        pool: Option<std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpPool>>>,
+    ) -> Self {
+        self.mcp_pool = pool;
+        self
     }
 
     /// Override the per-step DeepSeek API timeout (default
@@ -964,6 +974,7 @@ impl SubAgentRuntime {
             mailbox: self.mailbox.clone(),
             parent_completion_tx: self.parent_completion_tx.clone(),
             fork_context: self.fork_context.clone(),
+            mcp_pool: self.mcp_pool.clone(),
             step_api_timeout: self.step_api_timeout,
         }
     }
@@ -4808,17 +4819,21 @@ impl SubAgentToolRegistry {
         // review, RLM, sub-agent management (so grandchildren can spawn),
         // plus per-child fresh todo/plan state.
         let context = runtime.context.clone();
-        let registry = ToolRegistryBuilder::new()
-            .with_full_agent_surface(
-                Some(runtime.client.clone()),
-                runtime.model.clone(),
-                runtime.manager.clone(),
-                runtime.clone(),
-                runtime.allow_shell,
-                todo_list,
-                plan_state,
-            )
-            .build(context);
+        let mut registry = ToolRegistryBuilder::new().with_full_agent_surface(
+            Some(runtime.client.clone()),
+            runtime.model.clone(),
+            runtime.manager.clone(),
+            runtime.clone(),
+            runtime.allow_shell,
+            todo_list,
+            plan_state,
+        );
+
+        if let Some(pool) = runtime.mcp_pool.as_ref() {
+            registry = registry.with_mcp_tools(std::sync::Arc::clone(pool));
+        }
+
+        let registry = registry.build(context);
 
         Self {
             allowed_tools: explicit_allowed_tools,
@@ -5035,8 +5050,6 @@ const GENERAL_AGENT_INTRO: &str = concat!(
     "You are a general-purpose sub-agent spawned to handle a specific task autonomously.\n",
     "Stay inside the assigned scope; put adjacent work under RISKS/BLOCKERS.\n",
     "Plan multi-step work with `checklist_write`; add `update_plan` for complex strategy.\n",
-    // [pinvou3-fork] 加 stop-on-failure 条款,防止弱模型在外部 API 不可达 / 工具失败时
-    // 死磕反复重试(observed:Qwen3.6 子 agent 反复 retry web_search Bing 直到 5+ 分钟超时)。
     "**Stop quickly on failure**: if the same tool call fails 2 times in a row, stop retrying and return what you have so far with a one-line note explaining what's missing. Do not loop on impossible queries (e.g. external API unreachable, rate-limited, or returning empty).\n",
     "**Bounded effort**: prefer one focused attempt over many speculative retries. If you cannot complete the task with available data within 3-5 tool calls, return your current partial findings — the parent agent can compensate with its own knowledge.\n\n"
 );

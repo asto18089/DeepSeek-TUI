@@ -3,7 +3,9 @@
 use std::fmt::Write;
 use std::path::PathBuf;
 
-use crate::config::{COMMON_DEEPSEEK_MODELS, normalize_model_name_for_provider};
+use crate::config::{
+    COMMON_DEEPSEEK_MODELS, normalize_custom_model_id, normalize_model_name_for_provider,
+};
 use crate::localization::{MessageId, tr};
 use crate::tui::app::{App, AppAction, AppMode, ReasoningEffort};
 use crate::tui::views::{HelpView, ModalKind, SubAgentsView, subagent_view_agents};
@@ -100,6 +102,9 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     app.session.last_reasoning_replay_tokens = None;
     app.session.turn_cache_history.clear();
     app.session.last_cache_inspection = None;
+    app.session.last_warmup_key = None;
+    app.session.last_tool_catalog = None;
+    app.session.last_base_url = None;
     todos_cleared
 }
 
@@ -135,11 +140,21 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
                 AppAction::UpdateCompaction(app.compaction_config()),
             );
         }
-        let Some(model_id) = normalize_model_name_for_provider(app.api_provider, name) else {
-            return CommandResult::error(format!(
-                "Invalid model '{name}'. Expected auto or a DeepSeek model ID. Common models: {}",
-                COMMON_DEEPSEEK_MODELS.join(", ")
-            ));
+        let model_id = if app.accepts_custom_model_ids() {
+            let Some(model_id) = normalize_custom_model_id(name) else {
+                return CommandResult::error(format!(
+                    "Invalid model '{name}'. Expected a non-empty model ID."
+                ));
+            };
+            model_id
+        } else {
+            let Some(model_id) = normalize_model_name_for_provider(app.api_provider, name) else {
+                return CommandResult::error(format!(
+                    "Invalid model '{name}'. Expected auto or a DeepSeek model ID. Common models: {}",
+                    COMMON_DEEPSEEK_MODELS.join(", ")
+                ));
+            };
+            model_id
         };
         let old_model = app.model_display_label();
         let model_changed = app.auto_model || app.model != model_id;
@@ -185,7 +200,7 @@ pub fn profile_switch(_app: &mut App, arg: Option<&str>) -> CommandResult {
         Some(name) if !name.trim().is_empty() => name.trim().to_string(),
         _ => {
             return CommandResult::error(
-                "Usage: /profile <name>\n\nSwitch to a named config profile. Profiles are defined in ~/.deepseek/config.toml under [profiles] sections.",
+                "Usage: /profile <name>\n\nSwitch to a named config profile. Profiles are defined in ~/.codewhale/config.toml under [profiles] sections.",
             );
         }
     };
@@ -418,6 +433,7 @@ mod tests {
         let mut app = App::new(options, &Config::default());
         app.ui_locale = crate::localization::Locale::En;
         app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.model_ids_passthrough = false;
         app
     }
 
@@ -546,9 +562,13 @@ mod tests {
         app.session.last_prompt_cache_hit_tokens = Some(70);
         app.session.last_prompt_cache_miss_tokens = Some(30);
         app.session.last_reasoning_replay_tokens = Some(12);
+        app.session.last_warmup_key = None;
+        app.session.last_tool_catalog = Some(Vec::new());
+        app.session.last_base_url = Some("https://api.deepseek.com".to_string());
         app.session.last_cache_inspection = Some(PromptInspection {
             base_static_prefix_hash: "base".to_string(),
             full_request_prefix_hash: "full".to_string(),
+            tool_catalog_hash: String::new(),
             layers: Vec::new(),
         });
         app.push_turn_cache_record(TurnCacheRecord {
@@ -576,6 +596,9 @@ mod tests {
         assert_eq!(app.session.last_reasoning_replay_tokens, None);
         assert!(app.session.turn_cache_history.is_empty());
         assert_eq!(app.session.last_cache_inspection, None);
+        assert_eq!(app.session.last_warmup_key, None);
+        assert_eq!(app.session.last_tool_catalog, None);
+        assert_eq!(app.session.last_base_url, None);
     }
 
     #[test]
@@ -723,6 +746,38 @@ mod tests {
         let msg = result.message.unwrap();
         assert!(msg.contains("deepseek-v4"));
         assert_eq!(app.model, "deepseek-v4");
+        assert!(matches!(
+            result.action,
+            Some(AppAction::UpdateCompaction(_))
+        ));
+    }
+
+    #[test]
+    fn test_model_change_accepts_custom_id_for_openai_compatible_provider() {
+        let mut app = create_test_app();
+        app.api_provider = crate::config::ApiProvider::Openai;
+        app.model_ids_passthrough = true;
+
+        let result = model(&mut app, Some("opencode-go/glm-5.1"));
+
+        assert!(result.message.is_some());
+        assert_eq!(app.model, "opencode-go/glm-5.1");
+        assert!(!app.auto_model);
+        assert!(matches!(
+            result.action,
+            Some(AppAction::UpdateCompaction(_))
+        ));
+    }
+
+    #[test]
+    fn test_model_change_accepts_custom_id_for_custom_base_url() {
+        let mut app = create_test_app();
+        app.model_ids_passthrough = true;
+
+        let result = model(&mut app, Some("opencode-go/kimi-k2.6"));
+
+        assert!(result.message.is_some());
+        assert_eq!(app.model, "opencode-go/kimi-k2.6");
         assert!(matches!(
             result.action,
             Some(AppAction::UpdateCompaction(_))

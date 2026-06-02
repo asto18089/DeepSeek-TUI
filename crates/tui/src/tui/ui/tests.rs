@@ -1,5 +1,8 @@
 use super::*;
-use crate::config::{ApiProvider, Config, DEFAULT_TEXT_MODEL};
+use crate::config::{
+    ApiProvider, Config, DEFAULT_OPENROUTER_MODEL, DEFAULT_TEXT_MODEL, ProviderConfig,
+    ProvidersConfig,
+};
 use crate::config_ui::{self, WebConfigSession, WebConfigSessionEvent};
 use crate::core::engine::mock_engine_handle;
 use crate::tui::active_cell::ActiveCell;
@@ -9,9 +12,10 @@ use crate::tui::file_mention::{
     try_autocomplete_file_mention, user_request_with_file_mentions, visible_mention_menu_entries,
 };
 use crate::tui::footer_ui::{
-    active_tool_status_label, footer_auxiliary_spans, footer_cache_spans, footer_coherence_spans,
-    footer_state_label, footer_status_line_spans, format_context_budget,
-    format_token_count_compact, friendly_subagent_progress, render_footer_from,
+    active_tool_status_label, footer_auxiliary_spans, footer_balance_spans, footer_cache_spans,
+    footer_coherence_spans, footer_session_tokens_spans, footer_state_label,
+    footer_status_line_spans, format_context_budget, format_token_count_compact,
+    friendly_subagent_progress, render_footer_from,
 };
 use crate::tui::history::{
     ExecCell, ExecSource, GenericToolCell, HistoryCell, ToolCell, ToolStatus,
@@ -292,6 +296,45 @@ fn word_cursor_modifier_accepts_control_and_alt() {
     ));
     assert!(!is_word_cursor_modifier(KeyModifiers::NONE));
     assert!(!is_word_cursor_modifier(KeyModifiers::SHIFT));
+}
+
+#[test]
+fn alt_f_and_alt_b_move_by_word_without_inserting_text() {
+    let mut app = create_test_app();
+    app.input = "alpha beta gamma".to_string();
+    app.cursor_position = 0;
+
+    assert!(handle_composer_alt_word_motion_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+    ));
+    assert_eq!(app.input, "alpha beta gamma");
+    assert_eq!(app.cursor_position, "alpha ".chars().count());
+
+    app.selection_anchor = Some(0);
+    assert!(handle_composer_alt_word_motion_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+    ));
+    assert_eq!(app.input, "alpha beta gamma");
+    assert_eq!(app.cursor_position, 0);
+    assert!(app.selection_anchor.is_none());
+}
+
+#[test]
+fn alt_word_motion_helper_ignores_altgr_style_control_alt() {
+    let mut app = create_test_app();
+    app.input = "alpha beta".to_string();
+    app.cursor_position = 0;
+
+    assert!(!handle_composer_alt_word_motion_key(
+        &mut app,
+        KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+    ));
+    assert_eq!(app.cursor_position, 0);
 }
 
 fn select_full_transcript(app: &mut App) {
@@ -1141,6 +1184,70 @@ fn mouse_events_do_not_mutate_transcript_behind_modal() {
 }
 
 #[test]
+fn composer_mouse_wheel_scrolls_wrapped_draft_not_transcript() {
+    let mut app = create_test_app();
+    app.input = "alpha beta gamma delta epsilon".to_string();
+    app.cursor_position = 0;
+    app.viewport.last_composer_area = Some(Rect {
+        x: 0,
+        y: 10,
+        width: 12,
+        height: 5,
+    });
+    app.viewport.last_composer_content = Some(Rect {
+        x: 1,
+        y: 11,
+        width: 5,
+        height: 3,
+    });
+
+    let events = handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 2,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(events.is_empty());
+    assert_eq!(app.viewport.pending_scroll_delta, 0);
+    assert!(app.cursor_position > 0);
+}
+
+#[test]
+fn composer_mouse_wheel_up_moves_within_wrapped_draft() {
+    let mut app = create_test_app();
+    app.input = "alpha beta gamma delta epsilon".to_string();
+    app.cursor_position = app.input.chars().count();
+    app.viewport.last_composer_area = Some(Rect {
+        x: 0,
+        y: 10,
+        width: 12,
+        height: 5,
+    });
+    app.viewport.last_composer_content = Some(Rect {
+        x: 1,
+        y: 11,
+        width: 5,
+        height: 3,
+    });
+
+    assert!(handle_composer_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 2,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        },
+    ));
+
+    assert!(app.cursor_position < app.input.chars().count());
+}
+
+#[test]
 fn copy_shortcut_accepts_cmd_and_ctrl_shift_only() {
     assert!(crate::tui::key_shortcuts::is_copy_shortcut(&KeyEvent::new(
         KeyCode::Char('c'),
@@ -1357,6 +1464,99 @@ fn create_test_options() -> TuiOptions {
         resume_session_id: None,
         initial_input: None,
     }
+}
+
+#[tokio::test]
+// This test intentionally pins the process-global spillover root until the
+// async receipt path finishes.
+#[allow(clippy::await_holding_lock)]
+async fn tool_result_api_content_receipts_large_live_output() {
+    let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let tmp = TempDir::new().expect("spillover tempdir");
+    let prior = crate::tools::truncate::set_test_spillover_root(Some(
+        tmp.path().join(".deepseek").join("tool_outputs"),
+    ));
+    struct Restore(Option<PathBuf>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::tools::truncate::set_test_spillover_root(self.0.take());
+        }
+    }
+    let _restore = Restore(prior);
+
+    let mut app = App::new(create_test_options(), &Config::default());
+    app.api_messages.push(Message {
+        role: "assistant".to_string(),
+        content: vec![ContentBlock::ToolUse {
+            id: "call-live-big".to_string(),
+            name: "exec_shell".to_string(),
+            input: serde_json::json!({"command": "cargo test"}),
+            caller: None,
+        }],
+    });
+
+    let raw = "LIVE_RAW_SENTINEL\n".repeat(900);
+    let output = crate::tools::spec::ToolResult::success(raw.clone());
+    let content =
+        tool_result_content_for_api_message(&app, "call-live-big", "exec_shell", &output).await;
+
+    assert!(content.contains("[TOOL_OUTPUT_RECEIPT]"));
+    assert!(content.contains("tool: exec_shell"));
+    assert!(content.contains("tool_call_id: call-live-big"));
+    assert!(content.contains("detail_handle: sha:"));
+    assert!(content.contains("retrieve: retrieve_tool_result ref=sha:"));
+    assert!(!content.contains(&raw));
+    assert!(
+        content.chars().count()
+            < crate::tool_output_receipts::RAW_TOOL_OUTPUT_RECEIPT_THRESHOLD_CHARS
+    );
+}
+
+#[test]
+fn live_tool_receipt_messages_clones_only_matching_tool_use() {
+    let mut app = App::new(create_test_options(), &Config::default());
+    app.api_messages.push(Message {
+        role: "assistant".to_string(),
+        content: vec![ContentBlock::ToolUse {
+            id: "call-old".to_string(),
+            name: "exec_shell".to_string(),
+            input: serde_json::json!({"command": "old"}),
+            caller: None,
+        }],
+    });
+    app.api_messages.push(Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "call-old".to_string(),
+            content: "OLD_RAW\n".repeat(2_000),
+            is_error: None,
+            content_blocks: None,
+        }],
+    });
+    app.api_messages.push(Message {
+        role: "assistant".to_string(),
+        content: vec![ContentBlock::ToolUse {
+            id: "call-new".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "src/main.rs"}),
+            caller: None,
+        }],
+    });
+
+    let messages = live_tool_receipt_messages(&app, "call-new", "NEW_RAW", true);
+
+    assert_eq!(messages.len(), 2);
+    assert!(matches!(
+        &messages[0].content[0],
+        ContentBlock::ToolUse { id, name, .. } if id == "call-new" && name == "read_file"
+    ));
+    assert!(matches!(
+        &messages[1].content[0],
+        ContentBlock::ToolResult { tool_use_id, content, .. }
+            if tool_use_id == "call-new" && content == "NEW_RAW"
+    ));
 }
 
 fn text_message(role: &str, text: &str) -> Message {
@@ -1952,6 +2152,67 @@ async fn provider_switch_clears_turn_cache_history() {
 }
 
 #[tokio::test]
+async fn provider_switch_to_deepseek_canonicalizes_openrouter_default_model() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Openrouter;
+    app.model = DEFAULT_OPENROUTER_MODEL.to_string();
+    let mut engine = mock_engine_handle();
+    let mut config = Config {
+        provider: Some("openrouter".to_string()),
+        api_key: Some("test-key".to_string()),
+        default_text_model: Some(DEFAULT_OPENROUTER_MODEL.to_string()),
+        ..Default::default()
+    };
+
+    switch_provider(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ApiProvider::Deepseek,
+        None,
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert!(!app.model_ids_passthrough);
+    assert_eq!(app.model, DEFAULT_TEXT_MODEL);
+}
+
+#[tokio::test]
+async fn provider_switch_to_openrouter_canonicalizes_deepseek_default_model() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Deepseek;
+    app.model = DEFAULT_TEXT_MODEL.to_string();
+    let mut engine = mock_engine_handle();
+    let mut config = Config {
+        provider: Some("deepseek".to_string()),
+        default_text_model: Some(DEFAULT_TEXT_MODEL.to_string()),
+        providers: Some(ProvidersConfig {
+            openrouter: ProviderConfig {
+                api_key: Some("test-key".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    switch_provider(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ApiProvider::Openrouter,
+        None,
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::Openrouter);
+    assert_eq!(app.model, DEFAULT_OPENROUTER_MODEL);
+}
+
+#[tokio::test]
 async fn dispatch_user_message_failed_send_clears_loading_state() {
     let mut app = create_test_app();
     let engine = mock_engine_handle();
@@ -1978,18 +2239,233 @@ async fn dispatch_user_message_failed_send_clears_loading_state() {
     assert!(app.dispatch_started_at.is_none());
 }
 
+#[cfg(not(windows))]
+fn write_message_submit_hook(dir: &TempDir, name: &str, body: &str) -> String {
+    let path = dir.path().join(name);
+    std::fs::write(&path, body).expect("write message_submit hook");
+    format!("sh {}", path.display())
+}
+
+#[cfg(not(windows))]
+fn configure_single_message_submit_hook(app: &mut App, dir: &TempDir, command: String) {
+    configure_message_submit_hooks(app, dir, vec![command]);
+}
+
+#[cfg(not(windows))]
+fn configure_message_submit_hooks(app: &mut App, dir: &TempDir, commands: Vec<String>) {
+    app.hooks = crate::hooks::HookExecutor::new(
+        crate::hooks::HooksConfig {
+            enabled: true,
+            hooks: commands
+                .iter()
+                .map(|command| {
+                    crate::hooks::Hook::new(crate::hooks::HookEvent::MessageSubmit, command)
+                })
+                .collect(),
+            working_dir: Some(dir.path().to_path_buf()),
+            ..crate::hooks::HooksConfig::default()
+        },
+        dir.path().to_path_buf(),
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn dispatch_user_message_surfaces_continued_message_submit_timeout() {
+    let dir = TempDir::new().expect("tempdir");
+    let slow = write_message_submit_hook(
+        &dir,
+        "slow.sh",
+        r#"#!/bin/sh
+sleep 2
+"#,
+    );
+    let replacing = write_message_submit_hook(
+        &dir,
+        "replace.sh",
+        r#"#!/bin/sh
+printf '%s\n' '{"text":"after timeout"}'
+"#,
+    );
+    let mut app = create_test_app();
+    app.hooks = crate::hooks::HookExecutor::new(
+        crate::hooks::HooksConfig {
+            enabled: true,
+            hooks: vec![
+                crate::hooks::Hook::new(crate::hooks::HookEvent::MessageSubmit, &slow)
+                    .with_timeout(1),
+                crate::hooks::Hook::new(crate::hooks::HookEvent::MessageSubmit, &replacing),
+            ],
+            working_dir: Some(dir.path().to_path_buf()),
+            ..crate::hooks::HooksConfig::default()
+        },
+        dir.path().to_path_buf(),
+    );
+    let mut engine = crate::core::engine::mock_engine_handle();
+    let config = Config::default();
+
+    dispatch_user_message(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("hello".to_string(), None),
+    )
+    .await
+    .expect("dispatch user message");
+
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Hook timed out after 1s")
+    );
+    match engine.rx_op.recv().await.expect("send message op") {
+        crate::core::ops::Op::SendMessage { content, .. } => {
+            assert_eq!(content, "after timeout");
+        }
+        other => panic!("expected SendMessage, got {other:?}"),
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn dispatch_user_message_surfaces_continued_message_submit_stderr() {
+    let dir = TempDir::new().expect("tempdir");
+    let failing = write_message_submit_hook(
+        &dir,
+        "fail.sh",
+        r#"#!/bin/sh
+printf '%s\n' 'soft failure' >&2
+exit 9
+"#,
+    );
+    let replacing = write_message_submit_hook(
+        &dir,
+        "replace.sh",
+        r#"#!/bin/sh
+printf '%s\n' '{"text":"after soft failure"}'
+"#,
+    );
+    let mut app = create_test_app();
+    configure_message_submit_hooks(&mut app, &dir, vec![failing, replacing]);
+    let mut engine = crate::core::engine::mock_engine_handle();
+    let config = Config::default();
+
+    dispatch_user_message(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("hello".to_string(), None),
+    )
+    .await
+    .expect("dispatch user message");
+
+    assert_eq!(app.status_message.as_deref(), Some("soft failure"));
+    match engine.rx_op.recv().await.expect("send message op") {
+        crate::core::ops::Op::SendMessage { content, .. } => {
+            assert_eq!(content, "after soft failure");
+        }
+        other => panic!("expected SendMessage, got {other:?}"),
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn dispatch_user_message_uses_transformed_message_submit_text() {
+    let dir = TempDir::new().expect("tempdir");
+    let command = write_message_submit_hook(
+        &dir,
+        "replace.sh",
+        r#"#!/bin/sh
+printf '%s\n' '{"text":"[hooked] hello"}'
+"#,
+    );
+    let mut app = create_test_app();
+    configure_single_message_submit_hook(&mut app, &dir, command);
+    let mut engine = crate::core::engine::mock_engine_handle();
+    let config = Config::default();
+
+    dispatch_user_message(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("hello".to_string(), None),
+    )
+    .await
+    .expect("dispatch user message");
+
+    assert_eq!(app.last_submitted_prompt.as_deref(), Some("[hooked] hello"));
+    assert!(app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::User { content } if content == "[hooked] hello"
+    )));
+    assert_eq!(app.api_messages.len(), 1);
+    assert!(matches!(
+        &app.api_messages[0].content[0],
+        ContentBlock::Text { text, .. } if text == "[hooked] hello"
+    ));
+    match engine.rx_op.recv().await.expect("send message op") {
+        crate::core::ops::Op::SendMessage { content, .. } => {
+            assert_eq!(content, "[hooked] hello");
+        }
+        other => panic!("expected SendMessage, got {other:?}"),
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn dispatch_user_message_blocked_by_message_submit_hook_does_not_start_turn() {
+    let dir = TempDir::new().expect("tempdir");
+    let command = write_message_submit_hook(
+        &dir,
+        "block.sh",
+        r#"#!/bin/sh
+printf '%s\n' '{"reason":"blocked by test hook"}'
+exit 2
+"#,
+    );
+    let mut app = create_test_app();
+    configure_single_message_submit_hook(&mut app, &dir, command);
+    let mut engine = crate::core::engine::mock_engine_handle();
+    let config = Config::default();
+
+    dispatch_user_message(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("hello".to_string(), None),
+    )
+    .await
+    .expect("blocked submit is handled locally");
+
+    assert_eq!(app.status_message.as_deref(), Some("blocked by test hook"));
+    assert!(app.api_messages.is_empty());
+    assert!(
+        app.history
+            .iter()
+            .all(|cell| !matches!(cell, HistoryCell::User { .. }))
+    );
+    assert!(!app.is_loading);
+    assert!(app.dispatch_started_at.is_none());
+    assert!(app.runtime_turn_status.is_none());
+    assert!(
+        engine.rx_op.try_recv().is_err(),
+        "blocked submit must not send any engine operation"
+    );
+}
+
 #[test]
 fn turn_liveness_watchdog_clears_stale_dispatch() {
     let mut app = create_test_app();
     app.is_loading = true;
     app.dispatch_started_at =
         Some(Instant::now() - DISPATCH_WATCHDOG_TIMEOUT - Duration::from_millis(1));
+    app.turn_started_at = Some(Instant::now());
 
     let recovered = reconcile_turn_liveness(&mut app, Instant::now(), false);
 
     assert!(recovered);
     assert!(!app.is_loading);
     assert!(app.dispatch_started_at.is_none());
+    assert!(app.turn_started_at.is_none());
     let toast = app.status_toasts.back().expect("watchdog toast");
     assert_eq!(toast.level, StatusToastLevel::Error);
     assert!(toast.text.contains("Turn dispatch timed out"));
@@ -2001,12 +2477,14 @@ fn turn_liveness_reconciles_completed_busy_state() {
     app.is_loading = true;
     app.runtime_turn_status = Some("completed".to_string());
     app.dispatch_started_at = Some(Instant::now());
+    app.turn_started_at = Some(Instant::now());
 
     let recovered = reconcile_turn_liveness(&mut app, Instant::now(), false);
 
     assert!(recovered);
     assert!(!app.is_loading);
     assert!(app.dispatch_started_at.is_none());
+    assert!(app.turn_started_at.is_none());
     let toast = app.status_toasts.back().expect("reconciliation toast");
     assert_eq!(toast.level, StatusToastLevel::Warning);
     assert!(
@@ -2021,15 +2499,90 @@ fn turn_liveness_leaves_active_turn_running() {
     let mut app = create_test_app();
     app.is_loading = true;
     app.runtime_turn_status = Some("in_progress".to_string());
-    app.dispatch_started_at =
-        Some(Instant::now() - DISPATCH_WATCHDOG_TIMEOUT - Duration::from_secs(10));
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(60));
 
     let recovered = reconcile_turn_liveness(&mut app, Instant::now(), false);
 
     assert!(!recovered);
     assert!(app.is_loading);
-    assert!(app.dispatch_started_at.is_some());
+    assert!(app.turn_started_at.is_some());
     assert!(app.status_toasts.is_empty());
+}
+
+#[test]
+fn turn_liveness_uses_recent_turn_activity_not_turn_start() {
+    let mut app = create_test_app();
+    let now = Instant::now();
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".to_string());
+    app.turn_started_at = Some(now - TURN_STALL_WATCHDOG_TIMEOUT - Duration::from_secs(30));
+    app.turn_last_activity_at = Some(now - Duration::from_secs(1));
+
+    let recovered = reconcile_turn_liveness(&mut app, now, false);
+
+    assert!(!recovered);
+    assert!(app.is_loading);
+    assert!(app.runtime_turn_status.is_some());
+    assert!(app.status_toasts.is_empty());
+}
+
+#[test]
+fn turn_liveness_does_not_abort_running_tool() {
+    let mut app = create_test_app();
+    let now = Instant::now();
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".to_string());
+    app.turn_started_at = Some(now - TURN_STALL_WATCHDOG_TIMEOUT - Duration::from_secs(30));
+    app.turn_last_activity_at = app.turn_started_at;
+    let mut active = ActiveCell::new();
+    active.push_tool(
+        "tool-1",
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "edit_file".to_string(),
+            status: ToolStatus::Running,
+            input_summary: Some("path: CHANGELOG.md".to_string()),
+            output: None,
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        })),
+    );
+    app.active_cell = Some(active);
+
+    let recovered = reconcile_turn_liveness(&mut app, now, false);
+
+    assert!(!recovered);
+    assert!(app.is_loading);
+    assert!(app.active_cell.is_some());
+    assert!(app.status_toasts.is_empty());
+}
+
+#[test]
+fn turn_liveness_recovers_stalled_in_progress_turn() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".to_string());
+    app.runtime_turn_id = Some("stale-turn-id".to_string());
+    app.turn_started_at =
+        Some(Instant::now() - TURN_STALL_WATCHDOG_TIMEOUT - Duration::from_millis(1));
+    app.streaming_message_index = Some(0);
+    app.user_scrolled_during_stream = true;
+
+    let recovered = reconcile_turn_liveness(&mut app, Instant::now(), false);
+
+    assert!(recovered);
+    assert!(!app.is_loading);
+    assert!(app.turn_started_at.is_none());
+    assert!(app.runtime_turn_status.is_none());
+    assert!(app.runtime_turn_id.is_none());
+    assert!(app.dispatch_started_at.is_none());
+    assert!(app.streaming_message_index.is_none());
+    assert!(app.streaming_thinking_active_entry.is_none());
+    assert!(!app.user_scrolled_during_stream);
+    let toast = app.status_toasts.back().expect("stall toast");
+    assert_eq!(toast.level, StatusToastLevel::Error);
+    assert!(toast.text.contains("Turn stalled"));
 }
 
 #[test]
@@ -2077,6 +2630,8 @@ fn init_git_repo() -> TempDir {
             "user.name=codewhale Tests",
             "-c",
             "user.email=tests@example.com",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "--allow-empty",
             "-m",
@@ -2301,6 +2856,21 @@ fn format_token_count_compact_formats_units() {
 }
 
 #[test]
+fn footer_session_tokens_chip_uses_single_compact_total() {
+    let mut app = create_test_app();
+    app.session.total_input_tokens = 900_000;
+    app.session.total_cache_hit_tokens = 700_000;
+    app.session.total_cache_miss_tokens = 200_000;
+    app.session.total_output_tokens = 600_000;
+
+    let text = spans_text(&footer_session_tokens_spans(&app));
+
+    assert_eq!(text, "tok 1.5M");
+    assert!(!text.contains(" cch "));
+    assert!(!text.contains(" out"));
+}
+
+#[test]
 fn format_context_budget_caps_overflow_display() {
     assert_eq!(format_context_budget(5_000, 128_000), "5.0k/128.0k");
     assert_eq!(format_context_budget(250_000, 128_000), ">128.0k/128.0k");
@@ -2340,6 +2910,114 @@ fn event_poll_timeout_has_nonzero_floor() {
         clamp_event_poll_timeout(Duration::from_millis(24)),
         Duration::from_millis(24)
     );
+}
+
+fn complete_release_json(tag: &str) -> serde_json::Value {
+    let assets = REQUIRED_RELEASE_ASSETS
+        .iter()
+        .map(|name| serde_json::json!({ "name": name, "state": "uploaded" }))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "tag_name": tag,
+        "draft": false,
+        "prerelease": false,
+        "assets": assets,
+    })
+}
+
+#[test]
+fn version_hint_requires_complete_release_assets() {
+    let complete = complete_release_json("v0.8.47");
+    let hint = version_hint_from_release_json(&complete, "0.8.46").expect("newer complete release");
+    assert!(hint.contains("v0.8.47 available"));
+
+    let mut missing_manifest = complete_release_json("v0.8.47");
+    missing_manifest["assets"] = serde_json::Value::Array(
+        missing_manifest["assets"]
+            .as_array()
+            .expect("assets")
+            .iter()
+            .filter(|asset| {
+                asset.get("name").and_then(serde_json::Value::as_str)
+                    != Some("codewhale-artifacts-sha256.txt")
+            })
+            .cloned()
+            .collect(),
+    );
+    assert!(
+        version_hint_from_release_json(&missing_manifest, "0.8.46").is_none(),
+        "do not advertise a release before checksums are uploaded"
+    );
+
+    let mut pending_asset = complete_release_json("v0.8.47");
+    pending_asset["assets"].as_array_mut().expect("assets")[0]["state"] = serde_json::json!("open");
+    assert!(
+        version_hint_from_release_json(&pending_asset, "0.8.46").is_none(),
+        "do not advertise a release before every asset is uploaded"
+    );
+
+    let mut missing_state = complete_release_json("v0.8.47");
+    missing_state["assets"].as_array_mut().expect("assets")[0]
+        .as_object_mut()
+        .expect("asset object")
+        .remove("state");
+    assert!(
+        version_hint_from_release_json(&missing_state, "0.8.46").is_none(),
+        "do not accept malformed asset state as uploaded"
+    );
+}
+
+#[test]
+fn version_hint_ignores_draft_prerelease_and_current_versions() {
+    let mut draft = complete_release_json("v0.8.47");
+    draft["draft"] = serde_json::Value::Bool(true);
+    assert!(version_hint_from_release_json(&draft, "0.8.46").is_none());
+
+    let mut prerelease = complete_release_json("v0.8.47");
+    prerelease["prerelease"] = serde_json::Value::Bool(true);
+    assert!(version_hint_from_release_json(&prerelease, "0.8.46").is_none());
+
+    let current = complete_release_json("v0.8.46");
+    assert!(version_hint_from_release_json(&current, "0.8.46").is_none());
+}
+
+#[test]
+fn startup_version_check_source_respects_update_config() {
+    assert_eq!(
+        startup_version_check_source(&UpdateConfig {
+            check_for_updates: false,
+            update_uri: Some("https://mirror.example/releases/latest".to_string()),
+        }),
+        StartupVersionCheckSource::Disabled
+    );
+
+    assert_eq!(
+        startup_version_check_source(&UpdateConfig {
+            check_for_updates: true,
+            update_uri: Some("  https://mirror.example/releases/latest  ".to_string()),
+        }),
+        StartupVersionCheckSource::ConfiguredUrl(
+            "https://mirror.example/releases/latest".to_string()
+        )
+    );
+
+    assert_eq!(
+        startup_version_check_source(&UpdateConfig::default()),
+        StartupVersionCheckSource::ReleaseResolver
+    );
+}
+
+#[test]
+fn custom_update_uri_accepts_tag_only_release_json() {
+    let json = serde_json::json!({
+        "tag_name": "v0.8.47",
+        "draft": false,
+        "prerelease": false,
+    });
+
+    let hint = version_hint_from_custom_release_json(&json, "0.8.46")
+        .expect("tag-only custom metadata should be enough for mirrors");
+    assert!(hint.contains("v0.8.47 available"));
 }
 
 #[test]
@@ -2813,13 +3491,25 @@ fn test_ctrl_c_cancels_streaming_sets_status() {
 
 #[test]
 fn local_cancel_marks_late_stream_events_for_suppression() {
+    let _retry_guard = crate::retry_status::test_guard();
     let mut app = create_test_app();
     app.is_loading = true;
+    app.turn_started_at = Some(Instant::now());
+    app.runtime_turn_id = Some("turn_cancel_me".to_string());
+    app.runtime_turn_status = Some("in_progress".to_string());
     app.streaming_state.start_text(0, None);
+    crate::retry_status::start(2, Duration::from_secs(3), "network error");
 
     mark_active_turn_cancelled_locally(&mut app);
 
     assert!(!app.is_loading);
+    assert!(app.turn_started_at.is_none());
+    assert!(app.runtime_turn_id.is_none());
+    assert!(app.runtime_turn_status.is_none());
+    assert!(matches!(
+        crate::retry_status::snapshot(),
+        crate::retry_status::RetryState::Idle
+    ));
     assert!(app.suppress_stream_events_until_turn_complete);
     assert!(suppress_engine_event_after_local_cancel(
         &EngineEvent::MessageDelta {
@@ -2853,6 +3543,8 @@ fn local_cancel_marks_late_stream_events_for_suppression() {
             usage: Usage::default(),
             status: crate::core::events::TurnOutcomeStatus::Interrupted,
             error: None,
+            tool_catalog: None,
+            base_url: None,
         }
     ));
     assert!(!suppress_engine_event_after_local_cancel(
@@ -3116,6 +3808,28 @@ fn inline_skill_slash_popup_filters_partial_without_leaking_to_command_position(
 }
 
 #[test]
+fn inline_skill_slash_popup_does_not_open_inside_command_arguments() {
+    let mut app = create_test_app();
+    app.cached_skills = vec![
+        (
+            "config-doctor".to_string(),
+            "Diagnose configuration".to_string(),
+        ),
+        ("cargo-ci-fixer".to_string(), "Fix CI failures".to_string()),
+    ];
+    app.input = "/attach /".to_string();
+    app.cursor_position = app.input.chars().count();
+
+    let entries = visible_slash_menu_entries(&app, 128);
+
+    assert!(
+        entries.is_empty(),
+        "command argument paths should not show inline skill entries: {:?}",
+        entries.iter().map(|entry| &entry.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn apply_slash_menu_selection_splices_inline_skill_mention() {
     let mut app = create_test_app();
     app.input = "please use /se here".to_string();
@@ -3263,6 +3977,47 @@ async fn dispatch_user_message_records_prompt_for_cancel_restore() {
                 !show_thinking,
                 "dispatch must carry the user's hidden-thinking setting into the engine"
             );
+        }
+        other => panic!("expected SendMessage, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn startup_prompt_waits_for_onboarding_then_dispatches() {
+    let mut app = create_test_app();
+    app.input = "阅读项目 and wait".to_string();
+    app.cursor_position = app.input.chars().count();
+    app.auto_submit_initial_input = true;
+    app.onboarding = OnboardingState::Welcome;
+    let config = Config::default();
+    let mut engine = crate::core::engine::mock_engine_handle();
+
+    submit_initial_input_if_ready(&mut app, &config, &engine.handle)
+        .await
+        .expect("defer");
+
+    assert!(app.auto_submit_initial_input);
+    assert_eq!(app.input, "阅读项目 and wait");
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some(INITIAL_PROMPT_DEFERRED_STATUS)
+    );
+    assert!(engine.rx_op.try_recv().is_err());
+
+    app.onboarding = OnboardingState::None;
+    submit_initial_input_if_ready(&mut app, &config, &engine.handle)
+        .await
+        .expect("submit");
+
+    assert!(!app.auto_submit_initial_input);
+    assert!(app.input.is_empty());
+    assert_eq!(
+        app.last_submitted_prompt.as_deref(),
+        Some("阅读项目 and wait")
+    );
+    match engine.rx_op.recv().await.expect("send message op") {
+        crate::core::ops::Op::SendMessage { content, .. } => {
+            assert!(content.contains("阅读项目 and wait"));
         }
         other => panic!("expected SendMessage, got {other:?}"),
     }
@@ -3629,6 +4384,8 @@ fn open_tool_details_pager_supports_active_virtual_tool_cell() {
         &[1],
         100,
         app.transcript_render_options(),
+        &app.folded_thinking,
+        None,
     );
     app.viewport.last_transcript_top = 0;
     app.viewport.last_transcript_visible = 4;
@@ -5048,6 +5805,10 @@ fn activity_detail_opens_reasoning_timeline_for_selected_thinking() {
         body.contains("Selected chunk: 1 of 2"),
         "chunk position missing: {body}"
     );
+    assert!(
+        body.contains("Next chunk: 2 of 2 - second chunk reasoning"),
+        "neighboring chunk missing: {body}"
+    );
     assert!(body.contains("Thinking chunk 1 of 2 (selected)"), "{body}");
     assert!(body.contains("Thinking chunk 2 of 2"), "{body}");
     assert!(body.contains("first chunk reasoning"), "body: {body}");
@@ -5055,6 +5816,95 @@ fn activity_detail_opens_reasoning_timeline_for_selected_thinking() {
         body.contains("second chunk reasoning"),
         "timeline should include the whole session's thinking: {body}"
     );
+}
+
+#[test]
+fn activity_detail_includes_tool_handle_and_neighbor_context() {
+    let mut app = create_test_app();
+    app.history = vec![
+        HistoryCell::Thinking {
+            content: "checked approach".to_string(),
+            streaming: false,
+            duration_secs: Some(0.6),
+        },
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "read_file".to_string(),
+            status: ToolStatus::Success,
+            input_summary: Some("src/main.rs".to_string()),
+            output: Some("bounded preview".to_string()),
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        })),
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "grep_files".to_string(),
+            status: ToolStatus::Success,
+            input_summary: Some("TODO".to_string()),
+            output: Some("grep summary".to_string()),
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        })),
+    ];
+    app.tool_details_by_cell.insert(
+        1,
+        ToolDetailRecord {
+            tool_id: "call-read".to_string(),
+            tool_name: "read_file".to_string(),
+            input: serde_json::json!({"path": "src/main.rs"}),
+            output: Some("full output behind raw details".to_string()),
+        },
+    );
+    app.session_artifacts
+        .push(crate::artifacts::ArtifactRecord {
+            id: "art_call-read".to_string(),
+            kind: crate::artifacts::ArtifactKind::ToolOutput,
+            session_id: "session-activity".to_string(),
+            tool_call_id: "call-read".to_string(),
+            tool_name: "read_file".to_string(),
+            created_at: chrono::Utc::now(),
+            byte_size: 42,
+            preview: "bounded preview".to_string(),
+            storage_path: PathBuf::from("artifacts").join("art_call-read.txt"),
+        });
+    app.resync_history_revisions();
+    let revisions = app.history_revisions.clone();
+    app.viewport.transcript_cache.ensure(
+        &app.history,
+        &revisions,
+        100,
+        app.transcript_render_options(),
+    );
+    let line = first_line_for_cell(&app, 1);
+    let point = TranscriptSelectionPoint {
+        line_index: line,
+        column: 0,
+    };
+    app.viewport.transcript_selection.anchor = Some(point);
+    app.viewport.transcript_selection.head = Some(point);
+
+    assert!(open_activity_detail_pager(&mut app));
+    let body = pop_pager_body(&mut app);
+
+    assert!(body.contains("Activity: read_file"), "{body}");
+    assert!(body.contains("Activity chunk: 2 of 3"), "{body}");
+    assert!(
+        body.contains("Previous activity: 1 of 3 - thinking"),
+        "{body}"
+    );
+    assert!(
+        body.contains("Next activity: 3 of 3 - tool grep_files"),
+        "{body}"
+    );
+    assert!(body.contains("Detail handle: art_call-read"), "{body}");
+    assert!(
+        body.contains("retrieve_tool_result ref=art_call-read"),
+        "{body}"
+    );
+    assert!(body.contains("Alt+V"), "{body}");
+    assert!(body.contains("raw details"), "{body}");
 }
 
 #[test]
@@ -5114,6 +5964,11 @@ fn activity_detail_fallback_uses_recent_meaningful_activity_without_full_tool_du
     assert!(
         body.contains("Alt+V for details"),
         "activity detail should stay bounded and point to Alt+V for raw detail: {body}"
+    );
+    assert!(body.contains("Detail handle: Alt+V details"), "{body}");
+    assert!(
+        !body.contains("Detail handle: Alt+V raw details"),
+        "fallback tool details should not be labeled raw: {body}"
     );
     assert!(
         !body.contains("line 10"),
@@ -5200,6 +6055,50 @@ fn message_complete_drain_preserves_thinking_when_thinking_complete_lost() {
         app.streaming_thinking_active_entry.is_none(),
         "thinking entry must be cleared after the drain"
     );
+}
+
+#[test]
+fn approval_prompt_uses_event_input_after_message_complete_drain() {
+    let mut app = create_test_app();
+    app.pending_tool_uses.push((
+        "tool-1".to_string(),
+        "exec_shell".to_string(),
+        serde_json::json!({"command": "stale value from drained list"}),
+    ));
+
+    // Mirror the old race: MessageComplete drains pending tool uses before
+    // ApprovalRequired is handled. The approval modal must still show the
+    // non-empty input carried directly on the ApprovalRequired event.
+    app.pending_tool_uses.clear();
+
+    let event_input = serde_json::json!({
+        "command": "cargo test -p codewhale-tui approval",
+        "workdir": "/repo",
+    });
+    push_approval_request_view(
+        &mut app,
+        "tool-1",
+        "exec_shell",
+        "Run cargo tests",
+        &event_input,
+        "approval-key",
+        None,
+    );
+
+    let mut view = app.view_stack.pop().expect("approval view");
+    let approval = view
+        .as_any_mut()
+        .downcast_mut::<ApprovalView>()
+        .expect("approval view");
+    let action = approval.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    let ViewAction::Emit(ViewEvent::OpenTextPager { content, .. }) = action else {
+        panic!("expected approval params pager");
+    };
+
+    assert!(content.contains("cargo test -p codewhale-tui approval"));
+    assert!(content.contains("/repo"));
+    assert!(!content.contains("stale value from drained list"));
+    assert_ne!(content.trim(), "{}");
 }
 
 #[test]
@@ -5496,6 +6395,16 @@ fn next_escape_action_cancels_when_loading_with_empty_input() {
 }
 
 #[test]
+fn next_escape_action_cancels_in_progress_runtime_even_if_loading_flag_was_cleared() {
+    let mut app = create_test_app();
+    app.is_loading = false;
+    app.runtime_turn_status = Some("in_progress".to_string());
+    app.input.clear();
+
+    assert_eq!(next_escape_action(&app, false), EscapeAction::CancelRequest);
+}
+
+#[test]
 fn next_escape_action_cancels_when_loading_with_input() {
     let mut app = create_test_app();
     app.is_loading = true;
@@ -5683,7 +6592,7 @@ fn render_footer_from_with_default_items_renders_mode_and_model() {
 }
 
 #[test]
-fn default_footer_keeps_prefix_stability_opt_in() {
+fn default_footer_excludes_provider_specific_diagnostic_chips() {
     let items = crate::config::StatusItem::default_footer();
 
     assert!(
@@ -5691,8 +6600,16 @@ fn default_footer_keeps_prefix_stability_opt_in() {
         "prefix stability is a diagnostic chip and should not crowd the default footer"
     );
     assert!(
+        !items.contains(&crate::config::StatusItem::Balance),
+        "balance is DeepSeek-only and should not crowd the default footer for non-DeepSeek users"
+    );
+    assert!(
         items.contains(&crate::config::StatusItem::Cache),
         "default footer should still include provider-reported cache hit rate"
+    );
+    assert!(
+        items.contains(&crate::config::StatusItem::GitBranch),
+        "default footer should surface the current workspace branch"
     );
 }
 
@@ -5777,9 +6694,159 @@ fn render_footer_from_git_branch_item_renders_workspace_branch() {
 
     let mut app = create_test_app();
     app.workspace = repo.path().to_path_buf();
+    crate::tui::workspace_context::refresh_if_needed(&mut app, Instant::now(), true);
 
     let props = render_footer_from(&app, &[crate::config::StatusItem::GitBranch], None);
     assert_eq!(spans_text(&props.cache), "feature/statusline");
+}
+
+// ── Balance footer chip tests ─────────────────────────────────────
+
+#[test]
+fn footer_balance_spans_empty_when_cell_is_none() {
+    let app = create_test_app();
+    let spans = footer_balance_spans(&app);
+    assert!(spans.is_empty());
+}
+
+#[test]
+fn footer_balance_spans_empty_when_balance_is_zero() {
+    let app = create_test_app();
+    let info = crate::pricing::BalanceInfo {
+        currency: "USD".into(),
+        total_balance: "0".into(),
+        ..Default::default()
+    };
+    *app.balance_cell.lock().unwrap() = Some(info);
+    let spans = footer_balance_spans(&app);
+    assert!(spans.is_empty());
+}
+
+#[test]
+fn footer_balance_spans_formats_cny() {
+    let app = create_test_app();
+    let info = crate::pricing::BalanceInfo {
+        currency: "CNY".into(),
+        total_balance: "123.45".into(),
+        ..Default::default()
+    };
+    *app.balance_cell.lock().unwrap() = Some(info);
+    let spans = footer_balance_spans(&app);
+    assert_eq!(spans_text(&spans), "bal ¥123.5");
+}
+
+#[test]
+fn footer_balance_spans_formats_usd() {
+    let app = create_test_app();
+    let info = crate::pricing::BalanceInfo {
+        currency: "USD".into(),
+        total_balance: "0.50".into(),
+        ..Default::default()
+    };
+    *app.balance_cell.lock().unwrap() = Some(info);
+    let spans = footer_balance_spans(&app);
+    assert_eq!(spans_text(&spans), "bal $0.50");
+}
+
+#[test]
+fn footer_balance_spans_rounds_large_amount() {
+    let app = create_test_app();
+    let info = crate::pricing::BalanceInfo {
+        currency: "USD".into(),
+        total_balance: "1234.56".into(),
+        ..Default::default()
+    };
+    *app.balance_cell.lock().unwrap() = Some(info);
+    let spans = footer_balance_spans(&app);
+    assert_eq!(spans_text(&spans), "bal $1235");
+}
+
+#[test]
+fn footer_balance_spans_treats_unknown_currency_as_usd() {
+    let app = create_test_app();
+    let info = crate::pricing::BalanceInfo {
+        currency: "EUR".into(),
+        total_balance: "10.00".into(),
+        ..Default::default()
+    };
+    *app.balance_cell.lock().unwrap() = Some(info);
+    let spans = footer_balance_spans(&app);
+    assert_eq!(spans_text(&spans), "bal $10.0");
+}
+
+#[test]
+fn render_footer_from_with_balance_item_shows_balance() {
+    let app = create_test_app();
+    let info = crate::pricing::BalanceInfo {
+        currency: "USD".into(),
+        total_balance: "42.50".into(),
+        ..Default::default()
+    };
+    *app.balance_cell.lock().unwrap() = Some(info);
+    let props = render_footer_from(&app, &[crate::config::StatusItem::Balance], None);
+    assert_eq!(spans_text(&props.balance), "bal $42.5");
+}
+
+#[test]
+fn render_footer_from_without_balance_item_hides_balance() {
+    let app = create_test_app();
+    let info = crate::pricing::BalanceInfo {
+        currency: "USD".into(),
+        total_balance: "99.99".into(),
+        ..Default::default()
+    };
+    *app.balance_cell.lock().unwrap() = Some(info);
+    let props = render_footer_from(&app, &[], None);
+    assert!(spans_text(&props.balance).is_empty());
+}
+
+#[test]
+fn should_fetch_deepseek_balance_requires_balance_status_item() {
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Deepseek;
+    app.status_items = crate::config::StatusItem::default_footer();
+
+    assert!(!should_fetch_deepseek_balance(&app));
+
+    app.status_items.push(crate::config::StatusItem::Balance);
+    assert!(should_fetch_deepseek_balance(&app));
+}
+
+#[test]
+fn should_fetch_deepseek_balance_requires_deepseek_provider() {
+    let mut app = create_test_app();
+    app.status_items = vec![crate::config::StatusItem::Balance];
+
+    app.api_provider = ApiProvider::Openrouter;
+    assert!(!should_fetch_deepseek_balance(&app));
+
+    app.api_provider = ApiProvider::DeepseekCN;
+    assert!(should_fetch_deepseek_balance(&app));
+}
+
+#[test]
+fn default_footer_renders_workspace_branch_when_available() {
+    let repo = init_git_repo();
+    let checkout = Command::new("git")
+        .args(["checkout", "-b", "feature/default-branch-chip"])
+        .current_dir(repo.path())
+        .output()
+        .expect("git checkout should run");
+    assert!(
+        checkout.status.success(),
+        "git checkout failed: {}",
+        String::from_utf8_lossy(&checkout.stderr)
+    );
+
+    let mut app = create_test_app();
+    app.workspace = repo.path().to_path_buf();
+    crate::tui::workspace_context::refresh_if_needed(&mut app, Instant::now(), true);
+
+    let props = render_footer_from(&app, &crate::config::StatusItem::default_footer(), None);
+    assert!(
+        spans_text(&props.cache).contains("feature/default-branch-chip"),
+        "default footer should include the current git branch"
+    );
 }
 
 /// Regression for issue #244: visible session spend must not decrease.
@@ -6118,6 +7185,33 @@ fn composer_arrows_scroll_config_overrides_default() {
         !app.composer_arrows_scroll,
         "explicit config=false must override the mouse-capture-derived default"
     );
+}
+
+#[test]
+fn history_arrow_down_handles_empty_input() {
+    let mut app = create_test_app();
+    app.composer_arrows_scroll = false;
+    app.input_history.push("older".to_string());
+    app.input_history.push("newer".to_string());
+
+    // Empty composer + Up → newest entry (draft saved as empty string).
+    assert!(handle_composer_history_arrow(
+        &mut app,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        false,
+        false,
+    ));
+    assert_eq!(app.input, "newer");
+
+    // Down from newest → end of history → restores the saved empty draft.
+    assert!(handle_composer_history_arrow(
+        &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        false,
+        false,
+    ));
+    assert!(app.input.is_empty());
+    assert!(app.history_index.is_none());
 }
 
 #[test]

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::config::{ApiProvider, Config, RetryPolicy};
+use crate::config::{ApiProvider, Config, RetryPolicy, wire_model_for_provider};
 use crate::llm_client::{
     LlmClient, LlmError, RetryConfig as LlmRetryConfig, extract_retry_after, with_retry,
 };
@@ -568,6 +568,11 @@ fn build_default_headers(
 }
 
 impl DeepSeekClient {
+    /// Returns the API base URL used by this client.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Translate text to the requested target language using a focused
     /// non-streaming chat completion call on the supplied model.
     ///
@@ -581,6 +586,7 @@ impl DeepSeekClient {
         target_language: &str,
     ) -> Result<String> {
         let url = api_url(&self.base_url, "chat/completions");
+        let model = wire_model_for_provider(self.api_provider, model);
         let mut body = serde_json::json!({
             "model": model,
             "messages": [
@@ -882,8 +888,11 @@ pub(super) fn apply_reasoning_effort(
             ApiProvider::Deepseek
             | ApiProvider::DeepseekCN
             | ApiProvider::Openrouter
+            | ApiProvider::XiaomiMimo
             | ApiProvider::Novita
-            | ApiProvider::Sglang => {
+            | ApiProvider::Siliconflow
+            | ApiProvider::Sglang
+            | ApiProvider::Volcengine => {
                 body["thinking"] = json!({ "type": "disabled" });
             }
             ApiProvider::Fireworks => {}
@@ -914,7 +923,11 @@ pub(super) fn apply_reasoning_effort(
         },
         "low" | "minimal" | "medium" | "mid" | "high" | "" => match provider {
             // DeepSeek compatibility: low/medium both map to high
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::Sglang => {
+            ApiProvider::Deepseek
+            | ApiProvider::DeepseekCN
+            | ApiProvider::Siliconflow
+            | ApiProvider::Sglang
+            | ApiProvider::Volcengine => {
                 body["reasoning_effort"] = json!("high");
                 body["thinking"] = json!({ "type": "enabled" });
             }
@@ -928,6 +941,9 @@ pub(super) fn apply_reasoning_effort(
                     _ => "high",
                 };
                 body["reasoning_effort"] = json!(value);
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+            ApiProvider::XiaomiMimo => {
                 body["thinking"] = json!({ "type": "enabled" });
             }
             ApiProvider::Fireworks => {
@@ -959,12 +975,19 @@ pub(super) fn apply_reasoning_effort(
             }
         },
         "xhigh" | "max" | "highest" => match provider {
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::Sglang => {
+            ApiProvider::Deepseek
+            | ApiProvider::DeepseekCN
+            | ApiProvider::Siliconflow
+            | ApiProvider::Sglang
+            | ApiProvider::Volcengine => {
                 body["reasoning_effort"] = json!("max");
                 body["thinking"] = json!({ "type": "enabled" });
             }
             ApiProvider::Openrouter | ApiProvider::Novita => {
                 body["reasoning_effort"] = json!("xhigh");
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+            ApiProvider::XiaomiMimo => {
                 body["thinking"] = json!({ "type": "enabled" });
             }
             ApiProvider::Fireworks => {
@@ -1074,6 +1097,7 @@ impl DeepSeekClient {
         max_tokens: u32,
     ) -> anyhow::Result<String> {
         let url = api_url(&self.base_url, "beta/completions");
+        let model = wire_model_for_provider(self.api_provider, model);
         let body = json!({
             "model": model,
             "prompt": prompt,
@@ -1101,7 +1125,7 @@ impl DeepSeekClient {
 
 mod chat;
 
-pub(crate) use chat::PromptInspection;
+pub(crate) use chat::{CacheWarmupKey, PromptInspection};
 
 pub(crate) fn inspect_prompt_for_request(request: &MessageRequest) -> PromptInspection {
     chat::inspect_prompt_for_request(request)
@@ -2042,6 +2066,29 @@ mod tests {
                 Some("enabled")
             );
         }
+    }
+
+    #[test]
+    fn reasoning_effort_uses_xiaomi_mimo_thinking_parameter_only() {
+        for input in ["low", "medium", "max", "xhigh"] {
+            let mut body = json!({});
+            apply_reasoning_effort(&mut body, Some(input), ApiProvider::XiaomiMimo);
+
+            assert_eq!(
+                body.pointer("/thinking/type").and_then(Value::as_str),
+                Some("enabled"),
+                "MiMo thinking mapping for {input}"
+            );
+            assert!(body.get("reasoning_effort").is_none());
+        }
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("off"), ApiProvider::XiaomiMimo);
+        assert_eq!(
+            body.pointer("/thinking/type").and_then(Value::as_str),
+            Some("disabled")
+        );
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]

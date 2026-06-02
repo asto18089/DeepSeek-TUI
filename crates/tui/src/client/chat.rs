@@ -9,9 +9,12 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::time::timeout as tokio_timeout;
+
+use crate::config::wire_model_for_provider;
 
 /// Default idle timeout for SSE stream reads (300 seconds = 5 minutes).
 /// After this period with no data, the stream is considered stalled and
@@ -61,7 +64,7 @@ use crate::llm_client::StreamEventBox;
 use crate::logging;
 use crate::models::{
     ContentBlock, ContentBlockStart, Delta, Message, MessageDelta, MessageRequest, MessageResponse,
-    StreamEvent, SystemPrompt, Tool, ToolCaller, Usage,
+    StreamEvent, SystemPrompt, Tool, ToolCaller, Usage, model_supports_reasoning,
 };
 
 use super::{
@@ -71,17 +74,30 @@ use super::{
     release_stream_buffer, system_to_instructions, to_api_tool_name,
 };
 
+fn apply_provider_token_limit(body: &mut Value, provider: ApiProvider, max_tokens: u32) {
+    if provider != ApiProvider::XiaomiMimo {
+        return;
+    }
+
+    if let Some(object) = body.as_object_mut() {
+        object.remove("max_tokens");
+    }
+    body["max_completion_tokens"] = json!(max_tokens);
+}
+
 impl DeepSeekClient {
     pub(super) async fn create_message_chat(
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse> {
         let messages = build_chat_messages_for_request_and_provider(request, self.api_provider);
+        let model = wire_model_for_provider(self.api_provider, &request.model);
         let mut body = json!({
-            "model": request.model,
+            "model": model,
             "messages": messages,
             "max_tokens": request.max_tokens,
         });
+        apply_provider_token_limit(&mut body, self.api_provider, request.max_tokens);
 
         if let Some(temperature) = request.temperature {
             body["temperature"] = json!(temperature);
@@ -90,12 +106,24 @@ impl DeepSeekClient {
             body["top_p"] = json!(top_p);
         }
         if let Some(tools) = request.tools.as_ref() {
-            body["tools"] = json!(
-                tools
-                    .iter()
-                    .map(|tool| tool_to_chat_for_base_url(tool, &self.base_url))
-                    .collect::<Vec<_>>()
-            );
+            let mut chat_tools: Vec<_> = tools
+                .iter()
+                .map(|tool| tool_to_chat_for_base_url(tool, &self.base_url))
+                .collect();
+            // Kimi / Moonshot enforces stricter JSON Schema: `type` must be
+            // inside `anyOf` / `oneOf` items, not on the parent (#2438).
+            if matches!(self.api_provider, crate::config::ApiProvider::Moonshot) {
+                for t in &mut chat_tools {
+                    if let Some(fn_obj) = t
+                        .as_object_mut()
+                        .and_then(|t| t.get_mut("function"))
+                        .and_then(|f| f.get_mut("parameters"))
+                    {
+                        crate::tools::schema_sanitize::sanitize_for_kimi(fn_obj);
+                    }
+                }
+            }
+            body["tools"] = json!(chat_tools);
         }
         if let Some(choice) = request.tool_choice.as_ref()
             && let Some(mapped) = map_tool_choice_for_chat(choice)
@@ -147,8 +175,9 @@ impl DeepSeekClient {
     ) -> Result<StreamEventBox> {
         // Try true SSE streaming via chat completions (widely supported)
         let messages = build_chat_messages_for_request_and_provider(&request, self.api_provider);
+        let model = wire_model_for_provider(self.api_provider, &request.model);
         let mut body = json!({
-            "model": request.model,
+            "model": model.clone(),
             "messages": messages,
             "max_tokens": request.max_tokens,
             "stream": true,
@@ -156,6 +185,7 @@ impl DeepSeekClient {
                 "include_usage": true
             },
         });
+        apply_provider_token_limit(&mut body, self.api_provider, request.max_tokens);
 
         if let Some(temperature) = request.temperature {
             body["temperature"] = json!(temperature);
@@ -164,12 +194,24 @@ impl DeepSeekClient {
             body["top_p"] = json!(top_p);
         }
         if let Some(tools) = request.tools.as_ref() {
-            body["tools"] = json!(
-                tools
-                    .iter()
-                    .map(|tool| tool_to_chat_for_base_url(tool, &self.base_url))
-                    .collect::<Vec<_>>()
-            );
+            let mut chat_tools: Vec<_> = tools
+                .iter()
+                .map(|tool| tool_to_chat_for_base_url(tool, &self.base_url))
+                .collect();
+            // Kimi / Moonshot enforces stricter JSON Schema: `type` must be
+            // inside `anyOf` / `oneOf` items, not on the parent (#2438).
+            if matches!(self.api_provider, crate::config::ApiProvider::Moonshot) {
+                for t in &mut chat_tools {
+                    if let Some(fn_obj) = t
+                        .as_object_mut()
+                        .and_then(|t| t.get_mut("function"))
+                        .and_then(|f| f.get_mut("parameters"))
+                    {
+                        crate::tools::schema_sanitize::sanitize_for_kimi(fn_obj);
+                    }
+                }
+            }
+            body["tools"] = json!(chat_tools);
         }
         if let Some(choice) = request.tool_choice.as_ref()
             && let Some(mapped) = map_tool_choice_for_chat(choice)
@@ -192,7 +234,7 @@ impl DeepSeekClient {
         // still produces a valid request.
         let replay_input_tokens = sanitize_thinking_mode_messages(
             &mut body,
-            &request.model,
+            &model,
             request.reasoning_effort.as_deref(),
             self.api_provider,
         );
@@ -214,7 +256,6 @@ impl DeepSeekClient {
             anyhow::bail!("SSE stream request failed: HTTP {status}: {error_text}");
         }
 
-        let model = request.model.clone();
         let api_provider = self.api_provider;
 
         // Capture transport-shape headers before we consume `response` into
@@ -266,7 +307,7 @@ impl DeepSeekClient {
             let mut last_event_at = std::time::Instant::now();
             let mut bytes_received: usize = 0;
 
-            loop {
+            'stream: loop {
                 let chunk_result = match tokio_timeout(idle, byte_stream.next()).await {
                     Ok(Some(result)) => result,
                     Ok(None) => break, // Stream ended normally
@@ -344,32 +385,32 @@ impl DeepSeekClient {
                         // Empty line = event boundary, process accumulated data
                         if !line_buf.is_empty() {
                             let data = std::mem::take(&mut line_buf);
-                            if data.trim() == "[DONE]" {
-                                // Stream complete
-                            } else if let Ok(chunk_json) = serde_json::from_str::<Value>(&data) {
-                                // Parse the SSE chunk into stream events
-                                for mut event in parse_sse_chunk(
-                                    &chunk_json,
-                                    &mut content_index,
-                                    &mut text_started,
-                                    &mut thinking_started,
-                                    &mut tool_indices,
-                                    is_reasoning_model,
-                                ) {
-                                    // Stamp the client-side replay-token estimate
-                                    // onto the final usage so the UI can surface
-                                    // it (#30). We compute it pre-request and
-                                    // overlay it on the server-reported usage at
-                                    // stream completion.
-                                    if let Some(tokens) = replay_input_tokens
-                                        && let StreamEvent::MessageDelta {
-                                            usage: Some(usage),
-                                            ..
-                                        } = &mut event
-                                    {
-                                        usage.reasoning_replay_tokens = Some(tokens);
+                            match parse_sse_data_frame(
+                                &data,
+                                &mut content_index,
+                                &mut text_started,
+                                &mut thinking_started,
+                                &mut tool_indices,
+                                is_reasoning_model,
+                            ) {
+                                SseDataFrame::Done => break 'stream,
+                                SseDataFrame::Events(events) => {
+                                    for mut event in events {
+                                        // Stamp the client-side replay-token estimate
+                                        // onto the final usage so the UI can surface
+                                        // it (#30). We compute it pre-request and
+                                        // overlay it on the server-reported usage at
+                                        // stream completion.
+                                        if let Some(tokens) = replay_input_tokens
+                                            && let StreamEvent::MessageDelta {
+                                                usage: Some(usage),
+                                                ..
+                                            } = &mut event
+                                        {
+                                            usage.reasoning_replay_tokens = Some(tokens);
+                                        }
+                                        yield Ok(event);
                                     }
-                                    yield Ok(event);
                                 }
                             }
                         }
@@ -548,24 +589,75 @@ const TOOL_RESULT_DEDUP_MIN_CHARS: usize = 1_024;
 /// up with tiny `gh auth status` and `cat package.json` files.
 const TOOL_RESULT_SHA_PERSIST_MIN_CHARS: usize = 1_024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PromptInspection {
     pub base_static_prefix_hash: String,
     pub full_request_prefix_hash: String,
+    /// Hash of the rendered tool catalog JSON, or empty when no tools were supplied.
+    pub tool_catalog_hash: String,
     pub layers: Vec<PromptLayerInspection>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Identifies the stable prefix that a cache warmup primes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CacheWarmupKey {
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    pub static_prefix_hash: String,
+    pub tool_catalog_hash: String,
+    pub project_pack_hash: String,
+    pub skills_hash: String,
+}
+
+impl CacheWarmupKey {
+    pub(crate) fn from_inspection(
+        provider: &str,
+        model: &str,
+        base_url: &str,
+        inspection: &PromptInspection,
+    ) -> Self {
+        Self {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            base_url: base_url.to_string(),
+            static_prefix_hash: inspection.base_static_prefix_hash.clone(),
+            tool_catalog_hash: inspection.tool_catalog_hash.clone(),
+            project_pack_hash: layer_hash(inspection, "Project context pack"),
+            skills_hash: layer_hash(inspection, "Skills"),
+        }
+    }
+
+    pub(crate) fn hash_short(&self) -> String {
+        let json = serde_json::to_string(self).unwrap_or_default();
+        let hash = sha256_hex(json.as_bytes());
+        hash[..hash.len().min(12)].to_string()
+    }
+}
+
+fn layer_hash(inspection: &PromptInspection, name: &str) -> String {
+    inspection
+        .layers
+        .iter()
+        .find(|layer| layer.name == name)
+        .map(|layer| layer.sha256.clone())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PromptLayerInspection {
     pub name: String,
     pub stability: PromptLayerStability,
     pub char_len: usize,
+    pub byte_len: usize,
+    /// Rough token estimate for quick before/after cache-hit reports.
+    pub token_estimate: usize,
     pub sha256: String,
     pub tool_result: Option<ToolResultInspection>,
     pub turn_meta: Option<TurnMetaInspection>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ToolResultInspection {
     pub original_chars: usize,
     pub sent_chars: usize,
@@ -573,7 +665,7 @@ pub(crate) struct ToolResultInspection {
     pub deduplicated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TurnMetaInspection {
     pub original_chars: usize,
     pub sent_chars: usize,
@@ -581,7 +673,7 @@ pub(crate) struct TurnMetaInspection {
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PromptLayerStability {
     Static,
     History,
@@ -602,6 +694,7 @@ fn inspect_wire_request(tools: Option<&[Tool]>, messages: &[Value]) -> PromptIns
     let mut layers = Vec::new();
     let mut base_static_prefix_parts = Vec::new();
     let mut full_request_prefix_parts = Vec::new();
+    let mut tool_catalog_hash = String::new();
     let mut start_index = 0;
 
     if let Some(message) = messages.first() {
@@ -625,6 +718,7 @@ fn inspect_wire_request(tools: Option<&[Tool]>, messages: &[Value]) -> PromptIns
     }
 
     if let Some(tool_catalog) = tool_catalog_for_inspect(tools) {
+        tool_catalog_hash = sha256_hex(tool_catalog.as_bytes());
         base_static_prefix_parts.push(tool_catalog.clone());
         full_request_prefix_parts.push(tool_catalog.clone());
         layers.push(prompt_layer(
@@ -666,6 +760,7 @@ fn inspect_wire_request(tools: Option<&[Tool]>, messages: &[Value]) -> PromptIns
     PromptInspection {
         base_static_prefix_hash: sha256_hex(base_static_prefix.as_bytes()),
         full_request_prefix_hash: sha256_hex(full_request_prefix.as_bytes()),
+        tool_catalog_hash,
         layers,
     }
 }
@@ -837,10 +932,20 @@ fn prompt_layer(
     stability: PromptLayerStability,
     content: &str,
 ) -> PromptLayerInspection {
+    let char_len = content.chars().count();
+    let token_estimate = if char_len == 0 {
+        0
+    } else if content.is_ascii() {
+        (char_len / 4).max(1)
+    } else {
+        char_len.max(1)
+    };
     PromptLayerInspection {
         name,
         stability,
-        char_len: content.chars().count(),
+        char_len,
+        byte_len: content.len(),
+        token_estimate,
         sha256: sha256_hex(content.as_bytes()),
         tool_result: None,
         turn_meta: None,
@@ -1714,22 +1819,16 @@ fn should_replay_reasoning_content_for_provider(
 /// Should the SSE parser treat incoming `reasoning_content` deltas as thinking
 /// (vs. inlining them as answer text)?
 ///
-/// This is the streaming-path twin of `should_replay_reasoning_content_for_provider`:
-/// both must agree on whether a model is a DeepSeek-family reasoning model, or
-/// stream parsing stores reasoning tokens in `content` while the replay path
-/// expects them in `reasoning_content` (DeepSeek thinking-mode API 400s —
-/// #1739 / #1694). Like that predicate's model-aware gate, a known reasoning
-/// model is classified as such on ANY provider (including the generic `openai`
-/// provider used for DeepSeek-compatible endpoints); a genuine non-DeepSeek
-/// model is never reclassified, so #1542 is not regressed.
-///
-/// `provider_accepts_reasoning_content(provider) || requires_reasoning_content(model)`
-/// short-circuits to `requires_reasoning_content(model)` once the model gate
-/// already holds, so the effective rule is purely model-driven — kept explicit
-/// here to mirror the predicate above.
+/// DeepSeek-family models are classified on any provider because their API
+/// requires `reasoning_content` replay on later turns (#1739 / #1694). Other
+/// known reasoning-capable large models are classified only on providers whose
+/// streaming shape exposes reasoning fields, so `reasoning`/`reasoning_content`
+/// deltas become Thinking cells instead of leaking as normal answer text.
 fn is_reasoning_model_for_stream(provider: ApiProvider, model: &str) -> bool {
-    requires_reasoning_content(model)
-        && (provider_accepts_reasoning_content(provider) || requires_reasoning_content(model))
+    if requires_reasoning_content(model) {
+        return true;
+    }
+    provider_accepts_reasoning_content(provider) && model_supports_reasoning(model)
 }
 
 fn provider_accepts_reasoning_content(provider: ApiProvider) -> bool {
@@ -1739,8 +1838,10 @@ fn provider_accepts_reasoning_content(provider: ApiProvider) -> bool {
             | ApiProvider::DeepseekCN
             | ApiProvider::NvidiaNim
             | ApiProvider::Openrouter
+            | ApiProvider::XiaomiMimo
             | ApiProvider::Novita
             | ApiProvider::Fireworks
+            | ApiProvider::Siliconflow
             | ApiProvider::Sglang
     )
 }
@@ -1950,6 +2051,38 @@ fn build_stream_events(response: &MessageResponse) -> Vec<StreamEvent> {
 }
 
 // === SSE Chunk Parser ===
+
+enum SseDataFrame {
+    Done,
+    Events(Vec<StreamEvent>),
+}
+
+fn parse_sse_data_frame(
+    data: &str,
+    content_index: &mut u32,
+    text_started: &mut bool,
+    thinking_started: &mut bool,
+    tool_indices: &mut std::collections::HashMap<u32, u32>,
+    is_reasoning_model: bool,
+) -> SseDataFrame {
+    if data.trim() == "[DONE]" {
+        return SseDataFrame::Done;
+    }
+    let events = serde_json::from_str::<Value>(data).map_or_else(
+        |_| Vec::new(),
+        |chunk_json| {
+            parse_sse_chunk(
+                &chunk_json,
+                content_index,
+                text_started,
+                thinking_started,
+                tool_indices,
+                is_reasoning_model,
+            )
+        },
+    );
+    SseDataFrame::Events(events)
+}
 
 /// Parse a single SSE chunk from the Chat Completions streaming API into
 /// our internal `StreamEvent` representation.
@@ -2400,6 +2533,45 @@ mod stream_decoder_tests {
     }
 
     #[test]
+    fn decoder_does_not_render_reasoning_as_text_for_known_provider_models() {
+        let mut content_index = 0u32;
+        let mut text_started = false;
+        let mut thinking_started = false;
+        let mut tool_indices = std::collections::HashMap::new();
+        let is_reasoning_model =
+            is_reasoning_model_for_stream(ApiProvider::XiaomiMimo, "mimo-v2.5-pro");
+        let events = parse_sse_chunk(
+            &serde_json::json!({
+                "choices": [{
+                    "delta": {
+                        "reasoning_content": "private plan"
+                    }
+                }]
+            }),
+            &mut content_index,
+            &mut text_started,
+            &mut thinking_started,
+            &mut tool_indices,
+            is_reasoning_model,
+        );
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta {
+                delta: Delta::ThinkingDelta { thinking },
+                ..
+            } if thinking == "private plan"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta {
+                delta: Delta::TextDelta { text },
+                ..
+            } if text == "private plan"
+        )));
+    }
+
+    #[test]
     fn decoder_treats_reasoning_content_as_text_when_provider_does_not_support_reasoning() {
         let events = decode_chunk_with_reasoning(
             r#"{"choices":[{"delta":{"reasoning_content":"hello"}}]}"#,
@@ -2449,6 +2621,32 @@ mod stream_decoder_tests {
             events.is_empty(),
             "empty-choices chunk must produce no events; got {events:?}"
         );
+    }
+
+    #[test]
+    fn decoder_treats_done_frame_as_terminal() {
+        let mut content_index = 0u32;
+        let mut text_started = false;
+        let mut thinking_started = false;
+        let mut tool_indices = std::collections::HashMap::new();
+
+        let outcome = parse_sse_data_frame(
+            "  [DONE]  ",
+            &mut content_index,
+            &mut text_started,
+            &mut thinking_started,
+            &mut tool_indices,
+            true,
+        );
+
+        assert!(
+            matches!(outcome, SseDataFrame::Done),
+            "`data: [DONE]` must terminate the stream instead of waiting for the HTTP connection to close"
+        );
+        assert_eq!(content_index, 0);
+        assert!(!text_started);
+        assert!(!thinking_started);
+        assert!(tool_indices.is_empty());
     }
 
     #[test]
@@ -2848,8 +3046,12 @@ mod stream_decoder_tests {
     }
 
     #[test]
-    fn request_builder_deduplicates_large_identical_tool_results_with_retrieval_hint() {
+    fn request_builder_deduplicates_medium_identical_tool_results_with_retrieval_hint() {
         with_tool_result_sha_spillover_root(|| {
+            // 2,000 chars is intentionally above TOOL_RESULT_DEDUP_MIN_CHARS
+            // (1,024) but below TOOL_RESULT_SENT_CHAR_BUDGET (12,000). This
+            // verifies the cache-saving path for repeated medium outputs that
+            // do not otherwise need truncation.
             let output = "A".repeat(2_000);
             let messages = vec![
                 tool_use_message("tool-1", "read_file", json!({"path": "README.md"})),
@@ -2863,6 +3065,7 @@ mod stream_decoder_tests {
             let second = tool_message_content(&built, 1);
 
             assert_eq!(first, output);
+            assert!(!first.contains("[TOOL_RESULT_TRUNCATED]"), "got: {first}");
             assert!(
                 second.starts_with("<TOOL_RESULT_REF sha=\""),
                 "got: {second}"
@@ -3102,11 +3305,12 @@ mod alias_thinking_detection_tests {
     //! turn. See upstream API docs:
     //! https://api-docs.deepseek.com/guides/thinking_mode
     use super::{
-        is_reasoning_model_for_stream, provider_accepts_reasoning_content,
-        requires_reasoning_content, should_replay_reasoning_content,
-        should_replay_reasoning_content_for_provider,
+        apply_provider_token_limit, is_reasoning_model_for_stream,
+        provider_accepts_reasoning_content, requires_reasoning_content,
+        should_replay_reasoning_content, should_replay_reasoning_content_for_provider,
     };
     use crate::config::ApiProvider;
+    use serde_json::json;
 
     #[test]
     fn aliases_routed_to_v4_require_reasoning_content() {
@@ -3172,6 +3376,25 @@ mod alias_thinking_detection_tests {
         assert!(!provider_accepts_reasoning_content(ApiProvider::Openai));
         assert!(provider_accepts_reasoning_content(ApiProvider::Deepseek));
         assert!(provider_accepts_reasoning_content(ApiProvider::NvidiaNim));
+        assert!(provider_accepts_reasoning_content(ApiProvider::XiaomiMimo));
+    }
+
+    #[test]
+    fn xiaomi_mimo_uses_max_completion_tokens_payload_key() {
+        let mut body = json!({
+            "model": "mimo-v2.5-pro",
+            "messages": [],
+            "max_tokens": 8192,
+        });
+
+        apply_provider_token_limit(&mut body, ApiProvider::XiaomiMimo, 8192);
+
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(
+            body.get("max_completion_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(8192)
+        );
     }
 
     #[test]
@@ -3242,6 +3465,28 @@ mod alias_thinking_detection_tests {
             ApiProvider::Deepseek,
             "deepseek-v4-pro"
         ));
+    }
+
+    #[test]
+    fn stream_classifies_known_large_reasoning_models_as_reasoning() {
+        // Xiaomi MiMo and OpenRouter/Qwen/Trinity can stream private reasoning through a
+        // `reasoning` delta without using a DeepSeek-looking model name. The
+        // renderer must still route that field into Thinking cells instead
+        // of plain assistant prose.
+        assert!(
+            is_reasoning_model_for_stream(ApiProvider::XiaomiMimo, "mimo-v2.5-pro"),
+            "mimo-v2.5-pro should stream reasoning as thinking on Xiaomi MiMo"
+        );
+        for model in [
+            "arcee-ai/trinity-large-thinking",
+            "minimax/minimax-m3",
+            "xiaomi/mimo-v2.5-pro",
+        ] {
+            assert!(
+                is_reasoning_model_for_stream(ApiProvider::Openrouter, model),
+                "{model} should stream reasoning as thinking on OpenRouter"
+            );
+        }
     }
 
     #[test]

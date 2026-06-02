@@ -833,6 +833,30 @@ impl RuntimeThreadManager {
         }
     }
 
+    pub async fn submit_user_input(
+        &self,
+        thread_id: &str,
+        input_id: &str,
+        response: crate::tools::user_input::UserInputResponse,
+    ) -> Result<bool> {
+        let active = self.active.lock().await;
+        let Some(state) = active.engines.get(thread_id) else {
+            bail!("thread '{thread_id}' not found");
+        };
+        state.engine.submit_user_input(input_id, response).await?;
+        Ok(true)
+    }
+
+    #[allow(dead_code)]
+    pub async fn cancel_user_input(&self, thread_id: &str, input_id: &str) -> Result<bool> {
+        let active = self.active.lock().await;
+        let Some(state) = active.engines.get(thread_id) else {
+            bail!("thread '{thread_id}' not found");
+        };
+        state.engine.cancel_user_input(input_id).await?;
+        Ok(true)
+    }
+
     #[allow(dead_code)]
     pub fn pending_approvals_count(&self) -> usize {
         self.pending_approvals
@@ -1629,6 +1653,7 @@ impl RuntimeThreadManager {
                 auto_approve,
                 translation_enabled: false,
                 show_thinking,
+                allowed_tools: None,
                 approval_mode: if auto_approve {
                     crate::tui::approval::ApprovalMode::Auto
                 } else {
@@ -1994,6 +2019,7 @@ impl RuntimeThreadManager {
             vision_config: self.config.vision_model_config(),
             strict_tool_mode: self.config.strict_tool_mode.unwrap_or(false),
             goal_objective: None,
+            allowed_tools: None,
             locale_tag: crate::localization::resolve_locale(&settings.locale)
                 .tag()
                 .to_string(),
@@ -2001,6 +2027,7 @@ impl RuntimeThreadManager {
             search_provider: self.config.search_provider(),
             search_api_key: self.config.search.as_ref().and_then(|s| s.api_key.clone()),
             tools_always_load: self.config.tools_always_load(),
+            tools: self.config.tools.clone(),
         };
 
         let engine = spawn_engine(engine_cfg, &self.config);
@@ -2657,6 +2684,7 @@ impl RuntimeThreadManager {
                     id,
                     tool_name,
                     description,
+                    intent_summary,
                     ..
                 } => {
                     self.emit_event(
@@ -2669,6 +2697,7 @@ impl RuntimeThreadManager {
                             "approval_id": id,
                             "tool_name": tool_name,
                             "description": description,
+                            "intent_summary": intent_summary,
                         }),
                     )
                     .await?;
@@ -2789,6 +2818,19 @@ impl RuntimeThreadManager {
                         }
                     }
                 }
+                EngineEvent::UserInputRequired { id, request } => {
+                    self.emit_event(
+                        &thread_id,
+                        Some(&turn_id),
+                        None,
+                        "user_input.required",
+                        json!({
+                            "id": id,
+                            "request": request,
+                        }),
+                    )
+                    .await?;
+                }
                 EngineEvent::Status { message } => {
                     let item = TurnItemRecord {
                         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
@@ -2846,6 +2888,7 @@ impl RuntimeThreadManager {
                     usage,
                     status,
                     error,
+                    ..
                 } => {
                     turn_usage = Some(usage);
                     turn_status = match status {
@@ -3670,6 +3713,8 @@ mod tests {
                         },
                         status: TurnOutcomeStatus::Completed,
                         error: None,
+                        tool_catalog: None,
+                        base_url: None,
                     })
                     .await;
             }
@@ -3962,6 +4007,8 @@ mod tests {
                         },
                         status: TurnOutcomeStatus::Completed,
                         error: None,
+                        tool_catalog: None,
+                        base_url: None,
                     })
                     .await;
                 if turn_index >= 2 {
@@ -4177,6 +4224,8 @@ mod tests {
                 id: "tool_stale".to_string(),
                 tool_name: "exec_command".to_string(),
                 description: "stale approval".to_string(),
+                input: serde_json::json!({}),
+                intent_summary: None,
             })
             .await?;
 
@@ -4197,6 +4246,8 @@ mod tests {
                 },
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                base_url: None,
             })
             .await?;
 
@@ -4250,6 +4301,8 @@ mod tests {
                 id: "tool_external_allow".to_string(),
                 tool_name: "exec_command".to_string(),
                 description: "external allow".to_string(),
+                input: serde_json::json!({}),
+                intent_summary: Some("I will update the config file.".to_string()),
             })
             .await?;
 
@@ -4258,6 +4311,20 @@ mod tests {
             sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(manager.pending_approvals_count(), 1);
+
+        let events = manager.events_since(&thread.id, None)?;
+        let approval_event = events
+            .iter()
+            .rev()
+            .find(|event| event.event == "approval.required")
+            .context("missing approval.required event")?;
+        assert_eq!(
+            approval_event
+                .payload
+                .get("intent_summary")
+                .and_then(Value::as_str),
+            Some("I will update the config file.")
+        );
 
         assert!(manager.deliver_external_approval(
             "tool_external_allow",
@@ -4277,6 +4344,8 @@ mod tests {
                 usage: Usage::default(),
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                base_url: None,
             })
             .await?;
         Ok(())
@@ -4327,6 +4396,8 @@ mod tests {
                 id: "tool_external_deny".to_string(),
                 tool_name: "exec_command".to_string(),
                 description: "external deny".to_string(),
+                input: serde_json::json!({}),
+                intent_summary: None,
             })
             .await?;
 
@@ -4353,6 +4424,8 @@ mod tests {
                 usage: Usage::default(),
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                base_url: None,
             })
             .await?;
         Ok(())
@@ -4416,6 +4489,8 @@ mod tests {
                 usage: Usage::default(),
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                base_url: None,
             })
             .await?;
 
@@ -4513,6 +4588,8 @@ mod tests {
                 id: "tool_remember".to_string(),
                 tool_name: "exec_command".to_string(),
                 description: "remember=true".to_string(),
+                input: serde_json::json!({}),
+                intent_summary: None,
             })
             .await?;
 
@@ -4542,6 +4619,8 @@ mod tests {
                 usage: Usage::default(),
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                base_url: None,
             })
             .await?;
         Ok(())
@@ -4622,6 +4701,8 @@ mod tests {
                 },
                 status: TurnOutcomeStatus::Completed,
                 error: None,
+                tool_catalog: None,
+                base_url: None,
             })
             .await?;
 
@@ -4683,6 +4764,8 @@ mod tests {
                         },
                         status: TurnOutcomeStatus::Completed,
                         error: None,
+                        tool_catalog: None,
+                        base_url: None,
                     })
                     .await;
             }
@@ -4793,6 +4876,8 @@ mod tests {
                                 },
                                 status: TurnOutcomeStatus::Completed,
                                 error: None,
+                                tool_catalog: None,
+                                base_url: None,
                             })
                             .await;
                     }
@@ -4823,6 +4908,8 @@ mod tests {
                                 },
                                 status: TurnOutcomeStatus::Completed,
                                 error: None,
+                                tool_catalog: None,
+                                base_url: None,
                             })
                             .await;
                     }
