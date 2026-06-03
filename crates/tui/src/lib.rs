@@ -18,7 +18,6 @@ pub mod config;
 pub mod config_ui;
 pub mod core;
 pub mod cost_status;
-pub mod cycle_manager;
 pub mod deepseek_theme;
 pub mod dependencies;
 pub mod error_taxonomy;

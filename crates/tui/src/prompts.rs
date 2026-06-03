@@ -701,7 +701,7 @@ fn apply_model_template(prompt: &str, model_id: &str) -> String {
 
 const TOOL_TAXONOMY_DISCOVERY: &[&str] = &["grep_files", "file_search"];
 const TOOL_TAXONOMY_GIT: &[&str] = &["git_status", "git_diff"];
-const TOOL_TAXONOMY_VERIFICATION: &[&str] = &["run_tests"];
+const TOOL_TAXONOMY_VERIFICATION: &[&str] = &["run_tests", "run_verifiers"];
 
 fn render_core_tool_taxonomy_block(mode: AppMode) -> String {
     let core_tools = core_taxonomy_tools_for_mode(mode);
@@ -729,7 +729,7 @@ fn core_taxonomy_tools_for_mode(mode: AppMode) -> Vec<&'static str> {
     core_tools
         .iter()
         .copied()
-        .filter(|tool| mode != AppMode::Plan || *tool != "run_tests")
+        .filter(|tool| mode != AppMode::Plan || !matches!(*tool, "run_tests" | "run_verifiers"))
         .collect()
 }
 
@@ -1283,6 +1283,7 @@ mod tests {
         );
         assert!(
             !expected_taxonomy.contains("run_tests")
+                && !expected_taxonomy.contains("run_verifiers")
                 && !expected_taxonomy.contains("for verification")
                 && !expected_taxonomy.contains("Use  "),
             "Plan taxonomy must not advertise unavailable verification tools: {expected_taxonomy:?}"

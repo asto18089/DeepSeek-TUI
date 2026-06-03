@@ -7,6 +7,173 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.51] - 2026-06-02
+
+### Added
+
+- **Arcee AI as a direct provider.** New `[providers.arcee]` config block and
+  `ARCEE_API_KEY` / `ARCEE_BASE_URL` / `ARCEE_MODEL` environment variables,
+  wired through CLI auth (`codewhale auth set --provider arcee`), the TUI
+  provider picker, and the model registry. The default direct-API model is
+  `trinity-large-thinking` (reasoning-capable, 262K context and 262K max
+  output); `trinity-large-preview` (262K context, non-reasoning) and
+  `trinity-mini` (128K context) are also selectable. OpenRouter's
+  `arcee-ai/trinity-large-thinking` route remains separate.
+- **Arcee Cloudflare-WAF compatibility.** The opening turn to the Arcee gateway
+  uses a benign read-only tool surface (`read_file`, `list_dir`, `file_search`,
+  `grep_files`, `git_status`, `git_diff`, `checklist_write`, `update_plan`) and
+  splits example payloads such as `python -c …` out of the system prompt, so the
+  WAF does not reject the first request; the full tool catalog stays reachable
+  through tool-search. `trinity-large-thinking`'s `reasoning_content` is
+  recognized and replayed on tool-call turns.
+- **Expanded model catalog.** Added context-window, max-output, and
+  reasoning-capability metadata for additional model IDs, including
+  `qwen/qwen3.6-flash`, `qwen/qwen3.6-plus`, `qwen/qwen3.6-max-preview`, and
+  Xiaomi MiMo v2.5 chat/ASR/TTS variants; `trinity-large-preview`'s context
+  window was corrected to 262K.
+- **Provider-aware model picker.** The picker groups models by provider, shows
+  per-model hints, and remembers a saved model per provider.
+
+### Changed
+
+- **Auto-compaction is now percentage- and model-aware.** The per-model
+  threshold helper is `compaction_threshold_for_model_at_percent(model,
+  percent)` (replacing the effort-based variant), and the default
+  `auto_compact_threshold_percent` is 80%. Auto-compaction defaults on for
+  models with a context window of 256K or smaller and stays opt-in for 1M-token
+  models (e.g. DeepSeek V4) to protect prefix-cache economics, unless the user
+  has explicitly set `auto_compact`.
+- **Clearer provider/gateway errors.** HTTP error bodies are sanitized before
+  display — HTML interstitials and Cloudflare "Access Denied" pages collapse to
+  a one-line reason (with the ray/error ID) instead of dumping raw markup into
+  the transcript — and 403s are split into authentication vs. authorization
+  (gateway/WAF block) categories.
+- The invalid-model error now names the active provider and lists Arcee among
+  the options.
+
+### Removed
+
+- **The session "cycle" / checkpoint-restart system.** Removed the `/cycles`,
+  `/cycle <n>`, and `/recall` commands, the `recall_archive` tool, the
+  cycle-handoff briefing prompt, the sidebar "cycles" lines, and the
+  `cycle_manager` engine plumbing (`EngineConfig.cycle`, `Event::CycleAdvanced`,
+  seam-manager cycle thresholds and flash briefings). Long sessions no longer
+  auto-reset their context at a fixed token boundary — reclaim budget with
+  `/compact` or model-aware auto-compaction instead. Existing on-disk cycle
+  archives are left untouched but are no longer read or written.
+
+### Fixed
+
+- Assistant turns no longer leave an orphaned role glyph (the stray "blue dot")
+  when a turn streams only whitespace between reasoning and a tool call.
+- Scrolling the mouse wheel over the right-hand sidebar no longer leaks into the
+  transcript scroll.
+- The sidebar hover tooltip now appears only for truncated lines, sits below the
+  cursor, and uses a neutral surface color instead of the warning-orange
+  highlight that overlapped neighbouring rows.
+- Corrected the README's description of the Constitution (Article VII is the
+  hierarchy itself; Article II's truth duty overrides even a user request) to
+  match `prompts/base.md`.
+- Repaired release-blocking unit and integration tests left failing by the
+  cycle-removal and compaction-threshold refactors (relay instruction,
+  model-reject message, compaction budget, mock-LLM threshold helper).
+- Fixed DEC private-mode CSI fragment leakage into composer text after
+  terminal resets, restoring clean prompt editing (#2592).
+- The engine now recovers from turn-level panics instead of killing the
+  main event loop, keeping the session alive through transient failures
+  (#2583, #1269).
+- Deeply nested files are now discoverable via @-mention and Ctrl+P file
+  picker; the default walk depth was relaxed to handle monorepo layouts (#2488).
+- Command-palette selection stays visible when scrolling through long lists
+  instead of scrolling off-screen (#2590).
+- exec_shell child processes now inherit .NET/NuGet and Windows app-data
+  environment variables, fixing toolchain resolution on Windows (#1857).
+- A warning is emitted when shell/sandbox config keys are nested under
+  unknown top-level sections instead of being silently ignored (#2589).
+- Diff-render now preserves leading whitespace in patch content lines,
+  fixing an extra-space regression in PR previews (#2591). Thanks @zlh124.
+- Model selection from the /model command now persists per-provider across
+  restarts, with a warning when persistence fails.
+
+### Community
+
+Thanks to **@zlh124** (#2591) and **@reidliu41** (#2601) for the fixes
+harvested into this release. Thanks also to **@idling11** (#2602),
+**@gordonlu** (#2585), **@cyq1017** (#2593), **@xyuai** (#2587, #2584),
+and **@IcedOranges** (#2584) for reports, drafts, and investigations
+that shaped this release cycle.
+
+## [0.8.50] - 2026-06-02
+
+### Added
+
+- Added a Windows NSIS installer release artifact and classroom/lab deployment
+  checklist, harvested from #2045 for #1987. The release workflow now builds
+  `CodeWhaleSetup.exe` from the canonical Windows binaries, and the installer
+  adds/removes only the exact current-user PATH entry.
+- Added deterministic session timestamps in session listings, receipt-export
+  boundary docs, and current-model turn metadata for routed/auto sessions.
+- Added exact AtlasCloud provider-hinted model ID pass-through for explicit
+  `vendor/model-id` selections, harvested from #2569 without freezing a
+  brittle provider catalog.
+- Added Xiaomi MiMo speech/TTS support with a `codewhale speech` CLI command,
+  `tts` tool alias, and config wiring for voice-design and voice-clone models,
+  harvested from #2560.
+- Added a three-zone immutable prefix diagnostic layer (FrozenPrefix Phase 2)
+  that logs cache-prefix drift at debug level without blocking requests,
+  harvested from #2514.
+- Added a Cache Guard CI integration test suite simulating prefix-cache
+  behaviour across nine scenarios, gated behind `CODEWHALE_CACHE_GUARD=1`,
+  harvested from #2503.
+- Added a plan-mode byte-stability invariant test verifying that the tool
+  catalog head remains byte-identical across mode toggles, harvested from
+  #2519.
+- Localized all 15 `/queue` command messages across 7 shipped locales,
+  harvested from #2568.
+- Added localized `FanoutCounts` MessageId for i18n of the aggregate worker
+  stats line in fanout cards, harvested from #2566.
+- Added contribution gate CI workflows (PR gate, issue gate, contributor
+  approval) with a dry-run mode, harvested from #2565.
+
+### Changed
+
+- Hardened theme repainting and sidebar color use so theme switches do not
+  leave stale Whale-dark panel colors behind.
+- Made legacy config migration visible when CodeWhale copies old DeepSeek-era
+  config into the CodeWhale config path.
+
+### Fixed
+
+- Fixed `/context` to use the effective routed model for context-window
+  budgeting, so DeepSeek V4 routes report the 1M-token window and legacy
+  DeepSeek routes keep the 128K fallback.
+- Fixed npm wrapper version output so `--version` prefers the installed binary
+  version instead of stale package metadata when both are available.
+- Fixed multiline composer arrow navigation so holding Up/Down at the first or
+  last line no longer replaces the current draft with prompt history.
+- Fixed foreground `exec_shell` output collection so timeout and inherited-pipe
+  cleanup cannot wedge later tool calls behind the global tool lock.
+- Clarified the English DeepSeek account-balance footer chip from `bal` to
+  `balance` so it is less likely to be mistaken for session spend.
+- Fixed truncated subagent tool calls and repeated truncated subagent responses
+  so they return model-visible errors instead of silently failing.
+- Moved Paste to the first position in the right-click context menu so users
+  copying text from the output area can paste with a single left-click instead
+  of navigating past cell-specific actions.
+
+### Community
+
+Thanks to **@ZhulongNT** (#2045), **@cyq1017** (#2521, #2536, #2537, #2559,
+#2562, #2563, #2564), **@HUQIANTAO** (#2527, #2519, #2503), **@lucaszhu-hue**
+(#2569), **@idling11** (#2573), **@encyc** (#2514), **@xyuai** (#2560),
+**@gordonlu** (#2568, #2566), and **@nightt5879** (#2565) for the work
+harvested into this release pass. Thanks
+also to issue reporters and verification helpers including **@New2Niu**
+(#2561), **@buko** (#2533, #2369), **@wywsoor** (#2494), **@ctxyao** (#2556),
+**@Dr3259** (#2380), **@caiyilian** (#2567), and **@chinaqy110** (#2571) for
+reports and acceptance details that shaped these fixes, plus the WeChat/Chinese
+UX reports relayed during the final triage pass.
+
 ## [0.8.49] - 2026-06-01
 
 ### Added
@@ -5162,7 +5329,8 @@ Welcome — and thank you.
 - Hooks system and config profiles
 - Example skills and launch assets
 
-[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.49...HEAD
+[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.50...HEAD
+[0.8.50]: https://github.com/Hmbown/CodeWhale/compare/v0.8.49...v0.8.50
 [0.8.49]: https://github.com/Hmbown/CodeWhale/compare/v0.8.48...v0.8.49
 [0.8.48]: https://github.com/Hmbown/CodeWhale/compare/v0.8.47...v0.8.48
 [0.8.47]: https://github.com/Hmbown/CodeWhale/compare/v0.8.46...v0.8.47

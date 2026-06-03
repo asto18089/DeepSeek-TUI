@@ -221,12 +221,32 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
         return Vec::new();
     }
 
+    // Scroll events while the cursor is over the right-hand sidebar must not
+    // drive the transcript scroll. The sidebar is a fixed dashboard with no
+    // scroll state of its own, so consume the wheel event instead of leaking
+    // it into the transcript viewport behind it.
+    if matches!(
+        mouse.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) && app.viewport.last_sidebar_area.is_some_and(|area| {
+        mouse.column >= area.x
+            && mouse.column < area.x.saturating_add(area.width)
+            && mouse.row >= area.y
+            && mouse.row < area.y.saturating_add(area.height)
+    }) {
+        return Vec::new();
+    }
+
     match mouse.kind {
         MouseEventKind::Moved => {
             // Update last mouse position for tooltip rendering.
             app.last_mouse_pos = Some((mouse.column, mouse.row));
 
-            // Check sidebar sections for hover tooltip.
+            // Check sidebar sections for hover tooltip. Only surface a tooltip
+            // when the hovered line was actually truncated to fit the panel
+            // width — otherwise it just paints a redundant copy of
+            // already-visible text over the neighbouring row, which reads as
+            // visual corruption.
             let mut found = false;
             for section in &app.sidebar_hover.sections {
                 if mouse.column >= section.content_area.x
@@ -243,10 +263,12 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
                             .saturating_add(section.content_area.height)
                 {
                     let line_idx = (mouse.row.saturating_sub(section.content_area.y)) as usize;
-                    if line_idx < section.lines.len() {
-                        let new_tooltip = section.lines[line_idx].clone();
-                        if app.sidebar_hover_tooltip.as_deref() != Some(&new_tooltip) {
-                            app.sidebar_hover_tooltip = Some(new_tooltip);
+                    if let Some(full) = section.lines.get(line_idx) {
+                        let truncated = UnicodeWidthStr::width(full.as_str())
+                            > section.content_area.width as usize;
+                        let desired = truncated.then(|| full.clone());
+                        if app.sidebar_hover_tooltip != desired {
+                            app.sidebar_hover_tooltip = desired;
                             app.needs_redraw = true;
                         }
                         found = true;
@@ -524,6 +546,14 @@ pub(crate) fn open_context_menu(app: &mut App, mouse: MouseEvent) {
 pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<ContextMenuEntry> {
     let mut entries = Vec::new();
 
+    // Paste first — the most common action when right-clicking in the
+    // composer after copying text from the output area.
+    entries.push(ContextMenuEntry {
+        label: app.tr(MessageId::CtxMenuPaste).to_string(),
+        description: app.tr(MessageId::CtxMenuPasteDesc).to_string(),
+        action: ContextMenuAction::Paste,
+    });
+
     if selection_has_content(app) {
         entries.push(ContextMenuEntry {
             label: app.tr(MessageId::CtxMenuCopySelection).to_string(),
@@ -597,11 +627,6 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
         });
     }
 
-    entries.push(ContextMenuEntry {
-        label: app.tr(MessageId::CtxMenuPaste).to_string(),
-        description: app.tr(MessageId::CtxMenuPasteDesc).to_string(),
-        action: ContextMenuAction::Paste,
-    });
     entries.push(ContextMenuEntry {
         label: app.tr(MessageId::CtxMenuCmdPalette).to_string(),
         description: app.tr(MessageId::CtxMenuCmdPaletteDesc).to_string(),

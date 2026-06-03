@@ -28,7 +28,7 @@ use crate::client::DeepSeekClient;
 use crate::config::MAX_SUBAGENTS;
 use crate::core::events::Event;
 use crate::llm_client::LlmClient;
-use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt, Tool};
+use crate::models::{ContentBlock, Message, MessageRequest, MessageResponse, SystemPrompt, Tool};
 use crate::tools::handle::VarHandle;
 use crate::tools::plan::{PlanState, SharedPlanState};
 use crate::tools::registry::{ToolRegistry, ToolRegistryBuilder};
@@ -71,6 +71,11 @@ const DEFAULT_MAX_STEPS: u32 = 20;
 /// Task(max_execution_time=300),配合 DEFAULT_MAX_STEPS 防死磕。
 const DEFAULT_SUBAGENT_ELAPSED_MAX: Duration = Duration::from_secs(300);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+// Non-streaming sub-agents need enough response budget to carry large tool-call
+// arguments, especially write_file content. The API bills generated tokens, not
+// the requested ceiling.
+const SUBAGENT_RESPONSE_MAX_TOKENS: u32 = 16_384;
+const MAX_CONSECUTIVE_TRUNCATED_SUBAGENT_RESPONSES: u32 = 5;
 /// Per-step LLM API call timeout. Each `create_message` request must complete
 /// within this window or the step is treated as timed out. Prevents a single
 /// stuck API call from blocking the sub-agent indefinitely.
@@ -491,6 +496,10 @@ impl SubAgentType {
                 "list_dir",
                 "read_file",
                 "write_file",
+                // [pinvou3-fork 組5] append_file 是 pinvou3 一等写工具,implementer
+                // 写重角色的 advisory 列表应与 write_file 并列(test_implementer_
+                // allowed_tools_include_writes 锁此意图);上游列表无此条,sync 时易丢。
+                "append_file",
                 "edit_file",
                 "apply_patch",
                 "grep_files",
@@ -522,6 +531,7 @@ impl SubAgentType {
                 "exec_wait",
                 "exec_interact",
                 "run_tests",
+                "run_verifiers",
                 "diagnostics",
                 "note",
             ],
@@ -796,6 +806,10 @@ pub struct SubAgentRuntime {
     /// false-timeout the child mid-thinking. `child_runtime()` and
     /// `background_runtime()` preserve the parent's value (#1806, #1808).
     pub step_api_timeout: Duration,
+    /// Default directory for Xiaomi MiMo speech/TTS tool outputs inherited by
+    /// child registries. Keeps parent and sub-agent `speech` / `tts` tools on
+    /// the same `[speech].output_dir` / env override.
+    pub speech_output_dir: Option<PathBuf>,
 }
 
 impl SubAgentRuntime {
@@ -831,6 +845,7 @@ impl SubAgentRuntime {
             fork_context: None,
             mcp_pool: None,
             step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
+            speech_output_dir: None,
         }
     }
 
@@ -851,6 +866,13 @@ impl SubAgentRuntime {
     #[must_use]
     pub fn with_step_api_timeout(mut self, timeout: Duration) -> Self {
         self.step_api_timeout = timeout;
+        self
+    }
+
+    /// Preserve the configured speech output directory for sub-agent tools.
+    #[must_use]
+    pub fn with_speech_output_dir(mut self, output_dir: Option<PathBuf>) -> Self {
+        self.speech_output_dir = output_dir;
         self
     }
 
@@ -976,6 +998,7 @@ impl SubAgentRuntime {
             fork_context: self.fork_context.clone(),
             mcp_pool: self.mcp_pool.clone(),
             step_api_timeout: self.step_api_timeout,
+            speech_output_dir: self.speech_output_dir.clone(),
         }
     }
 
@@ -1251,11 +1274,13 @@ impl SubAgentManager {
                     return false;
                 }
                 // Exclude persisted agents with no task_handle (they're not actually running)
-                let Some(handle) = agent.task_handle.as_ref() else {
+                if agent.task_handle.is_none() {
                     return false;
-                };
-                // Exclude agents whose task has finished (status will be updated to Completed shortly)
-                !handle.is_finished()
+                }
+                // Keep recently finished handles counted until the terminal
+                // status update has reconciled. Otherwise a fanout burst can
+                // refill the cap before the UI/state catches up (#2211).
+                true
             })
             .count()
     }
@@ -3656,6 +3681,46 @@ fn subagent_failed_sentinel(agent_id: &str, _err: &str) -> String {
     format!("<codewhale:subagent.done>{payload}</codewhale:subagent.done>")
 }
 
+fn response_was_truncated(response: &MessageResponse) -> bool {
+    response.stop_reason.as_deref() == Some("length")
+}
+
+fn truncated_response_tool_results(tool_uses: &[(String, String, Value)]) -> Vec<ContentBlock> {
+    tool_uses
+        .iter()
+        .map(|(tool_id, tool_name, _)| ContentBlock::ToolResult {
+            tool_use_id: tool_id.clone(),
+            content: format!(
+                "Error: the model response was truncated by max_tokens before the tool call arguments for '{tool_name}' could be fully generated. Split large content into smaller writes and retry."
+            ),
+            is_error: Some(true),
+            content_blocks: None,
+        })
+        .collect()
+}
+
+fn truncated_response_text_retry_message() -> Vec<ContentBlock> {
+    vec![ContentBlock::Text {
+        text: "Error: the model response was truncated by max_tokens. No complete tool call was available, so the partial response was not accepted as the sub-agent result. Retry with a shorter response or split the work into smaller steps.".to_string(),
+        cache_control: None,
+    }]
+}
+
+fn record_truncated_subagent_response(consecutive: &mut u32) -> Result<()> {
+    *consecutive = consecutive.saturating_add(1);
+    if *consecutive > MAX_CONSECUTIVE_TRUNCATED_SUBAGENT_RESPONSES {
+        return Err(anyhow!(
+            "Sub-agent response was truncated by max_tokens {count} consecutive times; stopping to avoid an unbounded retry loop.",
+            count = *consecutive
+        ));
+    }
+    Ok(())
+}
+
+fn reset_truncated_subagent_responses(consecutive: &mut u32) {
+    *consecutive = 0;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn insert_subagent_full_transcript_handle(
     runtime: &SubAgentRuntime,
@@ -3740,6 +3805,7 @@ async fn run_subagent(
     let mut steps = 0;
     let mut final_result: Option<String> = None;
     let mut pending_inputs: VecDeque<SubAgentInput> = VecDeque::new();
+    let mut consecutive_truncated_responses = 0;
 
     for _step in 0..max_steps {
         // [pinvou3-fork] C: elapsed hard cap. 防 subagent 内部死磕重试拖垮整个任务。
@@ -3852,7 +3918,7 @@ async fn run_subagent(
         let request = MessageRequest {
             model: runtime.model.clone(),
             messages: messages.clone(),
-            max_tokens: 4096,
+            max_tokens: SUBAGENT_RESPONSE_MAX_TOKENS,
             system: Some(request_system.clone()),
             tools: Some(tools.clone()),
             tool_choice: Some(json!({ "type": "auto" })),
@@ -3946,6 +4012,35 @@ async fn run_subagent(
             role: "assistant".to_string(),
             content: response.content.clone(),
         });
+
+        if response_was_truncated(&response) {
+            final_result = None;
+            record_truncated_subagent_response(&mut consecutive_truncated_responses)?;
+            let progress = if tool_uses.is_empty() {
+                "response truncated, returning retry instruction".to_string()
+            } else {
+                format!(
+                    "response truncated, returning {} tool error(s)",
+                    tool_uses.len()
+                )
+            };
+            emit_agent_progress(
+                runtime.event_tx.as_ref(),
+                runtime.mailbox.as_ref(),
+                &agent_id,
+                format!("step {steps}/{max_steps}: {progress}"),
+            );
+            messages.push(Message {
+                role: "user".to_string(),
+                content: if tool_uses.is_empty() {
+                    truncated_response_text_retry_message()
+                } else {
+                    truncated_response_tool_results(&tool_uses)
+                },
+            });
+            continue;
+        }
+        reset_truncated_subagent_responses(&mut consecutive_truncated_responses);
 
         if tool_uses.is_empty() {
             while let Ok(input) = input_rx.try_recv() {
