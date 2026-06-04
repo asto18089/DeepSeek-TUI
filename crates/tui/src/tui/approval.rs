@@ -211,7 +211,10 @@ impl ApprovalRequest {
 
 /// Get the category for a tool by name
 pub fn get_tool_category(name: &str) -> ToolCategory {
-    if matches!(name, "write_file" | "edit_file" | "apply_patch") {
+    if matches!(
+        name,
+        "write_file" | "append_file" | "edit_file" | "apply_patch"
+    ) {
         ToolCategory::FileWrite
     } else if matches!(name, "web_run" | "web_search" | "fetch_url") {
         ToolCategory::Network
@@ -963,6 +966,7 @@ mod tests {
     #[test]
     fn test_get_tool_category_file_write_tools() {
         assert_eq!(get_tool_category("write_file"), ToolCategory::FileWrite);
+        assert_eq!(get_tool_category("append_file"), ToolCategory::FileWrite);
         assert_eq!(get_tool_category("edit_file"), ToolCategory::FileWrite);
         assert_eq!(get_tool_category("apply_patch"), ToolCategory::FileWrite);
     }
@@ -1019,6 +1023,7 @@ mod tests {
     fn risk_writes_shell_mcp_action_unknown_route_destructive() {
         for (name, cat) in [
             ("write_file", ToolCategory::FileWrite),
+            ("append_file", ToolCategory::FileWrite),
             ("edit_file", ToolCategory::FileWrite),
             ("apply_patch", ToolCategory::FileWrite),
             ("exec_shell", ToolCategory::Shell),

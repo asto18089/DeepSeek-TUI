@@ -782,6 +782,45 @@ fn tools_always_load_overrides_default_native_deferral() {
     ));
 }
 
+// [pinvou3-fork] 回归保护:Yolo(GUI 单 session)下,pinvou3 必需但不在上游
+// DEFAULT_ACTIVE_NATIVE_TOOLS 白名单的工具(request_user_input / append_file)
+// 必须 offer(不 defer),否则 GUI 调不出 request_user_input 气泡 / 大文件 append_file。
+// 此前 v0.8.47 sync 因上游把 deferral 从 blocklist 改 allowlist 静默踩过(symptom: 气泡消失)。
+//
+// 2026-05-28 补强:`request_user_input` 跨所有 mode 永不 defer(Plan/Agent 也要,
+// 因为 pinvou3 instructions §1.4 + Plan reminder 都引导 AI 用这工具问澄清,
+// 工具表必须永远有它)。实测 case: Plan 模式问"我要做俄罗斯方块"AI 用 text
+// 列 A/B/C 选项而不是 request_user_input 气泡,根因就是非 Yolo 下被 defer。
+#[test]
+fn pinvou3_yolo_offers_nonblocklisted_tools_outside_upstream_default() {
+    let always_load = HashSet::new();
+    for tool in ["request_user_input", "append_file"] {
+        assert!(
+            !pinvou3_should_defer_native_tool(tool, AppMode::Yolo, &always_load),
+            "{tool} 在 Yolo 下不应被 defer(pinvou3 blocklist 模型,GUI 必需)"
+        );
+    }
+    // 黑名单工具即便 Yolo 也 defer
+    assert!(pinvou3_should_defer_native_tool(
+        "git_show",
+        AppMode::Yolo,
+        &always_load
+    ));
+    // request_user_input 跨所有 mode 都不 defer(pinvou3 instructions §1.4 引导用它问澄清)
+    for mode in [AppMode::Yolo, AppMode::Plan, AppMode::Agent] {
+        assert!(
+            !pinvou3_should_defer_native_tool("request_user_input", mode, &always_load),
+            "request_user_input 在 {mode:?} 下不应被 defer(pinvou3 引导调它问澄清,工具表必须有)"
+        );
+    }
+    // 其他非白名单工具(如 append_file)在非 Yolo 下仍回落上游 allowlist 被 defer
+    assert!(pinvou3_should_defer_native_tool(
+        "append_file",
+        AppMode::Agent,
+        &always_load
+    ));
+}
+
 #[test]
 #[ignore = "one-shot metric for scripts/measure-tool-catalog.py"]
 #[allow(clippy::print_stderr)]
@@ -1341,6 +1380,7 @@ fn turn_tool_registry_builder_keeps_plan_mode_read_only_for_files() {
     assert!(registry.contains("read_file"));
     assert!(registry.contains("list_dir"));
     assert!(!registry.contains("write_file"));
+    assert!(!registry.contains("append_file"));
     assert!(!registry.contains("edit_file"));
     assert!(!registry.contains("exec_shell"));
     assert!(!registry.contains("exec_shell_wait"));
@@ -3463,6 +3503,49 @@ fn final_tool_input_repairs_unparseable_buffer() {
     assert_eq!(final_tool_input(&state), json!({}));
 }
 
+#[test]
+fn truncated_args_hint_fires_for_file_write_missing_field() {
+    use crate::tools::spec::ToolError;
+    // write_file / append_file coming back missing a required field is the
+    // SSE-truncation signature → must carry chunking guidance.
+    let hint = truncated_args_hint("write_file", &ToolError::missing_field("path"))
+        .expect("write_file missing field should hint");
+    assert!(hint.contains("append_file"), "{hint}");
+    assert!(truncated_args_hint("append_file", &ToolError::missing_field("content")).is_some());
+    // required_str surfaces a truncated `content` as InvalidInput, not
+    // MissingField — that path must hint too (the observed pinvou3 stall loop).
+    assert!(
+        truncated_args_hint(
+            "write_file",
+            &ToolError::invalid_input("missing required field 'content'. Input provided: path")
+        )
+        .is_some(),
+        "InvalidInput naming a missing required field is a truncation artifact"
+    );
+}
+
+#[test]
+fn truncated_args_hint_skips_other_tools_and_other_errors() {
+    use crate::tools::spec::ToolError;
+    // Non-file-write tools: no hint even on missing field.
+    assert!(truncated_args_hint("exec_shell", &ToolError::missing_field("command")).is_none());
+    // write_file oversize rejection is InvalidInput (already has guidance) — no
+    // double hint. Its message is the over-the-limit text, NOT "missing required
+    // field", so the InvalidInput arm must not match it.
+    assert!(truncated_args_hint("write_file", &ToolError::invalid_input("too big")).is_none());
+    assert!(
+        truncated_args_hint(
+            "write_file",
+            &ToolError::invalid_input(
+                "write_file content is 99999 bytes — over the 64KB single-call limit. \
+                 ... append_file in ≤16KB chunks."
+            )
+        )
+        .is_none(),
+        "oversize rejection already carries guidance — must not double-hint"
+    );
+}
+
 // === #103 transparent stream-retry policy =====================================
 
 #[test]
@@ -3656,6 +3739,13 @@ fn edited_paths_for_write_file_returns_path() {
     let input = json!({ "path": "src/bar.rs", "content": "fn main() {}" });
     let paths = edited_paths_for_tool("write_file", &input);
     assert_eq!(paths, vec![PathBuf::from("src/bar.rs")]);
+}
+
+#[test]
+fn edited_paths_for_append_file_returns_path() {
+    let input = json!({ "path": "src/deck.html", "content": "<section></section>" });
+    let paths = edited_paths_for_tool("append_file", &input);
+    assert_eq!(paths, vec![PathBuf::from("src/deck.html")]);
 }
 
 #[test]
