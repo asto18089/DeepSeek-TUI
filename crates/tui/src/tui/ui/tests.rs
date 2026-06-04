@@ -2238,6 +2238,57 @@ async fn provider_switch_to_deepseek_drops_stale_xiaomi_root_base_url() {
 }
 
 #[tokio::test]
+async fn provider_switch_persists_provider_to_config_for_restart() {
+    let _home = SettingsHomeGuard::new();
+    let tmp = TempDir::new().expect("config tempdir");
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"provider = "arcee"
+
+[providers.xiaomi_mimo]
+base_url = "https://token-plan-sgp.xiaomimimo.com/v1"
+model = "mimo-v2.5-pro"
+api_key = "mimo-key"
+
+[providers.arcee]
+api_key = "arcee-key"
+"#,
+    )
+    .expect("write config");
+
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Arcee;
+    app.model = "auto".to_string();
+    app.config_path = Some(config_path.clone());
+
+    let mut engine = mock_engine_handle();
+    let mut config = Config::load(Some(config_path.clone()), None).expect("load config");
+
+    switch_provider(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ApiProvider::XiaomiMimo,
+        None,
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::XiaomiMimo);
+    assert_eq!(config.provider.as_deref(), Some("xiaomi-mimo"));
+
+    let reloaded = Config::load(Some(config_path.clone()), None).expect("reload config");
+    assert_eq!(reloaded.api_provider(), ApiProvider::XiaomiMimo);
+    assert_eq!(
+        reloaded.deepseek_base_url(),
+        "https://token-plan-sgp.xiaomimimo.com/v1"
+    );
+
+    let settings = crate::settings::Settings::load().expect("load settings");
+    assert_eq!(settings.default_provider.as_deref(), Some("xiaomi-mimo"));
+}
+
+#[tokio::test]
 async fn provider_switch_model_override_updates_target_provider_model_slot() {
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
@@ -2894,6 +2945,154 @@ fn hidden_sidebar_focus_suppresses_sidebar_split_even_when_wide() {
     assert_eq!(sidebar_width_for_chat_area(&app, 120), None);
 }
 
+// ── Sidebar resize-handle mouse tests ──────────────────────────────
+
+fn setup_resize_handle(app: &mut App, handle_x: u16, sidebar_width: u16, total_width: u16) {
+    let y = 2;
+    let h = 10;
+    app.last_sidebar_handle_area = Some(Rect {
+        x: handle_x,
+        y,
+        width: 1,
+        height: h,
+    });
+    app.last_sidebar_area = Some(Rect {
+        x: handle_x,
+        y,
+        width: sidebar_width,
+        height: h,
+    });
+    app.sidebar_resize_total_width = total_width;
+    app.sidebar_width_percent = 28;
+}
+
+#[test]
+fn sidebar_resize_down_on_handle_starts_resizing() {
+    let mut app = create_test_app();
+    setup_resize_handle(&mut app, 80, 33, 120);
+
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 80,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        app.sidebar_resizing,
+        "should start resizing on handle click"
+    );
+    assert_eq!(app.sidebar_resize_anchor_x, 80);
+    assert_eq!(app.sidebar_resize_anchor_width, 33);
+}
+
+#[test]
+fn sidebar_resize_down_outside_handle_does_not_start_resizing() {
+    let mut app = create_test_app();
+    setup_resize_handle(&mut app, 80, 33, 120);
+
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 79, // one column left of handle
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        !app.sidebar_resizing,
+        "should not resize on non-handle click"
+    );
+}
+
+#[test]
+fn sidebar_resize_drag_adjusts_width_percent() {
+    let mut app = create_test_app();
+    setup_resize_handle(&mut app, 80, 33, 120);
+    // 33 / 120 * 100 ≈ 27.5 → initial percent = 28 (the setup defaults to 28)
+    app.sidebar_width_percent = 28;
+    app.sidebar_resizing = true;
+    app.sidebar_resize_anchor_x = 80;
+    app.sidebar_resize_anchor_width = 33;
+
+    // Drag left by 4 cols (making sidebar wider): 33 + 4 = 37 → 37/120*100 ≈ 30
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 76,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    let expected = ((37u32 * 100) / 120) as u16; // ~30
+    assert_eq!(app.sidebar_width_percent, expected);
+}
+
+#[test]
+fn sidebar_resize_drag_clamps_to_10_50_range() {
+    let mut app = create_test_app();
+    setup_resize_handle(&mut app, 80, 33, 120);
+    app.sidebar_resizing = true;
+    app.sidebar_resize_anchor_x = 80;
+    app.sidebar_resize_anchor_width = 33;
+
+    // Drag far right → sidebar should shrink but not below 10%
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 200,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(app.sidebar_width_percent >= 10);
+
+    // Drag far left → sidebar should grow but not above 50%
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 0,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(app.sidebar_width_percent <= 50);
+}
+
+#[test]
+fn sidebar_resize_up_ends_resizing_and_marks_dirty() {
+    let mut app = create_test_app();
+    setup_resize_handle(&mut app, 80, 33, 120);
+    app.sidebar_resizing = true;
+    app.sidebar_resize_anchor_x = 80;
+    app.sidebar_resize_anchor_width = 33;
+
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 76,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(!app.sidebar_resizing, "should stop resizing on mouse up");
+    assert!(
+        app.sidebar_width_dirty,
+        "should mark width dirty for persistence"
+    );
+}
+
 fn make_subagent(
     id: &str,
     status: crate::tools::subagent::SubAgentStatus,
@@ -2934,6 +3133,46 @@ fn sort_subagents_orders_running_before_terminal_statuses() {
     assert_eq!(agents[0].agent_id, "agent_a");
     assert_eq!(agents[1].agent_id, "agent_b");
     assert_eq!(agents[2].agent_id, "agent_c");
+}
+
+#[test]
+fn subagent_hook_preview_is_bounded_on_char_boundaries() {
+    let text = format!("{}{}", "鲸".repeat(900), "tail");
+
+    let (preview, truncated) = bounded_subagent_hook_preview(&text);
+
+    assert!(truncated);
+    assert!(preview.ends_with("...[truncated]"));
+    assert!(preview.len() <= SUBAGENT_HOOK_PREVIEW_LIMIT + "...[truncated]".len());
+    assert!(preview.is_char_boundary(preview.len()));
+}
+
+#[test]
+fn subagent_completion_status_reads_done_sentinel() {
+    let result = r#"done
+<codewhale:subagent.done>{"agent_id":"agent_x","status":"completed"}</codewhale:subagent.done>"#;
+
+    assert_eq!(
+        subagent_completion_status(result).as_deref(),
+        Some("completed")
+    );
+    assert_eq!(subagent_completion_status("no sentinel"), None);
+}
+
+#[test]
+fn subagent_completion_status_reads_summary_fallbacks() {
+    assert_eq!(
+        subagent_completion_status("Cancelled").as_deref(),
+        Some("cancelled")
+    );
+    assert_eq!(
+        subagent_completion_status("Failed: tool timed out").as_deref(),
+        Some("failed")
+    );
+    assert_eq!(
+        subagent_completion_status("Interrupted: process restarted").as_deref(),
+        Some("interrupted")
+    );
 }
 
 #[test]

@@ -51,6 +51,7 @@ use crate::core::events::Event as EngineEvent;
 use crate::core::ops::{Op, USER_SHELL_TOOL_ID_PREFIX};
 use crate::hooks::{HookEvent, HookExecutor};
 use crate::llm_client::LlmClient;
+use crate::localization::{MessageId, tr};
 use crate::models::{
     ContentBlock, Message, MessageRequest, SystemPrompt, Usage, context_window_for_model,
 };
@@ -60,6 +61,7 @@ use crate::session_manager::{
     OfflineQueueState, QueuedSessionMessage, SavedSession, SessionManager,
     create_saved_session_with_id_and_mode, create_saved_session_with_mode, update_session,
 };
+use crate::settings::Settings;
 use crate::task_manager::{
     NewTaskRequest, SharedTaskManager, TaskManager, TaskManagerConfig, TaskStatus, TaskSummary,
 };
@@ -148,6 +150,7 @@ const CONTEXT_CRITICAL_THRESHOLD_PERCENT: f64 = 95.0;
 const CONTEXT_SUGGEST_COMPACT_THRESHOLD_PERCENT: f64 = 60.0;
 const UI_IDLE_POLL_MS: u64 = 48;
 const UI_ACTIVE_POLL_MS: u64 = 24;
+const SUBAGENT_HOOK_PREVIEW_LIMIT: usize = 2_048;
 const WEB_CONFIG_POLL_MS: u64 = 16;
 const DISPATCH_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum wall-clock time a turn may stay in `"in_progress"` before the UI
@@ -647,6 +650,97 @@ fn terminal_probe_timeout(config: &Config) -> Duration {
     Duration::from_millis(timeout_ms)
 }
 
+fn execute_subagent_observer_hook(
+    app: &App,
+    event: HookEvent,
+    agent_id: &str,
+    text_field: &str,
+    text: &str,
+) {
+    if !app.hooks.has_hooks_for_event(event) {
+        return;
+    }
+
+    let (preview, truncated) = bounded_subagent_hook_preview(text);
+    let context = app.base_hook_context().with_message(&preview);
+    let mut payload = serde_json::json!({
+        "event": event.as_str(),
+        "agent_id": agent_id,
+        "session_id": context.session_id.as_deref(),
+        "workspace": context.workspace.as_ref().map(|path| path.display().to_string()),
+        "mode": context.mode.as_deref(),
+        "model": context.model.as_deref(),
+        "total_tokens": context.total_tokens,
+    });
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            format!("{text_field}_preview"),
+            serde_json::Value::String(preview),
+        );
+        object.insert(
+            format!("{text_field}_truncated"),
+            serde_json::Value::Bool(truncated),
+        );
+    }
+
+    if event == HookEvent::SubagentComplete {
+        payload["status"] = serde_json::Value::String(
+            subagent_completion_status(text).unwrap_or_else(|| "unknown".to_string()),
+        );
+    }
+
+    let hooks = app.hooks.clone();
+    let _ = std::thread::Builder::new()
+        .name(format!("{}-observer-hook", event.as_str()))
+        .spawn(move || {
+            let _ = hooks.execute_json_observer(event, &context, &payload);
+        });
+}
+
+fn bounded_subagent_hook_preview(text: &str) -> (String, bool) {
+    if text.len() <= SUBAGENT_HOOK_PREVIEW_LIMIT {
+        return (text.to_string(), false);
+    }
+    let safe_end = text
+        .char_indices()
+        .take_while(|(idx, ch)| idx + ch.len_utf8() <= SUBAGENT_HOOK_PREVIEW_LIMIT)
+        .last()
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .unwrap_or(0);
+    (format!("{}...[truncated]", &text[..safe_end]), true)
+}
+
+fn subagent_completion_status(result: &str) -> Option<String> {
+    const START: &str = "<codewhale:subagent.done>";
+    const END: &str = "</codewhale:subagent.done>";
+
+    if let Some(start) = result.find(START).map(|idx| idx + START.len())
+        && let Some(end) = result[start..].find(END).map(|idx| idx + start)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&result[start..end])
+        && let Some(status) = value.get("status").and_then(serde_json::Value::as_str)
+    {
+        return Some(status.to_string());
+    }
+
+    let summary = result.lines().find_map(|line| {
+        let trimmed = line.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })?;
+    let summary = summary.to_ascii_lowercase();
+    if matches!(summary.as_str(), "cancelled" | "canceled")
+        || summary.starts_with("cancelled:")
+        || summary.starts_with("canceled:")
+    {
+        Some("cancelled".to_string())
+    } else if summary == "failed" || summary.starts_with("failed:") {
+        Some("failed".to_string())
+    } else if summary == "interrupted" || summary.starts_with("interrupted:") {
+        Some("interrupted".to_string())
+    } else {
+        None
+    }
+}
+
 struct TerminalCleanupGuard {
     use_alt_screen: bool,
     use_mouse_capture: bool,
@@ -777,6 +871,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         runtime_services: app.runtime_services.clone(),
         subagent_model_overrides: config.subagent_model_overrides(),
         subagent_api_timeout: Duration::from_secs(config.subagent_api_timeout_secs()),
+        subagent_heartbeat_timeout: Duration::from_secs(config.subagent_heartbeat_timeout_secs()),
         prefer_bwrap: config.prefer_bwrap.unwrap_or(false),
         memory_enabled: config.memory_enabled(),
         memory_path: config.memory_path(),
@@ -1991,6 +2086,13 @@ async fn run_event_loop(
                     }
                     EngineEvent::AgentSpawned { id, prompt } => {
                         let prompt_summary = summarize_tool_output(&prompt);
+                        execute_subagent_observer_hook(
+                            app,
+                            HookEvent::SubagentSpawn,
+                            &id,
+                            "prompt",
+                            &prompt,
+                        );
                         app.agent_progress
                             .insert(id.clone(), format!("starting: {prompt_summary}"));
                         if app.agent_activity_started_at.is_none() {
@@ -2015,6 +2117,13 @@ async fn run_event_loop(
                         app.status_message = Some(format!("Sub-agent {id}: {display}"));
                     }
                     EngineEvent::AgentComplete { id, result } => {
+                        execute_subagent_observer_hook(
+                            app,
+                            HookEvent::SubagentComplete,
+                            &id,
+                            "result",
+                            &result,
+                        );
                         let subagent_elapsed = app
                             .agent_activity_started_at
                             .or(app.turn_started_at)
@@ -2624,6 +2733,14 @@ async fn run_event_loop(
                 {
                     return Ok(());
                 }
+                // Persist sidebar width when the user finishes a drag-to-resize.
+                if app.sidebar_width_dirty {
+                    app.sidebar_width_dirty = false;
+                    if let Ok(mut settings) = Settings::load() {
+                        settings.update_sidebar_width(app.sidebar_width_percent);
+                        let _ = settings.save();
+                    }
+                }
                 continue;
             }
 
@@ -3024,6 +3141,14 @@ async fn run_event_loop(
                 .await?
                 {
                     return Ok(());
+                }
+                // Persist sidebar width when the user finishes a drag-to-resize.
+                if app.sidebar_width_dirty {
+                    app.sidebar_width_dirty = false;
+                    if let Ok(mut settings) = Settings::load() {
+                        settings.update_sidebar_width(app.sidebar_width_percent);
+                        let _ = settings.save();
+                    }
                 }
                 continue;
             }
@@ -4740,6 +4865,7 @@ async fn dispatch_user_message(
                 translation_enabled: app.translation_enabled,
                 model_id: &app.model,
                 show_thinking: app.show_thinking,
+                allow_shell: app.allow_shell,
             },
         ),
     );
@@ -5203,6 +5329,8 @@ async fn switch_provider(
     }
 
     let new_model = config.default_model();
+    let new_base_url = config.deepseek_base_url();
+    let new_endpoint = display_base_url_host(&new_base_url);
     let cache_scope_changed = previous_provider != target || previous_model != new_model;
     app.api_provider = target;
     app.model_ids_passthrough = config.model_ids_pass_through();
@@ -5241,28 +5369,45 @@ async fn switch_provider(
         })
         .await;
 
-    app.add_message(HistoryCell::System {
-        content: format!(
-            "Provider switched: {} → {}\nModel: {} → {}",
-            previous_provider.as_str(),
-            target.as_str(),
-            previous_model,
-            new_model
-        ),
-    });
-    app.status_message = Some(format!("Provider: {}", target.as_str()));
+    let persist_warning = (|| -> anyhow::Result<()> {
+        commands::persist_root_string_key(app.config_path.as_deref(), "provider", target.as_str())?;
 
-    // Persist the provider choice so it survives restarts.
-    if let Ok(mut settings) = crate::settings::Settings::load() {
+        let mut settings = crate::settings::Settings::load()?;
         settings.default_provider = Some(target.as_str().to_string());
         if model_override.is_some() {
             settings.set_model_for_provider(target.as_str(), &new_model);
             if matches!(target, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
-                let _ = settings.set("default_model", &new_model);
+                settings.set("default_model", &new_model)?;
             }
         }
-        let _ = settings.save();
+        settings.save()?;
+        Ok(())
+    })()
+    .err()
+    .map(|err| format!("Provider selection was not fully persisted: {err}"));
+
+    let mut switch_summary = format!(
+        "Provider switched: {} → {}",
+        previous_provider.as_str(),
+        target.as_str(),
+    );
+    switch_summary.push(char::from(10));
+    switch_summary.push_str(&format!("Model: {} → {}", previous_model, new_model));
+    switch_summary.push(char::from(10));
+    switch_summary.push_str(&format!("Endpoint: {}", new_endpoint));
+    if let Some(ref warning) = persist_warning {
+        switch_summary.push(char::from(10));
+        switch_summary.push_str(warning);
     }
+    app.add_message(HistoryCell::System {
+        content: switch_summary,
+    });
+
+    let mut status_message = format!("Provider: {} via {}", target.as_str(), new_endpoint);
+    if persist_warning.is_some() {
+        status_message.push_str(" (not fully persisted)");
+    }
+    app.status_message = Some(status_message);
 }
 
 fn root_base_url_belongs_to_non_deepseek_provider(base_url: &str) -> bool {
@@ -5284,6 +5429,18 @@ fn root_base_url_belongs_to_non_deepseek_provider(base_url: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn display_base_url_host(base_url: &str) -> String {
+    let without_scheme = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest);
+    without_scheme
+        .split('/')
+        .next()
+        .filter(|host| !host.is_empty())
+        .unwrap_or(base_url)
+        .to_string()
 }
 
 fn sync_config_provider_from_app(config: &mut Config, app: &App) {
@@ -5313,9 +5470,9 @@ pub(crate) fn open_context_inspector(app: &mut App) {
         .last_transcript_area
         .map(|area| area.width)
         .unwrap_or(80);
-    let content = build_context_inspector_text(app);
+    let content = build_context_inspector_text(app, app.ui_locale);
     app.view_stack.push(PagerView::from_text(
-        "Context inspector",
+        tr(app.ui_locale, MessageId::CtxInspTitle),
         &content,
         width.saturating_sub(2),
     ));
@@ -5399,29 +5556,21 @@ async fn apply_command_result(
                 let _ = engine_handle.send(Op::ListSubAgents).await;
             }
             AppAction::FetchModels => {
-                if crate::config::provider_passes_model_through(config.api_provider()) {
-                    app.add_message(HistoryCell::System {
-                        content: format!(
-                            "/models is not supported by the {} provider.",
-                            config.api_provider().display_name()
-                        ),
-                    });
-                } else {
-                    app.status_message = Some("Fetching models...".to_string());
-                    match fetch_available_models(config).await {
-                        Ok(models) => {
-                            app.add_message(HistoryCell::System {
-                                content: format_helpers::available_models_message(
-                                    &app.model, &models,
-                                ),
-                            });
-                            app.status_message = Some(format!("Found {} model(s)", models.len()));
-                        }
-                        Err(error) => {
-                            app.add_message(HistoryCell::System {
-                                content: format!("Failed to fetch models: {error}"),
-                            });
-                        }
+                app.status_message = Some("Fetching models...".to_string());
+                match fetch_available_models(config).await {
+                    Ok(models) => {
+                        app.add_message(HistoryCell::System {
+                            content: format_helpers::available_models_message(&app.model, &models),
+                        });
+                        app.status_message = Some(format!("Found {} model(s)", models.len()));
+                    }
+                    Err(error) => {
+                        app.add_message(HistoryCell::System {
+                            content: format!(
+                                "Failed to fetch models from {}: {error}",
+                                config.api_provider().display_name()
+                            ),
+                        });
                     }
                 }
             }
@@ -6068,20 +6217,13 @@ async fn execute_command_input(
     // (#343). The on-disk side is handled by clear_api_key() inside
     // commands::config::logout.
     if input.trim().eq_ignore_ascii_case("/logout") {
+        // Only clear the active provider's in-memory API key, not every
+        // provider.  The on-disk clear_api_key() inside commands::config::logout
+        // already removes all saved keys; clearing only the active slot here
+        // prevents surprising side-effects when the user has multiple providers
+        // configured.
         config.api_key = None;
-        if let Some(providers) = config.providers.as_mut() {
-            providers.deepseek.api_key = None;
-            providers.deepseek_cn.api_key = None;
-            providers.nvidia_nim.api_key = None;
-            providers.openai.api_key = None;
-            providers.atlascloud.api_key = None;
-            providers.openrouter.api_key = None;
-            providers.novita.api_key = None;
-            providers.fireworks.api_key = None;
-            providers.sglang.api_key = None;
-            providers.vllm.api_key = None;
-            providers.ollama.api_key = None;
-        }
+        config.provider_config_for_mut(app.api_provider).api_key = None;
         app.api_key_env_only = crate::config::active_provider_uses_env_only_api_key(config);
     }
     apply_command_result(
@@ -6485,12 +6627,15 @@ fn render(f: &mut Frame, app: &mut App) {
             crate::config::ApiProvider::XiaomiMimo => Some("MiMo"),
             crate::config::ApiProvider::Novita => Some("Novita"),
             crate::config::ApiProvider::Fireworks => Some("Fireworks"),
-            crate::config::ApiProvider::Siliconflow => Some("SiliconFlow"),
+            crate::config::ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => {
+                Some("SiliconFlow")
+            }
             crate::config::ApiProvider::Arcee => Some("Arcee"),
             crate::config::ApiProvider::Moonshot => Some("Kimi"),
             crate::config::ApiProvider::Sglang => Some("SGLang"),
             crate::config::ApiProvider::Vllm => Some("vLLM"),
             crate::config::ApiProvider::Ollama => Some("Ollama"),
+            crate::config::ApiProvider::Huggingface => Some("HF"),
         };
         let status_indicator_started_at = if app.low_motion {
             None
@@ -6557,6 +6702,8 @@ fn render(f: &mut Frame, app: &mut App) {
             };
 
         if let Some(sidebar_width) = sidebar_width_for_chat_area(app, chat_area.width) {
+            // Record total width for drag-to-resize percentage calculation.
+            app.sidebar_resize_total_width = chat_area.width;
             let split = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Min(1), Constraint::Length(sidebar_width)])
@@ -6574,7 +6721,53 @@ fn render(f: &mut Frame, app: &mut App) {
         chat_widget.render(chat_area, buf);
 
         if let Some(sidebar_area) = sidebar_area {
+            // Store sidebar area for mouse hit-testing (resize handle).
+            app.last_sidebar_area = Some(sidebar_area);
+
+            // Render sidebar
             super::sidebar::render_sidebar(f, sidebar_area, app);
+
+            // Paint resize handle (1-col draggable bar) on the left edge of
+            // the sidebar, over the sidebar content. Mouse drag on this strip
+            // adjusts sidebar_width_percent in real time.
+            let handle_rect = Rect {
+                x: sidebar_area.x,
+                y: sidebar_area.y,
+                width: 1,
+                height: sidebar_area.height,
+            };
+
+            // Store for mouse event handler.
+            app.last_sidebar_handle_area = Some(handle_rect);
+
+            let mouse_over = app.last_mouse_pos.is_some_and(|(col, row)| {
+                row >= handle_rect.y
+                    && row < handle_rect.y.saturating_add(handle_rect.height)
+                    && col == handle_rect.x
+            });
+
+            let handle_style = if app.sidebar_resizing {
+                Style::default()
+                    .bg(palette::DEEPSEEK_BLUE)
+                    .fg(palette::TEXT_PRIMARY)
+            } else if mouse_over {
+                Style::default()
+                    .bg(palette::STATUS_WARNING)
+                    .fg(palette::TEXT_MUTED)
+            } else {
+                Style::default()
+                    .bg(palette::DEEPSEEK_SLATE)
+                    .fg(palette::TEXT_MUTED)
+            };
+
+            let buf = f.buffer_mut();
+            for row in handle_rect.y..handle_rect.y.saturating_add(handle_rect.height) {
+                if row < buf.area().height {
+                    buf[(handle_rect.x, row)]
+                        .set_char('│')
+                        .set_style(handle_style);
+                }
+            }
 
             // Render sidebar hover tooltip if active.
             if let Some(ref tooltip_text) = app.sidebar_hover_tooltip
@@ -7450,12 +7643,13 @@ async fn apply_provider_picker_api_key(
             ApiProvider::XiaomiMimo => &mut providers.xiaomi_mimo,
             ApiProvider::Novita => &mut providers.novita,
             ApiProvider::Fireworks => &mut providers.fireworks,
-            ApiProvider::Siliconflow => &mut providers.siliconflow,
+            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => &mut providers.siliconflow,
             ApiProvider::Arcee => &mut providers.arcee,
             ApiProvider::Moonshot => &mut providers.moonshot,
             ApiProvider::Sglang => &mut providers.sglang,
             ApiProvider::Vllm => &mut providers.vllm,
             ApiProvider::Ollama => &mut providers.ollama,
+            ApiProvider::Huggingface => &mut providers.huggingface,
         };
         entry.api_key = Some(api_key);
     }
@@ -7506,12 +7700,13 @@ fn set_provider_auth_mode_in_memory(config: &mut Config, provider: ApiProvider, 
         ApiProvider::XiaomiMimo => &mut providers.xiaomi_mimo,
         ApiProvider::Novita => &mut providers.novita,
         ApiProvider::Fireworks => &mut providers.fireworks,
-        ApiProvider::Siliconflow => &mut providers.siliconflow,
+        ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => &mut providers.siliconflow,
         ApiProvider::Arcee => &mut providers.arcee,
         ApiProvider::Moonshot => &mut providers.moonshot,
         ApiProvider::Sglang => &mut providers.sglang,
         ApiProvider::Vllm => &mut providers.vllm,
         ApiProvider::Ollama => &mut providers.ollama,
+        ApiProvider::Huggingface => &mut providers.huggingface,
     };
     entry.auth_mode = Some(auth_mode);
 }

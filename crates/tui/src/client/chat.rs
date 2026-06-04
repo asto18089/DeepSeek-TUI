@@ -70,7 +70,7 @@ use crate::models::{
 
 use super::{
     DeepSeekClient, ERROR_BODY_MAX_BYTES, SSE_BACKPRESSURE_HIGH_WATERMARK,
-    SSE_BACKPRESSURE_SLEEP_MS, SSE_MAX_LINES_PER_CHUNK, acquire_stream_buffer, api_url,
+    SSE_BACKPRESSURE_SLEEP_MS, SSE_MAX_LINES_PER_CHUNK, acquire_stream_buffer, api_url_with_suffix,
     apply_reasoning_effort, bounded_error_text, from_api_tool_name, parse_usage,
     release_stream_buffer, system_to_instructions, to_api_tool_name,
 };
@@ -137,7 +137,11 @@ impl DeepSeekClient {
             self.api_provider,
         );
 
-        let url = api_url(&self.base_url, "chat/completions");
+        let url = api_url_with_suffix(
+            &self.base_url,
+            "chat/completions",
+            self.path_suffix.as_deref(),
+        );
         let open_timeout = stream_open_timeout();
         let response = match tokio_timeout(
             open_timeout,
@@ -245,7 +249,11 @@ impl DeepSeekClient {
             self.api_provider,
         );
 
-        let url = api_url(&self.base_url, "chat/completions");
+        let url = api_url_with_suffix(
+            &self.base_url,
+            "chat/completions",
+            self.path_suffix.as_deref(),
+        );
         let response = self
             .send_with_retry(|| self.http_client.post(&url).json(&body))
             .await?;
@@ -851,6 +859,31 @@ fn message_content_for_inspect(message: &Value) -> String {
     {
         parts.push(content.to_string());
     }
+    if let Some(content) = message.get("content").and_then(Value::as_array) {
+        for part in content {
+            match part.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = part.get("text").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        parts.push(text.to_string());
+                    }
+                }
+                Some("image_url") => {
+                    let url = part
+                        .get("image_url")
+                        .and_then(|image_url| image_url.get("url"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    parts.push(format!(
+                        "[image_url:{}]",
+                        summarize_image_url_for_inspect(url)
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
     if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str)
         && !reasoning.is_empty()
     {
@@ -860,6 +893,13 @@ fn message_content_for_inspect(message: &Value) -> String {
         parts.push(tool_calls.to_string());
     }
     parts.join("\n")
+}
+
+fn summarize_image_url_for_inspect(url: &str) -> String {
+    let Some((prefix, encoded)) = url.split_once(";base64,") else {
+        return first_chars(url, 96);
+    };
+    format!("{prefix};base64,<{} chars>", encoded.len())
 }
 
 fn tool_result_inspection_for_message(message: &Value) -> Option<ToolResultInspection> {
@@ -1348,6 +1388,7 @@ fn build_chat_messages_with_reasoning(
     for (message_index, message) in messages.iter().enumerate() {
         let role = message.role.as_str();
         let mut text_parts = Vec::new();
+        let mut image_parts = Vec::new();
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
         let mut tool_call_infos = Vec::new();
@@ -1365,6 +1406,14 @@ fn build_chat_messages_with_reasoning(
                     } else {
                         text_parts.push(text.clone());
                     }
+                }
+                ContentBlock::ImageUrl { image_url } => {
+                    image_parts.push(json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_url.url.clone(),
+                        },
+                    }));
                 }
                 ContentBlock::Thinking { thinking } => thinking_parts.push(thinking.clone()),
                 ContentBlock::ToolUse {
@@ -1479,10 +1528,25 @@ fn build_chat_messages_with_reasoning(
             }
         } else if role == "user" {
             let content = text_parts.join("\n");
-            if !content.trim().is_empty() {
+            let has_text = !content.trim().is_empty();
+            let has_images = !image_parts.is_empty();
+            if has_text || has_images {
+                let wire_content = if has_images {
+                    let mut parts = Vec::new();
+                    if has_text {
+                        parts.push(json!({
+                            "type": "text",
+                            "text": content,
+                        }));
+                    }
+                    parts.extend(image_parts);
+                    json!(parts)
+                } else {
+                    json!(content)
+                };
                 let mut msg = json!({
                     "role": "user",
-                    "content": content,
+                    "content": wire_content,
                 });
                 if include_tool_budget_metadata && let Some(turn_meta) = &turn_meta_budget {
                     msg["_turn_meta_budget"] = turn_meta_budget_json(turn_meta);
@@ -2108,6 +2172,7 @@ fn build_stream_events(response: &MessageResponse) -> Vec<StreamEvent> {
                 events.push(StreamEvent::ContentBlockStop { index });
             }
             ContentBlock::ToolResult { .. } => {}
+            ContentBlock::ImageUrl { .. } => {}
             ContentBlock::ServerToolUse { id, name, input } => {
                 events.push(StreamEvent::ContentBlockStart {
                     index,

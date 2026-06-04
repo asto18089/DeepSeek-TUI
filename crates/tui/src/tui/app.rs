@@ -40,6 +40,7 @@ use crate::tui::history::{HistoryCell, TranscriptRenderOptions};
 use crate::tui::paste_burst::{FlushResult, PasteBurst};
 use crate::tui::scrolling::{MouseScrollState, TranscriptLineMeta, TranscriptScroll};
 use crate::tui::selection::{SelectionAutoscroll, TranscriptSelection};
+use crate::tui::sidebar::SidebarWorkSummary;
 use crate::tui::streaming::StreamingState;
 use crate::tui::transcript::TranscriptViewCache;
 use crate::tui::views::ViewStack;
@@ -1297,8 +1298,26 @@ pub struct App {
     pub sidebar_hover: SidebarHoverState,
     /// Current hover tooltip text, if any.
     pub sidebar_hover_tooltip: Option<String>,
+    /// Last successfully rendered Work panel summary. Transient mutex misses
+    /// should not wipe completed checklist/strategy state from the sidebar.
+    pub(crate) cached_work_summary: Option<SidebarWorkSummary>,
     /// Last known mouse position for tooltip placement.
     pub last_mouse_pos: Option<(u16, u16)>,
+    /// Whether the user is currently dragging the sidebar resize handle.
+    pub sidebar_resizing: bool,
+    /// Mouse column at the start of a sidebar-resize drag.
+    pub sidebar_resize_anchor_x: u16,
+    /// Sidebar width in columns at the start of a sidebar-resize drag.
+    pub sidebar_resize_anchor_width: u16,
+    /// Last sidebar area rendered (for mouse hit-testing the resize handle).
+    pub last_sidebar_area: Option<Rect>,
+    /// Handle rect painted on the left edge of the sidebar (1 col).
+    pub last_sidebar_handle_area: Option<Rect>,
+    /// Total horizontal space (chat + sidebar) used to compute the percentage
+    /// during sidebar resize drag.
+    pub sidebar_resize_total_width: u16,
+    /// Sidebar width changed during this drag and needs persistence.
+    pub sidebar_width_dirty: bool,
     /// Whether the session-context panel is enabled (#504).
     pub context_panel: bool,
     /// File-tree pane state. `None` when hidden; `Some` when visible.
@@ -2019,7 +2038,15 @@ impl App {
             sidebar_focus,
             sidebar_hover: SidebarHoverState::default(),
             sidebar_hover_tooltip: None,
+            cached_work_summary: None,
             last_mouse_pos: None,
+            sidebar_resizing: false,
+            sidebar_resize_anchor_x: 0,
+            sidebar_resize_anchor_width: 0,
+            last_sidebar_area: None,
+            last_sidebar_handle_area: None,
+            sidebar_resize_total_width: 0,
+            sidebar_width_dirty: false,
             context_panel: settings.context_panel,
             file_tree: None,
             file_tree_visible: false,

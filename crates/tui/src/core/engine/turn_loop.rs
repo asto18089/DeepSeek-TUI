@@ -79,7 +79,7 @@ impl Engine {
         const MAX_STREAM_RETRIES: u32 = 3;
         let mut stream_retry_attempts: u32 = 0;
 
-        loop {
+        'turn_loop: loop {
             if self.cancel_token.is_cancelled() {
                 let _ = self.tx_event.send(Event::status("Request cancelled")).await;
                 return (TurnOutcomeStatus::Interrupted, None);
@@ -322,7 +322,9 @@ impl Engine {
             // Three-zone prefix contract (#2264): freeze baseline on first
             // turn, verify against it on subsequent turns. Operates alongside
             // PrefixStabilityManager as an independent diagnostic layer.
-            // Phase 2: warn-only, auto-re-freeze on drift.
+            // Phase 3: emit a one-shot 'frozen' event on first turn.
+            // Drift is logged (tracing::debug!) but not re-emitted —
+            // PrefixStabilityManager already reports the change above.
             let system_text =
                 crate::prefix_cache::system_prompt_text(self.session.system_prompt.as_ref());
             let current_tools: &[crate::models::Tool] = active_tools.as_deref().unwrap_or_default();
@@ -346,7 +348,19 @@ impl Engine {
                         self.session.system_prompt.as_ref(),
                         current_tools.to_vec(),
                     );
-                    self.session.frozen_prefix = Some(pinned.freeze());
+                    let frozen = pinned.freeze();
+                    let _ = self
+                        .tx_event
+                        .send(Event::PrefixCacheChange {
+                            description: format!("frozen: {}", frozen.short_id()),
+                            system_prompt_changed: false,
+                            tools_changed: false,
+                            stability_pct: 100,
+                            changed: false,
+                            pinned_combined_hash: frozen.hash().to_string(),
+                        })
+                        .await;
+                    self.session.frozen_prefix = Some(frozen);
                 }
             }
 
@@ -1050,11 +1064,14 @@ impl Engine {
                     completions.push(c);
                 }
                 if completions.is_empty() {
-                    let running = {
-                        let mgr = self.subagent_manager.read().await;
-                        mgr.running_count()
-                    };
-                    if should_hold_turn_for_subagents(completions.len(), running) {
+                    loop {
+                        let running = {
+                            let mgr = self.subagent_manager.read().await;
+                            mgr.running_count()
+                        };
+                        if !should_hold_turn_for_subagents(completions.len(), running) {
+                            break;
+                        }
                         let _ = self
                             .tx_event
                             .send(Event::status(format!(
@@ -1077,6 +1094,7 @@ impl Engine {
                                 while let Ok(extra) = self.rx_subagent_completion.try_recv() {
                                     completions.push(extra);
                                 }
+                                break;
                             }
                             Some(steer) = self.rx_steer.recv() => {
                                 let trimmed = steer.trim().to_string();
@@ -1097,7 +1115,21 @@ impl Engine {
                                         .await;
                                 }
                                 turn.next_step();
-                                continue;
+                                continue 'turn_loop;
+                            }
+                            () = tokio::time::sleep(self.config.subagent_heartbeat_timeout) => {
+                                let auto_cancelled = {
+                                    let mut mgr = self.subagent_manager.write().await;
+                                    mgr.cleanup(std::time::Duration::from_secs(60 * 60))
+                                };
+                                if auto_cancelled > 0 {
+                                    let _ = self
+                                        .tx_event
+                                        .send(Event::status(format!(
+                                            "Auto-cancelled {auto_cancelled} stale sub-agent(s) after no progress"
+                                        )))
+                                        .await;
+                                }
                             }
                         }
                     }

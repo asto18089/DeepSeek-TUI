@@ -46,7 +46,7 @@ use crate::tools::spec::RuntimeToolServices;
 use crate::tools::spec::{ApprovalRequirement, ToolError, ToolResult};
 use crate::tools::subagent::{
     Mailbox, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext, SubAgentResult,
-    SubAgentRuntime, SubAgentStatus, SubAgentType, new_shared_subagent_manager,
+    SubAgentRuntime, SubAgentStatus, SubAgentType, new_shared_subagent_manager_with_timeout,
     resolve_subagent_assignment_route,
 };
 use crate::tools::todo::{SharedTodoList, TodoListSnapshot, new_shared_todo_list};
@@ -314,6 +314,10 @@ pub struct EngineConfig {
     /// once at engine construction, then threaded onto every
     /// `SubAgentRuntime` the engine builds (#1806, #1808).
     pub subagent_api_timeout: Duration,
+    /// No-progress heartbeat timeout for live sub-agents. Used by the manager
+    /// and parent wait loop to auto-cancel stuck children before they exhaust
+    /// the sub-agent slot pool indefinitely (#2614).
+    pub subagent_heartbeat_timeout: Duration,
     /// Native tools that should stay in the model-visible catalog even when
     /// they are outside the small default core surface (#2076).
     pub tools_always_load: HashSet<String>,
@@ -371,6 +375,9 @@ impl Default for EngineConfig {
             search_api_key: None,
             subagent_api_timeout: Duration::from_secs(
                 crate::config::DEFAULT_SUBAGENT_API_TIMEOUT_SECS,
+            ),
+            subagent_heartbeat_timeout: Duration::from_secs(
+                crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS,
             ),
             tools_always_load: HashSet::new(),
             prefer_bwrap: false,
@@ -496,6 +503,8 @@ pub struct Engine {
     /// This keeps prompt refreshes cheap while still noticing append/update
     /// writes from slop ledger tools during the same session.
     slop_ledger_gate_cache: Option<(Option<SystemTime>, Option<String>)>,
+    /// Current operating mode. Updated on `ChangeMode` and `SendMessage`.
+    current_mode: AppMode,
 }
 
 // === Internal tool helpers ===
@@ -538,12 +547,13 @@ impl Engine {
             ApiProvider::XiaomiMimo => "XIAOMI_MIMO_API_KEY/XIAOMI_API_KEY/MIMO_API_KEY",
             ApiProvider::Novita => "NOVITA_API_KEY",
             ApiProvider::Fireworks => "FIREWORKS_API_KEY",
-            ApiProvider::Siliconflow => "SILICONFLOW_API_KEY",
+            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => "SILICONFLOW_API_KEY",
             ApiProvider::Arcee => "ARCEE_API_KEY",
             ApiProvider::Moonshot => "MOONSHOT_API_KEY/KIMI_API_KEY",
             ApiProvider::Sglang => "SGLANG_API_KEY",
             ApiProvider::Vllm => "VLLM_API_KEY",
             ApiProvider::Ollama => "OLLAMA_API_KEY",
+            ApiProvider::Huggingface => "HUGGINGFACE_API_KEY/HF_TOKEN",
         };
 
         Some(format!(
@@ -621,6 +631,7 @@ impl Engine {
                     translation_enabled: config.translation_enabled,
                     model_id: &config.model,
                     show_thinking: config.show_thinking,
+                    allow_shell: config.allow_shell,
                 },
                 session.approval_mode,
             );
@@ -640,8 +651,11 @@ impl Engine {
             crate::prefix_cache::PrefixStabilityManager::new_unpinned()
         });
 
-        let subagent_manager =
-            new_shared_subagent_manager(config.workspace.clone(), config.max_subagents);
+        let subagent_manager = new_shared_subagent_manager_with_timeout(
+            config.workspace.clone(),
+            config.max_subagents,
+            config.subagent_heartbeat_timeout,
+        );
         let shell_manager = config
             .runtime_services
             .shell_manager
@@ -739,6 +753,7 @@ impl Engine {
             slop_ledger_gate_cache: None,
             workshop_vars,
             sandbox_backend,
+            current_mode: AppMode::Agent,
         };
         engine.rehydrate_latest_canonical_state();
 
@@ -1164,11 +1179,23 @@ impl Engine {
                     let _ = self.tx_event.send(Event::AgentList { agents }).await;
                 }
                 Op::ChangeMode { mode } => {
+                    let previous_mode = self.current_mode;
+                    self.current_mode = mode;
                     self.refresh_system_prompt(mode);
                     self.emit_session_updated().await;
+                    // Notify the agent that the mode has changed so it can re-evaluate
+                    // any operations that were blocked by the previous mode's policy.
+                    if previous_mode != mode {
+                        let msg = Self::mode_change_runtime_message(previous_mode, mode);
+                        self.session.add_message(msg);
+                        self.emit_session_updated().await;
+                    }
                     let _ = self
                         .tx_event
-                        .send(Event::status(format!("Mode changed to: {mode:?}")))
+                        .send(Event::status(format!(
+                            "Mode changed to: {}",
+                            mode.description()
+                        )))
                         .await;
                 }
                 Op::SetModel { model, mode } => {
@@ -1308,6 +1335,47 @@ impl Engine {
             .await;
     }
 
+    /// Build a runtime event message notifying the agent that the operating mode has changed.
+    /// This lets the agent re-evaluate any operations that were blocked by the previous mode.
+    fn mode_change_runtime_message(previous_mode: AppMode, new_mode: AppMode) -> Message {
+        let (policy_note, re_eval_hint) = match new_mode {
+            AppMode::Yolo => (
+                "all operations run automatically without requiring user approval",
+                "Re-evaluate any previously blocked write, patch, or shell operations \
+                 — they are now auto-approved.",
+            ),
+            AppMode::Agent => (
+                "read-only operations run silently; writes, patches, and shell \
+                 commands require user approval",
+                "Any operations you ran automatically under YOLO mode now require \
+                 explicit user approval before executing.",
+            ),
+            AppMode::Plan => (
+                "all writes and patches are blocked; shell and code execution are unavailable",
+                "Any previously planned operations that require writes or shell access \
+                 must wait until the mode changes back to Agent or YOLO.",
+            ),
+        };
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: format!(
+                    "<codewhale:runtime_event kind=\"mode_change\" visibility=\"internal\">\n\
+This is an internal runtime event, not user input. The operating mode has changed \
+from {previous} mode to {new} mode.\n\n\
+In {new} mode: {policy}\n\n\
+{re_eval}\n\
+</codewhale:runtime_event>",
+                    previous = previous_mode.description(),
+                    new = new_mode.description(),
+                    policy = policy_note,
+                    re_eval = re_eval_hint,
+                ),
+                cache_control: None,
+            }],
+        }
+    }
+
     async fn add_session_message(&mut self, message: Message) {
         self.session.add_message(message);
         self.emit_session_updated().await;
@@ -1316,11 +1384,13 @@ impl Engine {
     fn turn_metadata_block(
         &self,
         routed_model: &str,
+        mode: AppMode,
         auto_model: bool,
         reasoning_effort: Option<&str>,
         reasoning_effort_auto: bool,
     ) -> ContentBlock {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let mode_label = mode.description();
         let working_set_summary = self
             .session
             .working_set
@@ -1330,6 +1400,7 @@ impl Engine {
 
         let mut lines = vec![
             format!("Current local date: {today}"),
+            format!("Current mode: {mode_label}"),
             format!("Current model: {routed_model}"),
         ];
         if auto_model {
@@ -1352,6 +1423,7 @@ impl Engine {
     fn user_text_message_with_turn_metadata(&self, text: String) -> Message {
         self.user_text_message_with_turn_metadata_for_route(
             text,
+            self.current_mode,
             &self.session.model,
             self.session.auto_model,
             self.session.reasoning_effort.as_deref(),
@@ -1362,6 +1434,7 @@ impl Engine {
     fn user_text_message_with_turn_metadata_for_route(
         &self,
         text: String,
+        mode: AppMode,
         routed_model: &str,
         auto_model: bool,
         reasoning_effort: Option<&str>,
@@ -1372,6 +1445,7 @@ impl Engine {
             content: vec![
                 self.turn_metadata_block(
                     routed_model,
+                    mode,
                     auto_model,
                     reasoning_effort,
                     reasoning_effort_auto,
@@ -1406,6 +1480,9 @@ impl Engine {
     ) {
         // Reset cancel token for fresh turn (in case previous was cancelled)
         self.reset_cancel_token();
+
+        // Track current mode so mid-turn messages include the right mode in turn metadata.
+        self.current_mode = mode;
 
         // Drain stale steer messages from previous turns.
         while self.rx_steer.try_recv().is_ok() {}
@@ -1486,6 +1563,7 @@ impl Engine {
         // Add user message to session
         let user_msg = self.user_text_message_with_turn_metadata_for_route(
             content,
+            mode,
             &model,
             auto_model,
             reasoning_effort.as_deref(),
@@ -2286,6 +2364,7 @@ impl Engine {
                 translation_enabled: self.config.translation_enabled,
                 model_id: &self.config.model,
                 show_thinking: self.config.show_thinking,
+                allow_shell: self.session.allow_shell,
             },
             self.session.approval_mode,
         );
