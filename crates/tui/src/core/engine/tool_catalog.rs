@@ -85,14 +85,61 @@ pub(super) fn should_default_defer_tool(
         .any(|core_tool| core_tool == &name)
 }
 
+/// [pinvou3-fork] pinvou3 用 **blocklist 模型**(显示全部、隐藏黑名单),而上游 v0.8.47
+/// `should_default_defer_tool` 是 **allowlist**(只显示 `DEFAULT_ACTIVE_NATIVE_TOOLS`)。
+/// 两者 philosophy 相反:上游 allowlist 会 defer 掉 `request_user_input` / `append_file` 等
+/// 不在白名单但 pinvou3 必需的工具(symptom: GUI 里 request_user_input 不出气泡)。
+/// 故 Yolo(GUI 单 session)下只 defer 黑名单、其余全显示;非 Yolo 才叠加上游 allowlist。
+/// 单独成函数(而非塞进 should_default_defer_tool)保上游单测纯净。详见 docs/工具表精简方案.md
+pub(super) fn pinvou3_should_defer_native_tool(
+    name: &str,
+    mode: AppMode,
+    always_load: &HashSet<String>,
+) -> bool {
+    if crate::tools::pinvou3_blocklist::is_pinvou3_hidden(name) {
+        return true;
+    }
+    // pinvou3 引导 AI 用 `request_user_input` 处理歧义(instructions §1.4 + Plan
+    // per-turn reminder),工具表里必须永远在。上游 allowlist 没把它加进
+    // `DEFAULT_ACTIVE_NATIVE_TOOLS`,非 Yolo 模式下会被 defer → GUI 不出气泡 →
+    // AI fallback 在 text 里列 A/B/C 选项(实测 case: Plan 模式问 "我要做俄罗斯方块"
+    // 时 AI 用 text 而非气泡)。硬保留,跨所有 mode。
+    if name == REQUEST_USER_INPUT_NAME {
+        return false;
+    }
+    if mode == AppMode::Yolo {
+        return false;
+    }
+    should_default_defer_tool(name, mode, always_load)
+}
+
 pub(super) fn apply_native_tool_deferral(
     catalog: &mut [Tool],
     mode: AppMode,
     always_load: &HashSet<String>,
 ) {
-    for tool in catalog {
-        tool.defer_loading = Some(should_default_defer_tool(&tool.name, mode, always_load));
+    for tool in &mut *catalog {
+        tool.defer_loading = Some(pinvou3_should_defer_native_tool(
+            &tool.name,
+            mode,
+            always_load,
+        ));
     }
+    let active: Vec<&str> = catalog
+        .iter()
+        .filter(|t| !t.defer_loading.unwrap_or(false))
+        .map(|t| t.name.as_str())
+        .collect();
+    let deferred = catalog.len() - active.len();
+    tracing::info!(
+        target: "pinvou3.tool_catalog",
+        mode = ?mode,
+        active_count = active.len(),
+        deferred_count = deferred,
+        total = catalog.len(),
+        active = ?active,
+        "native tool catalog deferral applied"
+    );
 }
 
 /// First-turn native tool surface for Arcee (Trinity).

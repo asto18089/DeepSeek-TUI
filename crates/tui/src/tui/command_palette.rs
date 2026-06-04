@@ -1082,6 +1082,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork patch #41: workspace skill dirs scrapped"]
     fn command_palette_skills_use_workspace_and_configured_directories() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");

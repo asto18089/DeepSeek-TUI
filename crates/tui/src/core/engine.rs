@@ -2661,6 +2661,7 @@ use self::dispatch::{
     final_tool_input, format_tool_error, mcp_tool_approval_description, mcp_tool_is_parallel_safe,
     mcp_tool_is_read_only, parse_parallel_tool_calls, parse_tool_input,
     plan_tool_execution_batches, should_force_update_plan_first, should_stop_after_plan_tool,
+    truncated_args_hint,
 };
 use self::loop_guard::{AttemptDecision, LoopGuard, OutcomeDecision};
 #[cfg(test)]
@@ -2683,7 +2684,7 @@ use self::tool_catalog::{
 #[cfg(test)]
 use self::tool_catalog::{
     TOOL_SEARCH_BM25_NAME, TOOL_SEARCH_REGEX_NAME, maybe_activate_requested_deferred_tool,
-    preflight_requested_deferred_tool, should_default_defer_tool,
+    pinvou3_should_defer_native_tool, preflight_requested_deferred_tool, should_default_defer_tool,
 };
 use self::tool_execution::emit_tool_audit;
 use self::tool_setup::sandbox_policy_for_mode;

@@ -290,6 +290,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "pinvou3 fork patch #41: workspace skill dirs scrapped"]
     async fn execute_finds_skills_in_opencode_dir_via_workspace_discovery() {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
@@ -340,6 +341,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "pinvou3 fork patch #41: workspace skill dirs scrapped"]
     async fn execute_returns_helpful_error_for_unknown_skill() {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
