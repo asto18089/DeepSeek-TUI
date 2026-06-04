@@ -358,7 +358,11 @@ pub fn prefix_allow_matches(pattern: &str, command: &str) -> bool {
 }
 
 /// Safety classification of a command
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `PartialOrd, Ord` (pinvou3-fork): variants declared from safest to most
+/// dangerous so the multi-line analyzer can fold per-line levels via `max`
+/// (analyze_command 的 `\n`/`\r` 分支需要 "取最严级别" 语义)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SafetyLevel {
     /// Command is known to be safe (read-only operations)
     Safe,
@@ -574,12 +578,40 @@ pub fn analyze_command(command: &str) -> SafetyAnalysis {
     let command_lower = command.to_lowercase();
     let command_trimmed = command.trim();
 
+    // pinvou3-fork: 多行命令不再一刀切 Dangerous。原硬规则误伤合理批量操作
+    // (例如 LLM 用 `\n` 串多个 `cp` / `mkdir`),业界 harness (Claude Code /
+    // Codex) 都不拦 newline。改成逐行 recurse 调用 analyze_command,取最严
+    // 级别 + 合并 reasons (附 line 号便于审计)。任一行 Dangerous → 整体 Dangerous,
+    // 否则取最严下限放行。null byte / heredoc 中的真危险 pattern 仍会被各行的
+    // analyze_destructive_patterns 抓到。
     if command.contains('\n') || command.contains('\r') {
-        return SafetyAnalysis::dangerous(
-            command,
-            vec!["Command contains multiple lines".to_string()],
-            vec!["Run one command at a time".to_string()],
-        );
+        let lines: Vec<&str> = command
+            .split(|c| c == '\n' || c == '\r')
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        if lines.is_empty() {
+            // 全空白多行 — 当 noop,以前归 Dangerous 现在放行
+            return SafetyAnalysis::safe(command);
+        }
+        let mut worst_level = SafetyLevel::Safe;
+        let mut reasons = Vec::new();
+        let mut suggestions = Vec::new();
+        for (idx, line) in lines.iter().enumerate() {
+            let line_analysis = analyze_command(line);
+            worst_level = worst_level.max(line_analysis.level);
+            for r in line_analysis.reasons {
+                reasons.push(format!("line {}: {}", idx + 1, r));
+            }
+            for s in line_analysis.suggestions {
+                suggestions.push(format!("line {}: {}", idx + 1, s));
+            }
+        }
+        return SafetyAnalysis {
+            level: worst_level,
+            command: command.to_string(),
+            reasons,
+            suggestions,
+        };
     }
 
     if command.contains('\0') {
@@ -1658,5 +1690,71 @@ mod tests {
                 "Expected 'git push'/'git checkout' NOT to match 'git status' allow_list, but got prefix '{prefix}' for '{cmd}'"
             );
         }
+    }
+
+    // pinvou3-fork: 多行命令逐行分析,不再一刀切 Dangerous。
+    // 原硬规则 (commit b2f6ef56 在 pinvou3-patches 上加的 careful hook) 误伤
+    // LLM 用 `\n` 串多个 cp / mkdir / mv 的合理批量操作 — h3c-ppt P7 阶段
+    // "拷贝 5 个 template 文件" 被无差别拦死。改成逐行 recurse 评估,任一行
+    // Dangerous 才拦。
+    #[test]
+    fn multiline_safe_commands_are_not_blocked() {
+        let cmd = "cp a.html slides/01.html\ncp b.html slides/02.html\nmkdir -p slides/sub";
+        let analysis = analyze_command(cmd);
+        assert!(
+            analysis.level < SafetyLevel::Dangerous,
+            "multi-line cp/mkdir should not be Dangerous, got {:?} ({:?})",
+            analysis.level,
+            analysis.reasons
+        );
+    }
+
+    #[test]
+    fn multiline_with_rm_rf_root_is_blocked() {
+        let cmd = "echo start\nrm -rf /\necho done";
+        let analysis = analyze_command(cmd);
+        assert_eq!(
+            analysis.level,
+            SafetyLevel::Dangerous,
+            "multi-line containing `rm -rf /` must be Dangerous"
+        );
+        assert!(
+            analysis.reasons.iter().any(|r| r.contains("line 2")),
+            "must surface which line was dangerous, got {:?}",
+            analysis.reasons
+        );
+    }
+
+    #[test]
+    fn singleline_rm_rf_still_blocked_regression() {
+        // 回归: 单行 dangerous pattern 不受多行改动影响
+        assert_eq!(analyze_command("rm -rf /").level, SafetyLevel::Dangerous);
+        assert_eq!(analyze_command("rm -rf ~").level, SafetyLevel::Dangerous);
+    }
+
+    #[test]
+    fn crlf_line_endings_also_split() {
+        // Windows / 跨平台行尾也要拆
+        let cmd = "cp a.txt b.txt\r\ncp c.txt d.txt";
+        assert!(analyze_command(cmd).level < SafetyLevel::Dangerous);
+    }
+
+    #[test]
+    fn whitespace_only_multiline_is_safe() {
+        // 全空行/纯空白多行 — 当 noop 放行 (历史上是 Dangerous)
+        assert_eq!(
+            analyze_command("\n\n  \n").level,
+            SafetyLevel::Safe,
+            "empty multi-line should not be Dangerous"
+        );
+    }
+
+    #[test]
+    fn multiline_takes_worst_level_across_lines() {
+        // 多行混合: 1 行 safe (ls) + 1 行 requires-approval (curl) + 1 行 dangerous (rm -rf /)
+        // 应取最严 = Dangerous
+        let cmd = "ls -la\ncurl https://example.com\nrm -rf /";
+        let analysis = analyze_command(cmd);
+        assert_eq!(analysis.level, SafetyLevel::Dangerous);
     }
 }
