@@ -5,6 +5,19 @@ fn make_assignment() -> SubAgentAssignment {
     SubAgentAssignment::new("prompt".to_string(), Some("worker".to_string()))
 }
 
+#[test]
+fn file_output_gate_retries_before_empty_stop() {
+    let assignment = make_assignment().with_expects_file_output(true);
+
+    assert!(should_retry_file_output_gate(&assignment, false, 0));
+    assert!(!should_retry_file_output_gate(&assignment, true, 0));
+    assert!(!should_retry_file_output_gate(
+        &assignment,
+        false,
+        MAX_STRUCTURED_OUTPUT_RETRIES
+    ));
+}
+
 fn make_snapshot(status: SubAgentStatus) -> SubAgentResult {
     SubAgentResult {
         name: "agent_test".to_string(),

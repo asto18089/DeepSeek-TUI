@@ -71,11 +71,16 @@ fn release_resident_leases_for(agent_id: &str) {
 // 注:上游 #2034 改为 `u32::MAX`(取消固定 cap,靠 explicit budget / final-response 终止)。
 // pinvou3 保留固定 cap 作本地弱模型(Qwen3.6)死磕兜底;subagent owner 可评估是否跟进 u32::MAX。
 const DEFAULT_MAX_STEPS: u32 = 20;
-// [pinvou3-fork] C: 单 subagent 内部 elapsed 硬上限 300s (5min)。参考 CrewAI Task(max_execution_time=300)。
-// 防 subagent 内部死磕反复重试任何场景 (web_search 失败 / LLM verbose / tool 卡死)。
+// [pinvou3-fork] C: 单 subagent 内部 elapsed 硬上限。防 subagent 死磕反复重试。
+// [2026-06-02] 300→1500s:本地 vLLM 写多页 deck(slide_writer 12 页 × ~50s/页 + 慢 TTFT)
+// 300s 只够写 ~5 页就砍断、剩页留空壳被 qa 打回。registry 已声明 slide_writer.timeout_secs=1500,
+// 但该值尚未 wired 到此 cap(见 project_subagent_editable_options_ui_todo:per-role timeout 该从
+// registry 取)。在 wiring 落地前,先把全局 const 提到 1500 对齐最大角色预算。
 // (上游 #2034 一并移除了 elapsed cap;pinvou3 保留。)
-const DEFAULT_SUBAGENT_ELAPSED_MAX: Duration = Duration::from_secs(300);
+const DEFAULT_SUBAGENT_ELAPSED_MAX: Duration = Duration::from_secs(1500);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+const WEB_SEARCH_BUDGET: u32 = 6;
+const FETCH_URL_BUDGET: u32 = 8;
 /// Per-step LLM API call timeout. Each `create_message` request must complete
 /// within this window or the step is treated as timed out. Prevents a single
 /// stuck API call from blocking the sub-agent indefinitely.
@@ -338,6 +343,8 @@ pub struct SubAgentAssignment {
     /// `None` = 自由文本角色,走原 write_file + break 逻辑,零影响。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<Value>,
+    #[serde(default)]
+    pub expects_file_output: bool,
 }
 
 impl SubAgentAssignment {
@@ -349,12 +356,18 @@ impl SubAgentAssignment {
             objective,
             role,
             output_schema: None,
+            expects_file_output: false,
         }
     }
 
     /// [pinvou3-fork] 链式设置结构化产出 schema。
     pub(crate) fn with_output_schema(mut self, schema: Option<Value>) -> Self {
         self.output_schema = schema;
+        self
+    }
+
+    pub(crate) fn with_expects_file_output(mut self, expects_file_output: bool) -> Self {
+        self.expects_file_output = expects_file_output;
         self
     }
 }
@@ -3841,6 +3854,10 @@ async fn run_subagent(
         .unwrap_or_else(|| runtime.context.workspace.clone());
     let mut output_submitted: Option<Value> = None;
     let mut structured_retries: u32 = 0;
+    let mut wrote_any_file = false;
+    let mut file_output_retries: u32 = 0;
+    let mut web_search_calls: u32 = 0;
+    let mut fetch_url_calls: u32 = 0;
     // [pinvou3-fork] 结构化产出重试耗尽标志:置位后 loop 结束按 Failed 收尾(修 codex BLOCKER1)。
     let mut structured_failed = false;
     // [codex Q2 复审修] 记最后一次结构化错误(字段校验/落盘),失败时带进 Failed reason 便于排障。
@@ -3981,7 +3998,11 @@ async fn run_subagent(
         let request = MessageRequest {
             model: runtime.model.clone(),
             messages: messages.clone(),
-            max_tokens: 4096,
+            // [pinvou3-fork 2026-06-03] 4096→32768:slide_writer 单步要生成整页 HTML(~150 行),
+            // 4096 token 写到一半就 finish=length 截断、write_file tool_call 不完整 → 该页没写成
+            // (留 ghost 占位)。这是 slide_writer 写页数飘忽(4-9/12)+ 去掉密度反而更差(页放长更
+            // 易超 4096 → 0/12)的真因。32768 给整页 HTML 充足额度(模型 max_model_len 262144)。
+            max_tokens: 32768,
             system: Some(request_system.clone()),
             tools: Some(tools.clone()),
             tool_choice: Some(json!({ "type": "auto" })),
@@ -4042,7 +4063,14 @@ async fn run_subagent(
                 });
             }
             api = tokio::time::timeout(runtime.step_api_timeout, runtime.client.create_message(request)) => {
-                api.map_err(|_| anyhow!("API call timed out after {}s", runtime.step_api_timeout.as_secs()))??
+                // [sa-dbg pinvou3 临时] 抓 slide_writer step3 早停真因
+                let outcome = api.map_err(|_| anyhow!("API call timed out after {}s", runtime.step_api_timeout.as_secs()));
+                if let Err(ref e) = outcome { eprintln!("[sa-dbg] {agent_id} step{steps}: TIMEOUT {e}"); }
+                let inner = outcome?;
+                if let Err(ref e) = inner { eprintln!("[sa-dbg] {agent_id} step{steps}: create_message ERR: {e:?}"); }
+                let resp = inner?;
+                eprintln!("[sa-dbg] {agent_id} step{steps}: ok stop={:?} content_blocks={}", resp.stop_reason, resp.content.len());
+                resp
             }
         };
 
@@ -4145,6 +4173,27 @@ async fn run_subagent(
                         ));
                         break;
                     }
+                } else if should_retry_file_output_gate(
+                    &assignment,
+                    wrote_any_file,
+                    file_output_retries,
+                ) {
+                    file_output_retries += 1;
+                    messages.push(Message {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: "你还没有产出任何文件。必须用 write_file 把你的产物写到信封【产物地址】段给定的绝对路径，这是完成任务的唯一方式，请现在写文件。"
+                                .to_string(),
+                            cache_control: None,
+                        }],
+                    });
+                    emit_agent_progress(
+                        runtime.event_tx.as_ref(),
+                        runtime.mailbox.as_ref(),
+                        &agent_id,
+                        format!("step {steps}/{max_steps}: 催促 write_file({file_output_retries}/{MAX_STRUCTURED_OUTPUT_RETRIES})"),
+                    );
+                    continue;
                 }
                 emit_agent_progress(
                     runtime.event_tx.as_ref(),
@@ -4241,8 +4290,51 @@ async fn run_subagent(
                 }
             } else if tool_name == "request_user_input" && runtime.user_input_tx.is_some() {
                 await_subagent_user_input(runtime, &tool_id, &tool_input).await
+            } else if tool_name == "web_search" {
+                if web_search_calls >= WEB_SEARCH_BUDGET {
+                    "网络搜索预算已用尽(上限 6 次)。请立即根据已获取的信息用 write_file 把你的产物写到【产物地址】指定的绝对路径,不要再搜索或抓取。".to_string()
+                } else {
+                    let output = match tokio::time::timeout(TOOL_TIMEOUT, async {
+                        tool_registry
+                            .execute(&agent_id, &tool_name, tool_input)
+                            .await
+                    })
+                    .await
+                    {
+                        Ok(Ok(output)) => output,
+                        Ok(Err(e)) => format!("Error: {e}"),
+                        Err(_) => format!("Error: Tool {tool_name} timed out"),
+                    };
+                    web_search_calls += 1;
+                    output
+                }
+            } else if tool_name == "fetch_url" {
+                if fetch_url_calls >= FETCH_URL_BUDGET {
+                    "网页抓取预算已用尽(上限 8 次)。请立即用 write_file 写报告，不要再搜索或抓取。".to_string()
+                } else {
+                    let output = match tokio::time::timeout(TOOL_TIMEOUT, async {
+                        tool_registry
+                            .execute(&agent_id, &tool_name, tool_input)
+                            .await
+                    })
+                    .await
+                    {
+                        Ok(Ok(output)) => output,
+                        Ok(Err(e)) => format!("Error: {e}"),
+                        Err(_) => format!("Error: Tool {tool_name} timed out"),
+                    };
+                    fetch_url_calls += 1;
+                    output
+                }
             } else {
-                match tokio::time::timeout(TOOL_TIMEOUT, async {
+                // [2026-06-02] 审计类工具(audit_format 跑 gate_runner.py,合理需 30-60s)
+                // 给更宽超时;其余工具仍用默认 TOOL_TIMEOUT 防挂死。
+                let exec_timeout = if tool_name == "audit_format" {
+                    Duration::from_secs(150)
+                } else {
+                    TOOL_TIMEOUT
+                };
+                match tokio::time::timeout(exec_timeout, async {
                     tool_registry
                         .execute(&agent_id, &tool_name, tool_input)
                         .await
@@ -4261,6 +4353,9 @@ async fn run_subagent(
             } else {
                 !result.starts_with("Error:")
             };
+            if tool_ok && (tool_name == "write_file" || tool_name == "append_file") {
+                wrote_any_file = true;
+            }
             emit_agent_progress(
                 runtime.event_tx.as_ref(),
                 runtime.mailbox.as_ref(),
@@ -4310,12 +4405,15 @@ async fn run_subagent(
 
     release_resident_leases_for(&agent_id);
     // [codex BLOCKER1 修] 结构化重试耗尽 → Failed(原来无条件 Completed,设计的"超3次→Failed"不生效)。
+    let file_output_failed = assignment.expects_file_output && !wrote_any_file;
     let status = if structured_failed {
         SubAgentStatus::Failed(
             final_result
                 .clone()
                 .unwrap_or_else(|| "max_structured_output_retries".to_string()),
         )
+    } else if file_output_failed {
+        SubAgentStatus::Failed("未产出任何文件".to_string())
     } else {
         SubAgentStatus::Completed
     };
@@ -4354,6 +4452,16 @@ async fn run_subagent(
         duration_ms,
         from_prior_session: false,
     })
+}
+
+fn should_retry_file_output_gate(
+    assignment: &SubAgentAssignment,
+    wrote_any_file: bool,
+    file_output_retries: u32,
+) -> bool {
+    assignment.expects_file_output
+        && !wrote_any_file
+        && file_output_retries < MAX_STRUCTURED_OUTPUT_RETRIES
 }
 
 async fn wait_for_result(
@@ -5113,6 +5221,7 @@ impl SubAgentToolRegistry {
                 todo_list,
                 plan_state,
             )
+            .with_tools(runtime.context.runtime.custom_tools.clone())
             .build(context);
 
         Self {

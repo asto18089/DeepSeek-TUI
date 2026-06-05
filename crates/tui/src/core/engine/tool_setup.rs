@@ -76,6 +76,9 @@ impl Engine {
         if self.config.features.enabled(Feature::ApplyPatch) && mode != AppMode::Plan {
             builder = builder.with_patch_tools();
         }
+        for tool in &self.config.custom_tools {
+            builder = builder.with_tool(tool.clone());
+        }
         if self.config.features.enabled(Feature::WebSearch) {
             builder = builder.with_web_tools();
         }

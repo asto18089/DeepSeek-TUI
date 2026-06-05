@@ -69,6 +69,9 @@ pub enum Op {
         /// [pinvou3-fork] 结构化产出 schema(registry.output_schema)。`Some` 时
         /// 强制 SubAgent 走 submit_output 提交合格产出才能结束(docs/SDAN/12)。
         output_schema: Option<serde_json::Value>,
+        /// [pinvou3-fork] 写文件型角色完成闸:无结构化 schema 但 registry.outputs 非空时,
+        /// SubAgent 必须成功调用 write_file/append_file 才能完成。
+        expects_file_output: bool,
     },
 
     /// List current sub-agents and their status

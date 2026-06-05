@@ -54,7 +54,7 @@ use crate::tools::subagent::{
 };
 use crate::tools::todo::{SharedTodoList, new_shared_todo_list};
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
-use crate::tools::{ToolContext, ToolRegistryBuilder};
+use crate::tools::{ToolContext, ToolRegistryBuilder, spec::ToolSpec};
 use crate::tui::app::AppMode;
 use crate::utils::spawn_supervised;
 
@@ -76,7 +76,7 @@ use super::turn::{TurnContext, TurnToolCall, post_turn_snapshot, pre_turn_snapsh
 // === Types ===
 
 /// Configuration for the engine
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EngineConfig {
     /// Model identifier to use for responses.
     pub model: String,
@@ -182,6 +182,10 @@ pub struct EngineConfig {
     /// Native tools that should stay in the model-visible catalog even when
     /// they are outside the small default core surface (#2076).
     pub tools_always_load: HashSet<String>,
+    /// Host application supplied native tools. Used by wrappers to add
+    /// domain tools without carrying product-specific implementations in this
+    /// crate.
+    pub custom_tools: Vec<Arc<dyn ToolSpec>>,
     /// When true and `/usr/bin/bwrap` is present on Linux, route exec_shell
     /// through bubblewrap instead of relying solely on Landlock (#2184).
     #[allow(dead_code)] // Wired through ShellManager in follow-up PR
@@ -239,6 +243,7 @@ impl Default for EngineConfig {
                 crate::config::DEFAULT_SUBAGENT_API_TIMEOUT_SECS,
             ),
             tools_always_load: HashSet::new(),
+            custom_tools: Vec::new(),
             prefer_bwrap: false,
             tool_whitelist: None,
         }
@@ -686,6 +691,7 @@ impl Engine {
                     allowed_tools,
                     max_steps,
                     output_schema,
+                    expects_file_output,
                 } => {
                     // [pinvou3-fork] Custom sub-agents require a non-empty tool
                     // whitelist (build_allowed_tools enforces this); fail fast
@@ -761,7 +767,8 @@ impl Engine {
                             // [pinvou3-fork] role=role_id(修 transcript role 显示 custom 的问题);
                             // output_schema 透传以触发 submit_output 强制提交。
                             SubAgentAssignment::new(prompt.clone(), Some(role_id.clone()))
-                                .with_output_schema(output_schema),
+                                .with_output_schema(output_schema)
+                                .with_expects_file_output(expects_file_output),
                             Some(allowed_tools),
                             SubAgentSpawnOptions {
                                 name: None,

@@ -412,6 +412,13 @@ impl ToolRegistryBuilder {
         self
     }
 
+    /// Add multiple custom tools.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<Arc<dyn ToolSpec>>) -> Self {
+        self.tools.extend(tools);
+        self
+    }
+
     /// Include file tools (read, write, append, edit, list).
     #[must_use]
     pub fn with_file_tools(self) -> Self {

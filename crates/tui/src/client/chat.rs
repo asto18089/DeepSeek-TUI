@@ -23,7 +23,11 @@ const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// `doctor` uses a bounded non-streaming request, but normal TUI turns first
 /// wait for the SSE response to open. On some Windows/proxy paths that wait can
 /// hang before any stream chunk exists, leaving the UI stuck at "Working...".
-const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(45);
+// [pinvou3-fork] 45s 是为云端调的;本地 vLLM(GB10)对大上下文 SubAgent 请求
+// (如 slide_writer 读 10+ 文件后)的首 token TTFT 偶发 >45s,撞这个墙导致
+// create_message 报 "did not receive response headers after 45s" → loop 早停不产出。
+// 提到 110s(留在外层 step_api_timeout=120s 之下);仍可经 DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS 覆盖。
+const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(110);
 
 /// Reads `DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS` as a bounded override for the
 /// response-header wait. This is intentionally shorter than the per-chunk idle
