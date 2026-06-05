@@ -122,7 +122,6 @@ impl Engine {
                         format!("Request cancelled while awaiting user input{suffix}"),
                     ));
                 }
-<<<<<<< HEAD
                 decision = self.rx_user_input.recv() => {
                     // [pinvou3-fork] broadcast channel: skip Lagged (low-frequency
                     // user input never realistically lags), error on Closed.
@@ -138,45 +137,14 @@ impl Engine {
                     match decision {
                         UserInputDecision::Submitted { id, response } if id == tool_id => {
                             return Ok(response);
-=======
-                result = tokio::time::timeout(USER_INPUT_TIMEOUT, self.rx_user_input.recv()) => {
-                    match result {
-                        Ok(Some(decision)) => {
-                            match decision {
-                                UserInputDecision::Submitted { id, response } if id == tool_id => {
-                                    return Ok(response);
-                                }
-                                UserInputDecision::Cancelled { id } if id == tool_id => {
-                                    return Err(ToolError::execution_failed(
-                                        "User input cancelled".to_string(),
-                                    ));
-                                }
-                                _ => continue,
-                            }
->>>>>>> c8575714
                         }
-                        Ok(None) => {
+                        UserInputDecision::Cancelled { id } if id == tool_id => {
                             return Err(ToolError::execution_failed(
-                                "User input channel closed".to_string(),
+                                "User input cancelled".to_string(),
                             ));
                         }
-                        Err(_) => {
-                            let _ = self
-                                .tx_event
-                                .send(Event::Status {
-                                    message: format!(
-                                        "User input timed out after {}s",
-                                        USER_INPUT_TIMEOUT.as_secs()
-                                    ),
-                                })
-                                .await;
-                            return Err(ToolError::execution_failed(
-                                format!(
-                                    "User input timed out after {}s",
-                                    USER_INPUT_TIMEOUT.as_secs()
-                                ),
-                            ));
-                        }
+                        // 别的 tool_call_id 的决定(其它 agent/主循环)——继续等
+                        _ => continue,
                     }
                 }
             }

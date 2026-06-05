@@ -2569,7 +2569,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn strip_phase_marker_removes_marker_in_single_delta() {
         let mut in_marker = false;
         let out = strip_phase_marker_delta("hello <phase id=\"p0\"/>\nworld", &mut in_marker);
@@ -2638,7 +2637,9 @@ mod tests {
         assert_eq!(extract_last_phase_id("<phase id=\"\"/>"), None);
         // Malformed (no closing >) ignored
         assert_eq!(extract_last_phase_id("<phase id=\"px"), None);
-=======
+    }
+
+    #[test]
     fn approval_intent_summary_trims_and_bounds_text() {
         assert_eq!(approval_intent_summary("   "), None);
 
@@ -2649,7 +2650,6 @@ mod tests {
             summary.chars().count(),
             MAX_APPROVAL_INTENT_SUMMARY_CHARS + 3
         );
->>>>>>> c8575714
     }
 
     /// Regression test for issue #1727 (P0, release-blocking).

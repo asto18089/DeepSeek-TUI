@@ -2256,11 +2256,8 @@ fn stub_runtime() -> SubAgentRuntime {
         fork_context: None,
         mcp_pool: None,
         step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
-<<<<<<< HEAD
         user_input_tx: None,
-=======
         speech_output_dir: None,
->>>>>>> c8575714
     }
 }
 

@@ -17,10 +17,7 @@ use crate::client::DeepSeekClient;
 use crate::models::Tool;
 
 use super::pinvou3_blocklist;
-<<<<<<< HEAD
-=======
 use super::schema_canonicalize;
->>>>>>> c8575714
 use super::schema_sanitize;
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
@@ -503,7 +500,6 @@ impl ToolRegistryBuilder {
         self
     }
 
-<<<<<<< HEAD
     /// Add multiple custom tools.
     #[must_use]
     pub fn with_tools(mut self, tools: Vec<Arc<dyn ToolSpec>>) -> Self {
@@ -511,8 +507,6 @@ impl ToolRegistryBuilder {
         self
     }
 
-=======
->>>>>>> c8575714
     /// Include file tools (read, write, append, edit, list).
     #[must_use]
     pub fn with_file_tools(self) -> Self {

@@ -885,12 +885,9 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         search_provider: config.search_provider(),
         search_api_key: config.search.as_ref().and_then(|s| s.api_key.clone()),
         tools_always_load: config.tools_always_load(),
-<<<<<<< HEAD
         custom_tools: Vec::new(),
         tool_whitelist: None,
-=======
         tools: config.tools.clone(),
->>>>>>> c8575714
     }
 }
 
@@ -2122,10 +2119,7 @@ async fn run_event_loop(
                         }
                         app.status_message = Some(format!("Sub-agent {id}: {display}"));
                     }
-<<<<<<< HEAD
                     EngineEvent::AgentComplete { id, result, .. } => {
-=======
-                    EngineEvent::AgentComplete { id, result } => {
                         execute_subagent_observer_hook(
                             app,
                             HookEvent::SubagentComplete,
@@ -2133,7 +2127,6 @@ async fn run_event_loop(
                             "result",
                             &result,
                         );
->>>>>>> c8575714
                         let subagent_elapsed = app
                             .agent_activity_started_at
                             .or(app.turn_started_at)

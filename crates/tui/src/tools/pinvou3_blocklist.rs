@@ -39,7 +39,6 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     "rlm_eval",
     "rlm_configure",
     "rlm_close",
-<<<<<<< HEAD
     // git（模型用 `exec_shell git ...` 替代）
     "git_status",
     "git_diff",
@@ -50,7 +49,6 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     "apply_patch",
     "fim_edit",
     "revert_turn",
-=======
     // 状态管理 - goal（GUI 单 session 不需要持久化目标跟踪）
     "create_goal",
     "get_goal",
@@ -62,7 +60,6 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     // patch / fim（edit_file 已覆盖；patch DSL 弱模型用不好；revert_turn 已释放）
     "apply_patch",
     "fim_edit",
->>>>>>> c8575714
     // 附件预处理（应移到 bridge 上传 pipeline，见文档 §6.1）
     "pandoc_convert",
     "image_ocr",
@@ -73,14 +70,8 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     "todo_add",
     "todo_update",
     "todo_list",
-<<<<<<< HEAD
-    // Shell 后台管理 + 异步交互变体（同步 exec_shell 已够）
-    "exec_shell_cancel",
-    "exec_shell_wait",
-=======
     // Shell 后台管理 + 异步交互变体（exec_shell_wait 已释放供后台轮询）
     "exec_shell_cancel",
->>>>>>> c8575714
     "exec_shell_interact",
     "exec_wait",
     "exec_interact",
@@ -101,16 +92,9 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     // 杂项 - 金融数据 + 旧版 web_run（保留 fetch_url）
     "finance",
     "web.run",
-<<<<<<< HEAD
-    // 元工具（pinvou3 普通用户场景用不到）
-    "multi_tool_use.parallel",
-    "note",
-    "diagnostics",
-=======
     // 元工具（pinvou3 普通用户场景用不到；diagnostics 已释放）
     "multi_tool_use.parallel",
     "note",
->>>>>>> c8575714
     "validate_data",
     "run_tests",
     "handle_read",
@@ -121,8 +105,6 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     "notify",
     "remember",
     "web_run",
-<<<<<<< HEAD
-=======
     // v0.8.53 sync 后补漏(2026-06-04 clean re-fork dump 发现这些新/漏工具暴露给了 LLM):
     // 语音(Xiaomi MiMo,v0.8.53 新增,pinvou3 用不到)
     "speech",
@@ -138,7 +120,6 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     "slop_ledger_export",
     "slop_ledger_query",
     "slop_ledger_update",
->>>>>>> c8575714
 ];
 
 /// 工具名是否在 pinvou3 隐藏清单内。

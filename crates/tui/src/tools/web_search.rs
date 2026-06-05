@@ -1306,20 +1306,12 @@ fn normalize_url(href: &str) -> String {
 }
 
 fn normalize_bing_url(href: &str) -> String {
-<<<<<<< HEAD
-    // [pinvou3-fork bing-ckurl] bing SERP 把每条结果 URL 包成 /ck/a?...&u=<base64>
-    // 点击重定向,且 HTML 里分隔符是 &amp; 实体。不先解码实体,extract_query_param
-    // 取到的 key 是 "amp;u" 而非 "u" → 真实 URL 还原失败 → 所有结果 root_domain
-    // 退化成 bing.com → is_likely_spam_results 误判整批为 spam → 返回 0 结果。
-    // 通用 bug(任何用 bing 后端者在当前 bing HTML 下都中招),可提上游 PR。
-=======
     // Bing wraps every SERP result URL in a `/ck/a?...&u=<base64>` click-tracking
     // redirect, and in the raw HTML the separators are `&amp;` entities. Without
     // decoding entities first, `extract_query_param` looks for `u` but the actual
     // key is `amp;u`, so the real URL is never recovered: every result collapses to
     // a `bing.com` root domain, which the spam heuristic then rejects — yielding
     // zero results for the default Bing backend. Decode entities before parsing.
->>>>>>> c8575714
     let href = decode_html_entities(href);
     let href = href.as_str();
     if let Some(encoded) = extract_query_param(href, "u") {
@@ -1454,14 +1446,6 @@ mod tests {
     };
     use serde_json::json;
 
-<<<<<<< HEAD
-    // [pinvou3-fork bing-ckurl] 回归保护:bing /ck/a 重定向 href 用 &amp; 实体编码,
-    // normalize_bing_url 必须先解码 HTML 实体才能取到 u= base64 还原真实 URL。
-    // 否则 root_domain 退化成 bing.com → is_likely_spam_results 误杀 → 0 结果。
-    #[test]
-    fn bing_ckurl_with_html_entities_decodes_real_url() {
-        use super::normalize_bing_url;
-=======
     // Regression guard: Bing /ck/a redirect hrefs are HTML-entity-encoded
     // (`&amp;`). normalize_bing_url must decode entities before extracting the
     // `u=` base64 payload, otherwise the real URL is never recovered and the
@@ -1469,7 +1453,6 @@ mod tests {
     // results for the default Bing backend).
     #[test]
     fn bing_ckurl_with_html_entities_decodes_real_url() {
->>>>>>> c8575714
         let href = "https://www.bing.com/ck/a?!&amp;&amp;p=abc&amp;u=a1aHR0cHM6Ly9ydXN0LWxhbmcub3JnLw&amp;ntb=1";
         assert_eq!(normalize_bing_url(href), "https://rust-lang.org/");
     }

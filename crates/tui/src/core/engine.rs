@@ -45,13 +45,9 @@ use crate::tools::shell::{SharedShellManager, new_shared_shell_manager};
 use crate::tools::spec::RuntimeToolServices;
 use crate::tools::spec::{ApprovalRequirement, ToolError, ToolResult};
 use crate::tools::subagent::{
-<<<<<<< HEAD
     Mailbox, SharedSubAgentManager, SubAgentAssignment, SubAgentCompletion, SubAgentForkContext,
-    SubAgentRuntime, SubAgentSpawnOptions, SubAgentType, new_shared_subagent_manager,
-=======
-    Mailbox, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext, SubAgentResult,
-    SubAgentRuntime, SubAgentStatus, SubAgentType, new_shared_subagent_manager_with_timeout,
->>>>>>> c8575714
+    SubAgentResult, SubAgentRuntime, SubAgentSpawnOptions, SubAgentStatus, SubAgentType,
+    new_shared_subagent_manager, new_shared_subagent_manager_with_timeout,
     resolve_subagent_assignment_route,
 };
 use crate::tools::todo::{SharedTodoList, TodoListSnapshot, new_shared_todo_list};
@@ -334,7 +330,6 @@ pub struct EngineConfig {
     /// through bubblewrap instead of relying solely on Landlock (#2184).
     #[allow(dead_code)] // Wired through ShellManager in follow-up PR
     pub prefer_bwrap: bool,
-<<<<<<< HEAD
     /// [pinvou3-fork] Hard per-session tool whitelist. `None` = no restriction
     /// (all normal sessions unchanged). `Some(set)` = the model-visible catalog
     /// is filtered down to exactly these tool names — a true allowlist, not a
@@ -342,12 +337,10 @@ pub struct EngineConfig {
     /// `tool_search` cannot re-activate them. Used to structurally constrain the
     /// workflow-session supervisor (品悟) to read + review tools only.
     pub tool_whitelist: Option<HashSet<String>>,
-=======
     /// Tool override and plugin configuration (`[tools]` table in config.toml).
     /// Applied to the per-turn tool registry after built-in tools are registered.
     /// When `None`, no overrides or plugin loading occurs.
     pub tools: Option<crate::config::ToolsConfig>,
->>>>>>> c8575714
 }
 
 impl Default for EngineConfig {
@@ -401,11 +394,8 @@ impl Default for EngineConfig {
             tools_always_load: HashSet::new(),
             custom_tools: Vec::new(),
             prefer_bwrap: false,
-<<<<<<< HEAD
             tool_whitelist: None,
-=======
             tools: None,
->>>>>>> c8575714
         }
     }
 }
@@ -1178,12 +1168,9 @@ impl Engine {
                     )
                     .with_max_spawn_depth(self.config.max_spawn_depth)
                     .with_step_api_timeout(self.config.subagent_api_timeout)
-<<<<<<< HEAD
                     .with_user_input_tx(self.tx_user_input.clone())
-=======
                     .with_speech_output_dir(self.config.speech_output_dir.clone())
                     .with_mcp_pool(mcp_pool)
->>>>>>> c8575714
                     .background_runtime();
                     let route = resolve_subagent_assignment_route(
                         &runtime,
@@ -1769,12 +1756,9 @@ In {new} mode: {policy}\n\n\
                         )
                         .with_max_spawn_depth(self.config.max_spawn_depth)
                         .with_step_api_timeout(self.config.subagent_api_timeout)
-<<<<<<< HEAD
                         .with_user_input_tx(self.tx_user_input.clone())
-=======
                         .with_speech_output_dir(self.config.speech_output_dir.clone())
                         .with_mcp_pool(mcp_pool.clone())
->>>>>>> c8575714
                         .with_parent_completion_tx(self.tx_subagent_completion.clone());
                         if let Some(context) = fork_context_for_runtime.clone() {
                             rt = rt.with_fork_context(context);
@@ -2739,7 +2723,6 @@ use self::dispatch::{
     ParallelToolResult, ParallelToolResultEntry, ToolExecGuard, ToolExecOutcome,
     ToolExecutionBatch, ToolExecutionPlan, caller_allowed_for_tool, caller_type_for_tool_use,
     final_tool_input, format_tool_error, mcp_tool_approval_description, mcp_tool_is_parallel_safe,
-    truncated_args_hint,
     mcp_tool_is_read_only, parse_parallel_tool_calls, parse_tool_input,
     plan_tool_execution_batches, should_force_update_plan_first, should_stop_after_plan_tool,
     truncated_args_hint,
@@ -2757,26 +2740,14 @@ use self::streaming::{
 };
 use self::tool_catalog::{
     CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME,
-<<<<<<< HEAD
-    REQUEST_USER_INPUT_NAME, active_tools_for_step, apply_tool_whitelist,
-    build_model_tool_catalog, ensure_advanced_tooling, execute_code_execution_tool,
-    execute_tool_search,
-    initial_active_tools, is_tool_search_tool, maybe_hydrate_requested_deferred_tool,
-    missing_tool_error_message,
-};
-#[cfg(test)]
-use self::tool_catalog::{
-    TOOL_SEARCH_BM25_NAME, maybe_activate_requested_deferred_tool,
-=======
     REQUEST_USER_INPUT_NAME, active_tools_for_step, apply_provider_tool_policy,
-    build_model_tool_catalog, ensure_advanced_tooling, execute_code_execution_tool,
-    execute_tool_search, initial_active_tools, is_tool_search_tool,
-    maybe_hydrate_requested_deferred_tool, missing_tool_error_message,
+    apply_tool_whitelist, build_model_tool_catalog, ensure_advanced_tooling,
+    execute_code_execution_tool, execute_tool_search, initial_active_tools,
+    is_tool_search_tool, maybe_hydrate_requested_deferred_tool, missing_tool_error_message,
 };
 #[cfg(test)]
 use self::tool_catalog::{
     TOOL_SEARCH_BM25_NAME, TOOL_SEARCH_REGEX_NAME, maybe_activate_requested_deferred_tool,
->>>>>>> c8575714
     pinvou3_should_defer_native_tool, preflight_requested_deferred_tool, should_default_defer_tool,
 };
 use self::tool_execution::emit_tool_audit;

@@ -18,10 +18,6 @@ pub mod config;
 pub mod config_ui;
 pub mod core;
 pub mod cost_status;
-<<<<<<< HEAD
-pub mod cycle_manager;
-=======
->>>>>>> c8575714
 pub mod deepseek_theme;
 pub mod dependencies;
 pub mod error_taxonomy;
@@ -44,13 +40,9 @@ pub mod prefix_cache;
 pub mod pricing;
 pub mod project_context;
 pub mod project_doc;
-<<<<<<< HEAD
-pub mod prompts;
-=======
 pub mod prompt_zones;
 pub mod prompts;
 pub mod purge;
->>>>>>> c8575714
 pub mod repl;
 pub mod retry_status;
 pub mod rlm;
@@ -60,20 +52,13 @@ pub mod runtime_threads;
 pub mod sandbox;
 pub mod schema_migration;
 pub mod seam_manager;
-<<<<<<< HEAD
 pub mod session_manager;
 pub mod settings;
 pub mod skill_state;
 pub mod skills;
-=======
 pub mod session_failure_classifier;
-pub mod session_manager;
-pub mod settings;
 pub mod shell_dispatcher;
-pub mod skill_state;
-pub mod skills;
 pub mod slop_ledger;
->>>>>>> c8575714
 pub mod snapshot;
 pub mod task_manager;
 pub mod tool_output_receipts;
@@ -82,10 +67,7 @@ pub mod tui;
 pub mod utils;
 pub mod vision;
 pub mod working_set;
-<<<<<<< HEAD
-=======
 pub mod workspace_discovery;
->>>>>>> c8575714
 pub mod workspace_trust;
 
 // main.rs 中定义的类型和函数，镜像到 lib 上下文
@@ -109,13 +91,9 @@ pub async fn resolve_cli_auto_route(
         let selection = resolve_auto_route_with_flash(config, prompt, "", "auto", "auto").await;
         CliAutoRoute {
             model: selection.model,
-<<<<<<< HEAD
-            reasoning_effort: selection.reasoning_effort.map(|e| e.as_setting().to_string()),
-=======
             reasoning_effort: selection
                 .reasoning_effort
                 .map(|e| e.as_setting().to_string()),
->>>>>>> c8575714
             auto_model: true,
         }
     } else {

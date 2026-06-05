@@ -99,8 +99,6 @@ pub(super) fn pinvou3_should_defer_native_tool(
     if crate::tools::pinvou3_blocklist::is_pinvou3_hidden(name) {
         return true;
     }
-<<<<<<< HEAD
-=======
     // pinvou3 引导 AI 用 `request_user_input` 处理歧义(instructions §1.4 + Plan
     // per-turn reminder),工具表里必须永远在。上游 allowlist 没把它加进
     // `DEFAULT_ACTIVE_NATIVE_TOOLS`,非 Yolo 模式下会被 defer → GUI 不出气泡 →
@@ -109,7 +107,6 @@ pub(super) fn pinvou3_should_defer_native_tool(
     if name == REQUEST_USER_INPUT_NAME {
         return false;
     }
->>>>>>> c8575714
     if mode == AppMode::Yolo {
         return false;
     }
@@ -122,9 +119,6 @@ pub(super) fn apply_native_tool_deferral(
     always_load: &HashSet<String>,
 ) {
     for tool in &mut *catalog {
-<<<<<<< HEAD
-        tool.defer_loading = Some(pinvou3_should_defer_native_tool(&tool.name, mode, always_load));
-=======
         tool.defer_loading = Some(pinvou3_should_defer_native_tool(
             &tool.name,
             mode,
@@ -139,7 +133,6 @@ pub(super) fn apply_native_tool_deferral(
     let deferred = catalog.len() - active.len();
     tracing::info!(
         target: "pinvou3.tool_catalog",
-        mode = ?mode,
         active_count = active.len(),
         deferred_count = deferred,
         total = catalog.len(),
@@ -196,13 +189,12 @@ pub(super) fn apply_provider_tool_policy(
     let Some(active) = provider_first_turn_native_tools(provider) else {
         return;
     };
-    for tool in catalog {
+    for tool in catalog.iter_mut() {
         if is_tool_search_tool(&tool.name) || always_load.contains(&tool.name) {
             tool.defer_loading = Some(false);
             continue;
         }
         tool.defer_loading = Some(!active.contains(&tool.name.as_str()));
->>>>>>> c8575714
     }
     let active: Vec<&str> = catalog
         .iter()
@@ -212,7 +204,6 @@ pub(super) fn apply_provider_tool_policy(
     let deferred = catalog.len() - active.len();
     tracing::info!(
         target: "pinvou3.tool_catalog",
-        mode = ?mode,
         active_count = active.len(),
         deferred_count = deferred,
         total = catalog.len(),

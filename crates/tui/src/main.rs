@@ -5735,12 +5735,9 @@ async fn run_exec_agent(
         search_provider: config.search_provider(),
         search_api_key: config.search.as_ref().and_then(|s| s.api_key.clone()),
         tools_always_load: config.tools_always_load(),
-<<<<<<< HEAD
         custom_tools: Vec::new(),
         tool_whitelist: None,
-=======
         tools: config.tools.clone(),
->>>>>>> c8575714
     };
 
     let engine_handle = spawn_engine(engine_config, config);

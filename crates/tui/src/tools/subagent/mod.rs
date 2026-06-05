@@ -79,16 +79,15 @@ const DEFAULT_MAX_STEPS: u32 = 20;
 // (上游 #2034 一并移除了 elapsed cap;pinvou3 保留。)
 const DEFAULT_SUBAGENT_ELAPSED_MAX: Duration = Duration::from_secs(1500);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
-<<<<<<< HEAD
 const WEB_SEARCH_BUDGET: u32 = 6;
 const FETCH_URL_BUDGET: u32 = 8;
-=======
 // Non-streaming sub-agents need enough response budget to carry large tool-call
 // arguments, especially write_file content. The API bills generated tokens, not
 // the requested ceiling.
-const SUBAGENT_RESPONSE_MAX_TOKENS: u32 = 16_384;
+// [pinvou3-fork] 16_384→32_768:slide_writer 单步生成整页 HTML,16K 写一半 finish=length
+// 截断留残页(2026-06-03 实锤)。本地 vLLM 256K 窗口,响应预算放高无害。
+const SUBAGENT_RESPONSE_MAX_TOKENS: u32 = 32_768;
 const MAX_CONSECUTIVE_TRUNCATED_SUBAGENT_RESPONSES: u32 = 5;
->>>>>>> c8575714
 /// Per-step LLM API call timeout. Each `create_message` request must complete
 /// within this window or the step is treated as timed out. Prevents a single
 /// stuck API call from blocking the sub-agent indefinitely.
@@ -866,7 +865,6 @@ pub struct SubAgentRuntime {
     /// false-timeout the child mid-thinking. `child_runtime()` and
     /// `background_runtime()` preserve the parent's value (#1806, #1808).
     pub step_api_timeout: Duration,
-<<<<<<< HEAD
     /// [pinvou3-fork] Broadcast sender for `request_user_input` answers. When
     /// `Some`, the sub-agent turn loop intercepts `request_user_input` tool
     /// calls — emits `Event::UserInputRequired` and blocks awaiting the answer
@@ -874,12 +872,10 @@ pub struct SubAgentRuntime {
     /// (`tools::user_input::RequestUserInputTool::execute`). The engine attaches
     /// this; it propagates to children via `child_runtime()` clone.
     pub user_input_tx: Option<broadcast::Sender<UserInputDecision>>,
-=======
     /// Default directory for Xiaomi MiMo speech/TTS tool outputs inherited by
     /// child registries. Keeps parent and sub-agent `speech` / `tts` tools on
     /// the same `[speech].output_dir` / env override.
     pub speech_output_dir: Option<PathBuf>,
->>>>>>> c8575714
 }
 
 impl SubAgentRuntime {
@@ -915,11 +911,8 @@ impl SubAgentRuntime {
             fork_context: None,
             mcp_pool: None,
             step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
-<<<<<<< HEAD
             user_input_tx: None,
-=======
             speech_output_dir: None,
->>>>>>> c8575714
         }
     }
 
@@ -1082,11 +1075,8 @@ impl SubAgentRuntime {
             fork_context: self.fork_context.clone(),
             mcp_pool: self.mcp_pool.clone(),
             step_api_timeout: self.step_api_timeout,
-<<<<<<< HEAD
             user_input_tx: self.user_input_tx.clone(),
-=======
             speech_output_dir: self.speech_output_dir.clone(),
->>>>>>> c8575714
         }
     }
 
@@ -3962,7 +3952,6 @@ async fn insert_subagent_full_transcript_handle(
     store.insert_json(format!("agent:{agent_id}"), "full_transcript", payload)
 }
 
-<<<<<<< HEAD
 /// [pinvou3-fork] Pop a `request_user_input` card to the GUI from inside a
 /// sub-agent turn loop and block for the answer, routed by `tool_call_id`.
 ///
@@ -4021,7 +4010,8 @@ async fn await_subagent_user_input(
             }
         }
     }
-=======
+}
+
 fn record_agent_progress(runtime: &SubAgentRuntime, agent_id: &str, message: impl Into<String>) {
     if let Ok(mut manager) = runtime.manager.try_write() {
         manager.touch(agent_id);
@@ -4032,7 +4022,6 @@ fn record_agent_progress(runtime: &SubAgentRuntime, agent_id: &str, message: imp
         agent_id,
         message.into(),
     );
->>>>>>> c8575714
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -4229,15 +4218,7 @@ async fn run_subagent(
         let request = MessageRequest {
             model: runtime.model.clone(),
             messages: messages.clone(),
-<<<<<<< HEAD
-            // [pinvou3-fork 2026-06-03] 4096→32768:slide_writer 单步要生成整页 HTML(~150 行),
-            // 4096 token 写到一半就 finish=length 截断、write_file tool_call 不完整 → 该页没写成
-            // (留 ghost 占位)。这是 slide_writer 写页数飘忽(4-9/12)+ 去掉密度反而更差(页放长更
-            // 易超 4096 → 0/12)的真因。32768 给整页 HTML 充足额度(模型 max_model_len 262144)。
-            max_tokens: 32768,
-=======
             max_tokens: SUBAGENT_RESPONSE_MAX_TOKENS,
->>>>>>> c8575714
             system: Some(request_system.clone()),
             tools: Some(tools.clone()),
             tool_choice: Some(json!({ "type": "auto" })),
@@ -4394,7 +4375,6 @@ async fn run_subagent(
                 pending_inputs.push_back(input);
             }
             if pending_inputs.is_empty() {
-<<<<<<< HEAD
                 // [pinvou3-fork] 结构化产出 stop 拦截:有 output_schema 的角色,模型想结束
                 // 但还没成功 submit_output → 不放它走,催它提交(对齐 Claude Code stop-hook)。
                 if output_schema.is_some() && output_submitted.is_none() {
@@ -4461,10 +4441,6 @@ async fn run_subagent(
                 emit_agent_progress(
                     runtime.event_tx.as_ref(),
                     runtime.mailbox.as_ref(),
-=======
-                record_agent_progress(
-                    runtime,
->>>>>>> c8575714
                     &agent_id,
                     format!("step {steps}/{max_steps}: complete"),
                 );
@@ -4489,7 +4465,6 @@ async fn run_subagent(
                 .iter()
                 .any(|(_, name, _)| name == SUBMIT_OUTPUT_TOOL);
         for (tool_id, tool_name, tool_input) in tool_uses {
-<<<<<<< HEAD
             // 本轮有 submit_output 时,其余工具一律不执行,只回占位 tool_result 保 messages 配对合法。
             if round_has_submit && tool_name != SUBMIT_OUTPUT_TOOL {
                 tool_results.push(ContentBlock::ToolResult {
@@ -4503,10 +4478,6 @@ async fn run_subagent(
             emit_agent_progress(
                 runtime.event_tx.as_ref(),
                 runtime.mailbox.as_ref(),
-=======
-            record_agent_progress(
-                runtime,
->>>>>>> c8575714
                 &agent_id,
                 format!("step {steps}/{max_steps}: running tool '{tool_name}'"),
             );
@@ -4617,7 +4588,6 @@ async fn run_subagent(
                     Err(_) => format!("Error: Tool {tool_name} timed out"),
                 }
             };
-<<<<<<< HEAD
             // [codex MINOR 修] submit_output 的成败以"是否真提交成功"为准,不靠 "Error:" 前缀
             // (校验失败的中文打回消息不带该前缀,否则会被误标 ok=true)。
             let tool_ok = if tool_name == SUBMIT_OUTPUT_TOOL && output_schema.is_some() {
@@ -4631,11 +4601,6 @@ async fn run_subagent(
             emit_agent_progress(
                 runtime.event_tx.as_ref(),
                 runtime.mailbox.as_ref(),
-=======
-            let tool_ok = !result.starts_with("Error:");
-            record_agent_progress(
-                runtime,
->>>>>>> c8575714
                 &agent_id,
                 format!("step {steps}/{max_steps}: finished tool '{tool_name}'"),
             );
@@ -5498,20 +5463,6 @@ impl SubAgentToolRegistry {
         // review, RLM, sub-agent management (so grandchildren can spawn),
         // plus per-child fresh todo/plan state.
         let context = runtime.context.clone();
-<<<<<<< HEAD
-        let registry = ToolRegistryBuilder::new()
-            .with_full_agent_surface(
-                Some(runtime.client.clone()),
-                runtime.model.clone(),
-                runtime.manager.clone(),
-                runtime.clone(),
-                runtime.allow_shell,
-                todo_list,
-                plan_state,
-            )
-            .with_tools(runtime.context.runtime.custom_tools.clone())
-            .build(context);
-=======
         let mut registry = ToolRegistryBuilder::new().with_full_agent_surface(
             Some(runtime.client.clone()),
             runtime.model.clone(),
@@ -5527,7 +5478,6 @@ impl SubAgentToolRegistry {
         }
 
         let registry = registry.build(context);
->>>>>>> c8575714
 
         Self {
             allowed_tools: explicit_allowed_tools,
@@ -5708,7 +5658,6 @@ fn build_allowed_tools(
     Ok(None)
 }
 
-<<<<<<< HEAD
 /// [pinvou3-fork] 增量 transcript 落盘:每个 SubAgent loop 追加一条 JSONL 到
 /// `<workspace>/_state/agent_transcripts/<role>_<agent_id>.jsonl`,像 chat session
 /// 一样只记本轮 LLM 输入/输出增量(不含 system prompt / 累积上下文),便于复盘
@@ -5993,7 +5942,6 @@ fn persist_structured_output(
     Ok(written)
 }
 
-=======
 /// When a child agent fails because its model is unavailable under the current
 /// access profile, a bare provider 403/404 (classified `Authorization` or
 /// `State`) is unactionable. Annotate it so the parent knows the likely cause
@@ -6009,7 +5957,6 @@ fn annotate_child_model_error(err: &str, model: &str) -> String {
     }
 }
 
->>>>>>> c8575714
 fn summarize_subagent_result(result: &SubAgentResult) -> String {
     match (&result.status, result.result.as_ref()) {
         (SubAgentStatus::Completed, Some(text)) => truncate_preview(text),
@@ -6066,11 +6013,8 @@ const GENERAL_AGENT_INTRO: &str = concat!(
     "You are a general-purpose sub-agent spawned to handle a specific task autonomously.\n",
     "Stay inside the assigned scope; put adjacent work under RISKS/BLOCKERS.\n",
     "Plan multi-step work with `checklist_write`; add `update_plan` for complex strategy.\n",
-<<<<<<< HEAD
     // [pinvou3-fork] 加 stop-on-failure 条款,防止弱模型在外部 API 不可达 / 工具失败时
     // 死磕反复重试(observed:Qwen3.6 子 agent 反复 retry web_search Bing 直到 5+ 分钟超时)。
-=======
->>>>>>> c8575714
     "**Stop quickly on failure**: if the same tool call fails 2 times in a row, stop retrying and return what you have so far with a one-line note explaining what's missing. Do not loop on impossible queries (e.g. external API unreachable, rate-limited, or returning empty).\n",
     "**Bounded effort**: prefer one focused attempt over many speculative retries. If you cannot complete the task with available data within 3-5 tool calls, return your current partial findings — the parent agent can compensate with its own knowledge.\n\n"
 );

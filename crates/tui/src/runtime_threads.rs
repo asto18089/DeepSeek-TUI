@@ -2040,12 +2040,9 @@ impl RuntimeThreadManager {
             search_provider: self.config.search_provider(),
             search_api_key: self.config.search.as_ref().and_then(|s| s.api_key.clone()),
             tools_always_load: self.config.tools_always_load(),
-<<<<<<< HEAD
             custom_tools: Vec::new(),
             tool_whitelist: None,
-=======
             tools: self.config.tools.clone(),
->>>>>>> c8575714
         };
 
         let engine = spawn_engine(engine_cfg, &self.config);
