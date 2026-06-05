@@ -3,7 +3,7 @@ use ratatui::{buffer::Buffer, layout::Rect};
 use std::cell::{Cell, RefCell};
 use std::fmt;
 
-use crate::config::Config;
+use crate::config::{ApiProvider, Config};
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::settings::Settings;
@@ -140,6 +140,7 @@ pub enum ViewEvent {
     /// nothing changed and craft a clear status message.
     ModelPickerApplied {
         model: String,
+        provider: Option<crate::config::ApiProvider>,
         effort: crate::tui::app::ReasoningEffort,
         previous_model: String,
         previous_effort: crate::tui::app::ReasoningEffort,
@@ -528,6 +529,7 @@ struct ConfigRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigSection {
+    Provider,
     Model,
     Permissions,
     Display,
@@ -540,6 +542,7 @@ enum ConfigSection {
 impl ConfigSection {
     fn label(self) -> &'static str {
         match self {
+            ConfigSection::Provider => "Provider",
             ConfigSection::Model => "Model",
             ConfigSection::Permissions => "Permissions",
             ConfigSection::Display => "Display",
@@ -575,17 +578,36 @@ pub struct ConfigView {
     filter: String,
     status: Option<String>,
     locale: Locale,
+    effective_cost_currency: String,
     last_visible_rows: Cell<usize>,
     last_row_hitboxes: RefCell<Vec<(u16, usize)>>,
 }
 
 const CONFIG_MIN_KEY_COLUMN_WIDTH: usize = 19;
 const CONFIG_VALUE_COLUMN_WIDTH: usize = 44;
+const CONFIG_MIN_VALUE_COLUMN_WIDTH: usize = 10;
+const CONFIG_SCOPE_COLUMN_WIDTH: usize = 7;
+const CONFIG_ROW_PREFIX_WIDTH: usize = 2;
+const CONFIG_COLUMN_GAPS_WIDTH: usize = 2;
 
 impl ConfigView {
     pub fn new_for_app(app: &App) -> Self {
         let settings = Settings::load().unwrap_or_else(|_| Settings::default());
         let rows = vec![
+            ConfigRow {
+                section: ConfigSection::Provider,
+                key: "provider".to_string(),
+                value: app.api_provider.as_str().to_string(),
+                editable: true,
+                scope: ConfigScope::Session,
+            },
+            ConfigRow {
+                section: ConfigSection::Provider,
+                key: config_base_url_row_key(app.api_provider).to_string(),
+                value: config_base_url_row_value(app),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
             ConfigRow {
                 section: ConfigSection::Model,
                 key: "model".to_string(),
@@ -616,15 +638,6 @@ impl ConfigView {
                 scope: ConfigScope::Saved,
             },
             ConfigRow {
-                section: ConfigSection::Model,
-                key: "base_url".to_string(),
-                value: Config::load(app.config_path.clone(), app.config_profile.as_deref())
-                    .map(|config| config.deepseek_base_url())
-                    .unwrap_or_else(|_| "(unavailable)".to_string()),
-                editable: true,
-                scope: ConfigScope::Saved,
-            },
-            ConfigRow {
                 section: ConfigSection::Permissions,
                 key: "approval_mode".to_string(),
                 value: app.approval_mode.label().to_string(),
@@ -635,6 +648,13 @@ impl ConfigView {
                 section: ConfigSection::Permissions,
                 key: "default_mode".to_string(),
                 value: settings.default_mode.clone(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::Permissions,
+                key: "allow_shell".to_string(),
+                value: app.allow_shell.to_string(),
                 editable: true,
                 scope: ConfigScope::Saved,
             },
@@ -761,6 +781,27 @@ impl ConfigView {
                 scope: ConfigScope::Saved,
             },
             ConfigRow {
+                section: ConfigSection::Composer,
+                key: "mention_menu_limit".to_string(),
+                value: settings.mention_menu_limit.to_string(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::Composer,
+                key: "mention_menu_behavior".to_string(),
+                value: settings.mention_menu_behavior.clone(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::Composer,
+                key: "mention_walk_depth".to_string(),
+                value: settings.mention_walk_depth.to_string(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
                 section: ConfigSection::Sidebar,
                 key: "sidebar_width".to_string(),
                 value: settings.sidebar_width_percent.to_string(),
@@ -785,6 +826,13 @@ impl ConfigView {
                 section: ConfigSection::History,
                 key: "auto_compact".to_string(),
                 value: settings.auto_compact.to_string(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::History,
+                key: "auto_compact_threshold_percent".to_string(),
+                value: format!("{:.0}", settings.auto_compact_threshold_percent),
                 editable: true,
                 scope: ConfigScope::Saved,
             },
@@ -819,6 +867,7 @@ impl ConfigView {
             filter: String::new(),
             status: None,
             locale: app.ui_locale,
+            effective_cost_currency: cost_currency_config_value(app),
             last_visible_rows: Cell::new(0),
             last_row_hitboxes: RefCell::new(Vec::new()),
         }
@@ -841,7 +890,7 @@ impl ConfigView {
 
         let section = row.section.label().to_lowercase();
         let key = row.key.to_lowercase();
-        let value = row.value.to_lowercase();
+        let value = self.row_display_value(row).to_lowercase();
         let scope = row.scope.label().to_lowercase();
 
         filter.split_whitespace().all(|term| {
@@ -886,6 +935,27 @@ impl ConfigView {
             .max()
             .unwrap_or(CONFIG_MIN_KEY_COLUMN_WIDTH)
             .max(CONFIG_MIN_KEY_COLUMN_WIDTH)
+    }
+
+    fn table_column_widths(&self, content_width: usize) -> (usize, usize, usize) {
+        let fixed_width =
+            CONFIG_ROW_PREFIX_WIDTH + CONFIG_COLUMN_GAPS_WIDTH + CONFIG_SCOPE_COLUMN_WIDTH;
+        let key_value_width = content_width.saturating_sub(fixed_width);
+        let desired_key_width = self.key_column_width();
+
+        if key_value_width == 0 {
+            return (0, 0, CONFIG_SCOPE_COLUMN_WIDTH);
+        }
+
+        let minimum_key_width = CONFIG_MIN_KEY_COLUMN_WIDTH.min(key_value_width);
+        let key_width = desired_key_width
+            .min(key_value_width.saturating_sub(CONFIG_MIN_VALUE_COLUMN_WIDTH))
+            .max(minimum_key_width);
+        let value_width = key_value_width
+            .saturating_sub(key_width)
+            .min(CONFIG_VALUE_COLUMN_WIDTH);
+
+        (key_width, value_width, CONFIG_SCOPE_COLUMN_WIDTH)
     }
 
     fn selected_row_index(&self) -> Option<usize> {
@@ -1120,12 +1190,52 @@ impl ConfigView {
 
         self.update_filter(|filter| filter.clear());
     }
+
+    fn row_display_value(&self, row: &ConfigRow) -> String {
+        if row.key == "cost_currency" && row.scope == ConfigScope::Saved {
+            let saved_cost_currency = crate::pricing::CostCurrency::from_setting(&row.value);
+            let effective_cost_currency =
+                crate::pricing::CostCurrency::from_setting(&self.effective_cost_currency);
+            if saved_cost_currency != effective_cost_currency {
+                return format!("{} (effective {})", row.value, self.effective_cost_currency);
+            }
+        }
+
+        row.value.clone()
+    }
+}
+
+fn config_base_url_row_key(provider: ApiProvider) -> &'static str {
+    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+        "base_url"
+    } else {
+        "provider_url"
+    }
+}
+
+fn config_base_url_row_value(app: &App) -> String {
+    Config::load(app.config_path.clone(), app.config_profile.as_deref())
+        .map(|mut config| {
+            config.provider = Some(app.api_provider.as_str().to_string());
+            config.deepseek_base_url()
+        })
+        .unwrap_or_else(|_| "(unavailable)".to_string())
+}
+
+fn cost_currency_config_value(app: &App) -> String {
+    match app.cost_currency {
+        crate::pricing::CostCurrency::Usd => "usd",
+        crate::pricing::CostCurrency::Cny => "cny",
+    }
+    .to_string()
 }
 
 fn config_hint_for_key(key: &str) -> &'static str {
     match key {
         "model" => "deepseek-v4-pro | deepseek-v4-flash | deepseek-*",
+        "provider" => "deepseek | openrouter | xiaomi-mimo | fireworks | siliconflow | ...",
         "approval_mode" => "auto | suggest | never",
+        "allow_shell" => "true enables shell in Agent mode with approvals on the next turn",
         "auto_compact"
         | "calm_mode"
         | "low_motion"
@@ -1137,10 +1247,16 @@ fn config_hint_for_key(key: &str) -> &'static str {
         "theme" => "system | dark | light | grayscale",
         "locale" => "auto | en | ja | zh-Hans | pt-BR",
         "background_color" => "#RRGGBB | default",
+        "base_url" => "global DeepSeek/root fallback; e.g. https://api.deepseek.com/beta",
+        "provider_url" => {
+            "current provider endpoint; Xiaomi: token-plan | pay-as-you-go | custom URL"
+        }
+        "cost_currency" => "usd | cny",
         "default_mode" => "agent | plan | yolo",
         "sidebar_width" => "10..=50",
         "sidebar_focus" => "auto | work | tasks | agents | context | hidden",
         "max_history" => "integer (0 allowed)",
+        "auto_compact_threshold_percent" => "10..=100",
         "default_model" => "deepseek-v4-pro | deepseek-v4-flash | deepseek-* | none/default",
         "reasoning_effort" => "auto | off | low | medium | high | max | default",
         "mcp_config_path" => "path to mcp.json",
@@ -1392,7 +1508,8 @@ impl ModalView for ConfigView {
                 self.filter.clone()
             };
 
-            let key_column_width = self.key_column_width();
+            let (key_column_width, value_column_width, scope_column_width) =
+                self.table_column_widths(usize::from(inner.width));
             let mut lines: Vec<Line> = vec![
                 Line::from(vec![Span::styled(
                     self.tr(MessageId::ConfigTitle),
@@ -1408,15 +1525,22 @@ impl ModalView for ConfigView {
                 ]),
                 Line::from(""),
                 Line::from(format!(
-                    "  {:<key_width$} {:<value_width$} Scope",
+                    "  {:<key_width$} {:<value_width$} {:<scope_width$}",
                     "Key",
                     "Value",
+                    "Scope",
                     key_width = key_column_width,
-                    value_width = CONFIG_VALUE_COLUMN_WIDTH
+                    value_width = value_column_width,
+                    scope_width = scope_column_width
                 )),
                 Line::from(format!(
                     "  {}",
-                    "-".repeat(key_column_width + CONFIG_VALUE_COLUMN_WIDTH + 8)
+                    "-".repeat(
+                        key_column_width
+                            + value_column_width
+                            + scope_column_width
+                            + CONFIG_COLUMN_GAPS_WIDTH
+                    )
                 )),
             ];
             let mut row_hitboxes = Vec::new();
@@ -1444,14 +1568,18 @@ impl ModalView for ConfigView {
                         } else {
                             Style::default().fg(palette::TEXT_PRIMARY)
                         };
-                        let value = truncate_view_text(&row.value, CONFIG_VALUE_COLUMN_WIDTH);
+                        let key = truncate_view_text(&row.key, key_column_width);
+                        let value =
+                            truncate_view_text(&self.row_display_value(row), value_column_width);
+                        let scope = truncate_view_text(row.scope.label(), scope_column_width);
                         let mut line = Line::from(format!(
-                            "  {:<key_width$} {:<value_width$} {}",
-                            row.key,
+                            "  {:<key_width$} {:<value_width$} {:<scope_width$}",
+                            key,
                             value,
-                            row.scope.label(),
+                            scope,
                             key_width = key_column_width,
-                            value_width = CONFIG_VALUE_COLUMN_WIDTH
+                            value_width = value_column_width,
+                            scope_width = scope_column_width
                         ));
                         line.style = style;
                         lines.push(line);
@@ -2025,8 +2153,52 @@ mod tests {
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use ratatui::{buffer::Buffer, layout::Rect};
+    use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::MutexGuard;
+    use tempfile::TempDir;
+
+    struct ConfigSettingsEnvGuard {
+        _tmp: TempDir,
+        previous_config_path: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl ConfigSettingsEnvGuard {
+        fn new(settings_toml: &str) -> Self {
+            let lock = crate::test_support::lock_test_env();
+            let tmp = TempDir::new().expect("settings tempdir");
+            let config_path = tmp.path().join(".deepseek").join("config.toml");
+            let settings_path = config_path
+                .parent()
+                .expect("settings parent")
+                .join("settings.toml");
+            std::fs::create_dir_all(config_path.parent().expect("config parent"))
+                .expect("config dir");
+            std::fs::write(&settings_path, settings_toml).expect("settings file");
+            let previous_config_path = std::env::var_os("DEEPSEEK_CONFIG_PATH");
+            unsafe {
+                std::env::set_var("DEEPSEEK_CONFIG_PATH", &config_path);
+            }
+            Self {
+                _tmp: tmp,
+                previous_config_path,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ConfigSettingsEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous_config_path.take() {
+                    Some(previous) => std::env::set_var("DEEPSEEK_CONFIG_PATH", previous),
+                    None => std::env::remove_var("DEEPSEEK_CONFIG_PATH"),
+                }
+            }
+        }
+    }
 
     fn create_test_app() -> App {
         let options = TuiOptions {
@@ -2050,7 +2222,29 @@ mod tests {
             resume_session_id: None,
             initial_input: None,
         };
-        App::new(options, &Config::default())
+        let mut app = App::new(options, &Config::default());
+        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app
+    }
+
+    fn cost_currency_row_for_settings(
+        settings_toml: &str,
+    ) -> (String, String, crate::pricing::CostCurrency, Locale) {
+        let _guard = ConfigSettingsEnvGuard::new(settings_toml);
+        let app = create_test_app();
+        let view = ConfigView::new_for_app(&app);
+        let row = view
+            .rows
+            .iter()
+            .find(|row| row.key == "cost_currency")
+            .expect("cost_currency row");
+
+        (
+            row.value.clone(),
+            view.row_display_value(row),
+            app.cost_currency,
+            app.ui_locale,
+        )
     }
 
     fn type_filter(view: &mut ConfigView, text: &str) {
@@ -2101,7 +2295,7 @@ mod tests {
     #[test]
     fn subagent_view_agents_includes_live_fanout_workers_when_cache_is_empty() {
         let mut app = create_test_app();
-        let mut card = FanoutCard::new("rlm").with_workers(["chunk_1", "chunk_2"]);
+        let mut card = FanoutCard::new("rlm", app.ui_locale).with_workers(["chunk_1", "chunk_2"]);
         card.upsert_worker("chunk_1", AgentLifecycle::Completed);
         card.upsert_worker("chunk_2", AgentLifecycle::Running);
         app.add_message(HistoryCell::SubAgent(SubAgentCell::Fanout(card)));
@@ -2168,6 +2362,7 @@ mod tests {
         assert_eq!(
             visible_section_labels(&view),
             vec![
+                ConfigSection::Provider.label(),
                 ConfigSection::Model.label(),
                 ConfigSection::Permissions.label(),
                 ConfigSection::Display.label(),
@@ -2188,10 +2383,12 @@ mod tests {
             .iter()
             .map(|row| row.key.as_str())
             .collect::<Vec<_>>();
+        assert!(keys.contains(&"provider"));
         assert!(keys.contains(&"model"));
         assert!(keys.contains(&"reasoning_effort"));
         assert!(keys.contains(&"base_url"));
         assert!(keys.contains(&"approval_mode"));
+        assert!(keys.contains(&"allow_shell"));
         assert!(keys.contains(&"theme"));
         assert!(keys.contains(&"locale"));
         assert!(keys.contains(&"background_color"));
@@ -2236,6 +2433,96 @@ mod tests {
     }
 
     #[test]
+    fn config_view_uses_provider_url_for_non_deepseek_provider() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "codewhale-provider-url-view-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let config_path = temp_root.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+provider = "xiaomi-mimo"
+
+[providers.xiaomi_mimo]
+api_key = "tp-test-token-plan-key"
+base_url = "https://api.xiaomimimo.com/v1"
+"#,
+        )
+        .unwrap();
+
+        let mut app = create_test_app();
+        app.api_provider = crate::config::ApiProvider::XiaomiMimo;
+        app.config_path = Some(config_path.clone());
+        let view = ConfigView::new_for_app(&app);
+
+        let row = view
+            .rows
+            .iter()
+            .find(|row| row.key == "provider_url")
+            .expect("provider_url row missing");
+        assert_eq!(row.value, crate::config::DEFAULT_XIAOMI_MIMO_BASE_URL);
+        assert!(!view.rows.iter().any(|row| row.key == "base_url"));
+    }
+
+    #[test]
+    fn config_view_cost_currency_shows_saved_and_effective_runtime_currency() {
+        let _guard = ConfigSettingsEnvGuard::new("locale = \"zh-Hans\"\ncost_currency = \"usd\"\n");
+        let app = create_test_app();
+        assert_eq!(app.ui_locale, Locale::ZhHans);
+        assert_eq!(app.cost_currency, crate::pricing::CostCurrency::Cny);
+
+        let view = ConfigView::new_for_app(&app);
+        let row = view
+            .rows
+            .iter()
+            .find(|row| row.key == "cost_currency")
+            .expect("cost_currency row");
+
+        assert_eq!(row.value, "usd");
+        assert_eq!(view.row_display_value(row), "usd (effective cny)");
+        assert_eq!(Settings::load().expect("settings").cost_currency, "usd");
+    }
+
+    #[test]
+    fn config_view_cost_currency_aliases_matching_effective_currency_are_silent() {
+        for alias in ["rmb", "yuan", "¥"] {
+            let (saved_value, display_value, effective_currency, locale) =
+                cost_currency_row_for_settings(&format!(
+                    "locale = \"zh-Hans\"\ncost_currency = \"{alias}\"\n"
+                ));
+
+            assert_eq!(locale, Locale::ZhHans);
+            assert_eq!(effective_currency, crate::pricing::CostCurrency::Cny);
+            assert_eq!(saved_value, alias);
+            assert_eq!(display_value, alias);
+        }
+    }
+
+    #[test]
+    fn config_view_cost_currency_matching_cny_setting_is_silent() {
+        let (saved_value, display_value, effective_currency, locale) =
+            cost_currency_row_for_settings("locale = \"zh-Hans\"\ncost_currency = \"cny\"\n");
+
+        assert_eq!(locale, Locale::ZhHans);
+        assert_eq!(effective_currency, crate::pricing::CostCurrency::Cny);
+        assert_eq!(saved_value, "cny");
+        assert_eq!(display_value, "cny");
+    }
+
+    #[test]
+    fn config_view_cost_currency_non_zh_hans_locale_uses_saved_currency() {
+        let (saved_value, display_value, effective_currency, locale) =
+            cost_currency_row_for_settings("locale = \"en\"\ncost_currency = \"cny\"\n");
+
+        assert_eq!(locale, Locale::En);
+        assert_eq!(effective_currency, crate::pricing::CostCurrency::Cny);
+        assert_eq!(saved_value, "cny");
+        assert_eq!(display_value, "cny");
+    }
+
+    #[test]
     fn config_view_exposes_all_available_saved_settings() {
         let app = create_test_app();
         let view = ConfigView::new_for_app(&app);
@@ -2274,7 +2561,7 @@ mod tests {
         view.clear_filter();
         view.rows[0].value = "CAFÉ".to_string();
         type_filter(&mut view, "café");
-        assert_eq!(visible_row_keys(&view), vec!["model"]);
+        assert_eq!(visible_row_keys(&view), vec!["provider"]);
     }
 
     #[test]
@@ -2382,6 +2669,12 @@ mod tests {
     fn config_view_enter_and_ctrl_u_emit_config_updated() {
         let app = create_test_app();
         let mut view = ConfigView::new_for_app(&app);
+
+        // Navigate to the "model" row (index 2, after provider and base_url)
+        for _ in 0..2 {
+            view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert_eq!(view.rows[view.selected].key, "model");
 
         let start = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(start, ViewAction::None));

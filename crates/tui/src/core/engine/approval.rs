@@ -5,9 +5,13 @@
 //! or whenever a tool requests live user input (`await_user_input`). Channels
 //! and engine state stay private to the parent module.
 
+use std::time::Duration;
+
 use crate::core::events::Event;
 use crate::tools::spec::ToolError;
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
+
+const USER_INPUT_TIMEOUT: Duration = Duration::from_secs(300);
 
 use super::Engine;
 
@@ -118,6 +122,7 @@ impl Engine {
                         format!("Request cancelled while awaiting user input{suffix}"),
                     ));
                 }
+<<<<<<< HEAD
                 decision = self.rx_user_input.recv() => {
                     // [pinvou3-fork] broadcast channel: skip Lagged (low-frequency
                     // user input never realistically lags), error on Closed.
@@ -133,13 +138,45 @@ impl Engine {
                     match decision {
                         UserInputDecision::Submitted { id, response } if id == tool_id => {
                             return Ok(response);
+=======
+                result = tokio::time::timeout(USER_INPUT_TIMEOUT, self.rx_user_input.recv()) => {
+                    match result {
+                        Ok(Some(decision)) => {
+                            match decision {
+                                UserInputDecision::Submitted { id, response } if id == tool_id => {
+                                    return Ok(response);
+                                }
+                                UserInputDecision::Cancelled { id } if id == tool_id => {
+                                    return Err(ToolError::execution_failed(
+                                        "User input cancelled".to_string(),
+                                    ));
+                                }
+                                _ => continue,
+                            }
+>>>>>>> c8575714
                         }
-                        UserInputDecision::Cancelled { id } if id == tool_id => {
+                        Ok(None) => {
                             return Err(ToolError::execution_failed(
-                                "User input cancelled".to_string(),
+                                "User input channel closed".to_string(),
                             ));
                         }
-                        _ => continue,
+                        Err(_) => {
+                            let _ = self
+                                .tx_event
+                                .send(Event::Status {
+                                    message: format!(
+                                        "User input timed out after {}s",
+                                        USER_INPUT_TIMEOUT.as_secs()
+                                    ),
+                                })
+                                .await;
+                            return Err(ToolError::execution_failed(
+                                format!(
+                                    "User input timed out after {}s",
+                                    USER_INPUT_TIMEOUT.as_secs()
+                                ),
+                            ));
+                        }
                     }
                 }
             }

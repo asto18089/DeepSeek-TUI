@@ -4,10 +4,12 @@
 
 [English README](README.md)
 [简体中文 README](README.zh-CN.md)
+[Tiếng Việt README](README.vi.md)
+
 
 ## インストール
 
-`codewhale` は自己完結型の Rust リリースバイナリのペアとしてインストールされます。`codewhale` はディスパッチャーで、同じ場所にある `codewhale-tui` ランタイムを起動して対話セッションを実行します。npm、Homebrew、Docker は両方を自動でインストールします。Cargo や手動インストールでは、両方を同じディレクトリ（通常は `PATH` 上のディレクトリ）に置いてください。実行に Node.js や Python のランタイムは不要です。
+`codewhale` は自己完結型の Rust リリースバイナリのペアとしてインストールされます。`codewhale` はディスパッチャーで、同じ場所にある `codewhale-tui` ランタイムを起動して対話セッションを実行します。npm と Docker は両方を自動でインストールします。Cargo や手動インストールでは、両方を同じディレクトリ（通常は `PATH` 上のディレクトリ）に置いてください。実行に Node.js や Python のランタイムは不要です。
 
 ```bash
 # 1. npm — すでに Node を使っているなら最も簡単。npm パッケージは
@@ -19,8 +21,9 @@ npm install -g codewhale
 cargo install codewhale-cli --locked   # `codewhale` (エントリーポイント)
 cargo install codewhale-tui     --locked   # `codewhale-tui` (TUI バイナリ)
 
-# 3. Homebrew — macOS パッケージマネージャ。
-#    tap/formula 名は旧名のままですが、codewhale と codewhale-tui をインストールします。
+# 3. Homebrew — 旧インストールとの互換用です。
+#    tap/formula はまだ旧 deepseek-tui 名を使っています。新規インストールでは、
+#    formula が改名されるまで npm、Cargo、Docker、直接ダウンロードを優先してください。
 brew tap Hmbown/deepseek-tui
 brew install deepseek-tui
 
@@ -46,10 +49,13 @@ docker run --rm -it \
 ```bash
 codewhale update
 npm install -g codewhale@latest
-brew update && brew upgrade deepseek-tui
+brew update && brew upgrade deepseek-tui  # 旧 Homebrew インストールのみ
 cargo install codewhale-cli --locked --force
 cargo install codewhale-tui     --locked --force
 ```
+
+> codewhale update は --proxy をサポートしており、プロキシ経由で更新できます
+> 例: codewhale update --proxy https://localhost:7897
 
 [![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/codewhale)](https://www.npmjs.com/package/codewhale)
@@ -213,6 +219,12 @@ codewhale --provider wanjie-ark --model deepseek-reasoner
 # OpenRouter
 codewhale auth set --provider openrouter --api-key "YOUR_OPENROUTER_API_KEY"
 codewhale --provider openrouter --model deepseek/deepseek-v4-pro
+codewhale --provider openrouter --model arcee-ai/trinity-large-thinking
+codewhale --provider openrouter --model qwen/qwen3.7-max
+
+# Xiaomi MiMo
+codewhale auth set --provider xiaomi-mimo --api-key "YOUR_XIAOMI_MIMO_API_KEY"
+codewhale --provider xiaomi-mimo --model mimo-v2.5-pro
 
 # Novita
 codewhale auth set --provider novita --api-key "YOUR_NOVITA_API_KEY"
@@ -235,6 +247,10 @@ VLLM_BASE_URL="http://localhost:8000/v1" codewhale --provider vllm --model deeps
 # セルフホスト Ollama
 ollama pull codewhale-coder:1.3b
 codewhale --provider ollama --model codewhale-coder:1.3b
+
+# Hugging Face Inference Providers
+codewhale auth set --provider huggingface --api-key "YOUR_HF_TOKEN"
+codewhale --provider huggingface --model deepseek-ai/DeepSeek-V4-Pro
 ```
 
 TUI 内では `/provider` でプロバイダーピッカー、`/model` でローカルのモデル/思考モードピッカーを開けます。`/provider openrouter` や `/model <id>` で直接切り替え、`/models` で対応プロバイダーのライブモデル一覧を明示的に取得できます。
@@ -319,23 +335,29 @@ codewhale update                                  # バイナリ更新の確認�
 | `DEEPSEEK_HTTP_HEADERS` | 任意のモデルリクエストヘッダー |
 | `DEEPSEEK_MODEL` | デフォルトモデル |
 | `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` | ストリームのアイドルタイムアウト秒数 |
-| `DEEPSEEK_PROVIDER` | `codewhale`（デフォルト）、`nvidia-nim`、`openai`、`atlascloud`、`wanjie-ark`、`openrouter`、`novita`、`fireworks`、`sglang`、`vllm`、`ollama` |
+| `CODEWHALE_PROVIDER` / `DEEPSEEK_PROVIDER` | `deepseek`（デフォルト）、`nvidia-nim`、`openai`、`atlascloud`、`wanjie-ark`、`volcengine`、`openrouter`、`xiaomi-mimo`、`novita`、`fireworks`、`siliconflow`、`moonshot`、`sglang`、`vllm`、`ollama`、`huggingface` |
 | `DEEPSEEK_PROFILE` | 設定プロファイル名 |
 | `DEEPSEEK_MEMORY` | `on` に設定するとユーザーメモリを有効化 |
 | `DEEPSEEK_ALLOW_INSECURE_HTTP=1` | 信頼できるネットワークで非ローカル `http://` API ベース URL を許可 |
-| `NVIDIA_API_KEY` / `OPENAI_API_KEY` / `ATLASCLOUD_API_KEY` / `WANJIE_ARK_API_KEY` / `OPENROUTER_API_KEY` / `NOVITA_API_KEY` / `FIREWORKS_API_KEY` / `SGLANG_API_KEY` / `VLLM_API_KEY` / `OLLAMA_API_KEY` | プロバイダー認証 |
+| `NVIDIA_API_KEY` / `OPENAI_API_KEY` / `ATLASCLOUD_API_KEY` / `WANJIE_ARK_API_KEY` / `VOLCENGINE_API_KEY` / `ARK_API_KEY` / `OPENROUTER_API_KEY` / `XIAOMI_MIMO_API_KEY` / `MIMO_API_KEY` / `NOVITA_API_KEY` / `FIREWORKS_API_KEY` / `SILICONFLOW_API_KEY` / `MOONSHOT_API_KEY` / `KIMI_API_KEY` / `SGLANG_API_KEY` / `VLLM_API_KEY` / `OLLAMA_API_KEY` | プロバイダー認証 |
 | `OPENAI_BASE_URL` / `OPENAI_MODEL` | 汎用 OpenAI 互換エンドポイントとモデル ID |
 | `ATLASCLOUD_BASE_URL` / `ATLASCLOUD_MODEL` | AtlasCloud エンドポイントとモデル上書き |
 | `WANJIE_ARK_BASE_URL` / `WANJIE_ARK_MODEL` | Wanjie Ark エンドポイントとモデル上書き |
+| `VOLCENGINE_BASE_URL` / `ARK_BASE_URL` / `VOLCENGINE_MODEL` / `ARK_MODEL` | Volcengine Ark エンドポイントとモデル上書き |
 | `OPENROUTER_BASE_URL` | OpenRouter エンドポイント上書き |
+| `XIAOMI_MIMO_BASE_URL` / `MIMO_BASE_URL` / `XIAOMI_MIMO_MODEL` / `MIMO_MODEL` | Xiaomi MiMo エンドポイントとモデル上書き |
 | `NOVITA_BASE_URL` | Novita エンドポイント上書き |
 | `FIREWORKS_BASE_URL` | Fireworks エンドポイント上書き |
+| `SILICONFLOW_BASE_URL` / `SILICONFLOW_MODEL` | SiliconFlow エンドポイントとモデル上書き |
+| `MOONSHOT_BASE_URL` / `MOONSHOT_MODEL` / `KIMI_BASE_URL` / `KIMI_MODEL` | Moonshot/Kimi エンドポイントとモデル上書き |
 | `SGLANG_BASE_URL` | セルフホスト SGLang のエンドポイント |
 | `SGLANG_MODEL` | セルフホスト SGLang のモデル ID |
 | `VLLM_BASE_URL` | セルフホスト vLLM のエンドポイント |
 | `VLLM_MODEL` | セルフホスト vLLM のモデル ID |
 | `OLLAMA_BASE_URL` | セルフホスト Ollama のエンドポイント |
 | `OLLAMA_MODEL` | セルフホスト Ollama のモデルタグ |
+| `HUGGINGFACE_API_KEY` / `HF_TOKEN` | Hugging Face 認証 |
+| `HUGGINGFACE_BASE_URL` / `HUGGINGFACE_MODEL` | Hugging Face エンドポイントとモデル上書き |
 | `NO_ANIMATIONS=1` | 起動時にアクセシビリティモードを強制 |
 | `SSL_CERT_FILE` | 企業プロキシ向けのカスタム CA バンドル |
 
@@ -409,6 +431,10 @@ description: DeepSeek にカスタムワークフローを実行させたいと�
 ## 謝辞
 
 このプロジェクトは、増え続けるコントリビューターのコミュニティから助けを得て出荷されています:
+
+v0.8.48 でマージまたは取り込まれた貢献者: **[@cy2311](https://github.com/cy2311)**、**[@LING71671](https://github.com/LING71671)**、**[@axobase001](https://github.com/axobase001)**、**[@dzyuan](https://github.com/dzyuan)**、**[@mvanhorn](https://github.com/mvanhorn)**、**[@malsony](https://github.com/malsony)**、**[@gaord](https://github.com/gaord)**、**[@yuanchenglu](https://github.com/yuanchenglu)**、**[@idling11](https://github.com/idling11)**、**[@h3c-hexin](https://github.com/h3c-hexin)**、**[@AdityaVG13](https://github.com/AdityaVG13)**、**[@Sskift](https://github.com/Sskift)**、**[@cyq1017](https://github.com/cyq1017)**、**[@HUQIANTAO](https://github.com/HUQIANTAO)**、**[@New2Niu](https://github.com/New2Niu)**、**[@AiurArtanis](https://github.com/AiurArtanis)**、**[@Lee-take](https://github.com/Lee-take)**、**[@nightt5879](https://github.com/nightt5879)**、**[@AresNing](https://github.com/AresNing)**、**[@AccMoment](https://github.com/AccMoment)**、**[@reidliu41](https://github.com/reidliu41)**、**[@aboimpinto](https://github.com/aboimpinto)**、**[@zhuangbiaowei](https://github.com/zhuangbiaowei)**、**[@donglovejava](https://github.com/donglovejava)**、**[@hongqitai](https://github.com/hongqitai)**、**[@zlh124](https://github.com/zlh124)**、**[@encyc](https://github.com/encyc)**、**[@Implementist](https://github.com/Implementist)**、**[@lihuan215](https://github.com/lihuan215)**、**[@LeoAlex0](https://github.com/LeoAlex0)**、**[@jimmyzhuu](https://github.com/jimmyzhuu)**、**[@rockyzhang](https://github.com/rockyzhang)**、**[@mo-vic](https://github.com/mo-vic)**、**[@hufanexplore](https://github.com/hufanexplore)**、**[@hoclaptrinh33](https://github.com/hoclaptrinh33)**、**[@BryonGo](https://github.com/BryonGo)**。
+
+報告、再現手順、検証で v0.8.48 を支えてくれた **[@buko](https://github.com/buko)**、**[@yyyCode](https://github.com/yyyCode)**、**[@gaslebinh-glitch](https://github.com/gaslebinh-glitch)**、**[@Dr3259](https://github.com/Dr3259)**、**[@lpeng1711694086-lang](https://github.com/lpeng1711694086-lang)**、**[@VerrPower](https://github.com/VerrPower)**、**[@yan-zay](https://github.com/yan-zay)**、**[@jretz](https://github.com/jretz)**、**[@Neo-millunnium](https://github.com/Neo-millunnium)**、**[@caeserchen](https://github.com/caeserchen)**、**[@T-Phuong-Nguyen](https://github.com/T-Phuong-Nguyen)**、**[@zhyuzhyu](https://github.com/zhyuzhyu)**、**[@0gl20shk0sbt36](https://github.com/0gl20shk0sbt36)**、**[@hatakes](https://github.com/hatakes)**、**[@goodvecn-dev](https://github.com/goodvecn-dev)**、**[@bevis-wong](https://github.com/bevis-wong)**、**[@PurplePulse](https://github.com/PurplePulse)**、**[@nbiish](https://github.com/nbiish)** にも感謝します。
 
 - **[merchloubna70-dot](https://github.com/merchloubna70-dot)** — 機能、修正、VS Code 拡張のスキャフォールドにまたがる 28 件の PR (#645–#681)
 - **[WyxBUPT-22](https://github.com/WyxBUPT-22)** — 表、太字／斜体、水平線の Markdown レンダリング (#579)

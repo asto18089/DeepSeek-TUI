@@ -5,7 +5,7 @@ use crate::models::SystemBlock;
 use crate::test_support::lock_test_env;
 use crate::tools::spec::ToolCapability;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -113,6 +113,52 @@ fn config_auth_error_does_not_blame_env() {
         engine.decorate_auth_error_message("Authentication failed: invalid API key".to_string());
 
     assert_eq!(message, "Authentication failed: invalid API key");
+}
+
+#[test]
+fn plugin_tools_dir_honors_missing_custom_directory_without_fallback() {
+    let missing = PathBuf::from("definitely-missing-codewhale-plugin-dir");
+    let tools_config = crate::config::ToolsConfig {
+        plugin_dir: Some(missing.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(plugin_tools_dir(Some(&tools_config)), missing);
+}
+
+#[test]
+fn configure_plugin_tools_applies_overrides_after_discovered_plugins() {
+    let tmp = tempdir().expect("tempdir");
+    let plugin_dir = tmp.path().join("tools");
+    fs::create_dir(&plugin_dir).expect("plugin dir");
+    fs::write(
+        plugin_dir.join("same-name.sh"),
+        "# name: same_tool\n# description: discovered plugin\n",
+    )
+    .expect("plugin script");
+
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "same_tool".to_string(),
+        crate::config::ToolOverride::Command {
+            command: "configured-command".to_string(),
+            args: None,
+        },
+    );
+    let tools_config = crate::config::ToolsConfig {
+        plugin_dir: Some(plugin_dir.to_string_lossy().to_string()),
+        overrides: Some(overrides),
+        ..Default::default()
+    };
+
+    let ctx = crate::tools::ToolContext::new(tmp.path().to_path_buf());
+    let mut registry = crate::tools::ToolRegistry::new(ctx);
+
+    let plugin_names = configure_plugin_tools(&mut registry, Some(&tools_config));
+
+    let tool = registry.get("same_tool").expect("same_tool registered");
+    assert!(tool.description().contains("configured-command"));
+    assert!(plugin_names.contains("same_tool"));
 }
 
 fn make_plan(
@@ -424,8 +470,9 @@ fn core_native_tools_stay_loaded_in_yolo_mode() {
         AppMode::Yolo,
         &always_load
     ));
+    // git_blame remains deferred (read-only git history beyond log/show/diff).
     assert!(should_default_defer_tool(
-        "git_show",
+        "git_blame",
         AppMode::Yolo,
         &always_load
     ));
@@ -445,6 +492,37 @@ fn non_yolo_mode_retains_default_defer_policy() {
         &always_load
     ));
     assert!(!should_default_defer_tool(
+        "apply_patch",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
+        "fetch_url",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
+        "git_diff",
+        AppMode::Agent,
+        &always_load
+    ));
+    // #2654: read-only git history joins the active set.
+    assert!(!should_default_defer_tool(
+        "git_log",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
+        "git_show",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
+        "git_status",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
         "run_tests",
         AppMode::Agent,
         &always_load
@@ -454,8 +532,26 @@ fn non_yolo_mode_retains_default_defer_policy() {
         AppMode::Agent,
         &always_load
     ));
+    // #2605: the fetch/close side of the sub-agent surface must also stay
+    // active so a first `agent_eval`/`agent_close` executes instead of
+    // hydrating its schema and forcing a double-invoke.
+    assert!(!should_default_defer_tool(
+        "agent_eval",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
+        "agent_close",
+        AppMode::Agent,
+        &always_load
+    ));
     assert!(!should_default_defer_tool(
         "read_file",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
+        "web_search",
         AppMode::Agent,
         &always_load
     ));
@@ -464,8 +560,18 @@ fn non_yolo_mode_retains_default_defer_policy() {
         AppMode::Agent,
         &always_load
     ));
+    assert!(!should_default_defer_tool(
+        "task_shell_start",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
+        "task_shell_wait",
+        AppMode::Agent,
+        &always_load
+    ));
     assert!(should_default_defer_tool(
-        "git_show",
+        "git_blame",
         AppMode::Agent,
         &always_load
     ));
@@ -527,6 +633,105 @@ fn tool_whitelist_none_is_noop_some_hard_filters() {
     assert_eq!(names, vec!["read_file", "update_plan"]);
     assert!(!catalog.iter().any(|t| t.name == "write_file"));
     assert!(!catalog.iter().any(|t| t.name == "exec_shell"));
+}
+
+#[test]
+fn arcee_provider_policy_defers_risky_tools_keeps_read_only_and_tool_search() {
+    let always_load = HashSet::new();
+    let mut catalog = vec![
+        api_tool("read_file"),
+        api_tool("list_dir"),
+        api_tool("git_status"),
+        api_tool("git_diff"),
+        api_tool("grep_files"),
+        api_tool("file_search"),
+        api_tool("update_plan"),
+        api_tool("checklist_write"),
+        api_tool("exec_shell"),
+        api_tool("apply_patch"),
+        api_tool("write_file"),
+        api_tool("edit_file"),
+        api_tool("fetch_url"),
+        api_tool("web_search"),
+        api_tool("tool_search_tool_regex"),
+        api_tool("tool_search_tool_bm25"),
+    ];
+
+    apply_provider_tool_policy(&mut catalog, ApiProvider::Arcee, &always_load);
+
+    let defer = |name: &str| {
+        catalog
+            .iter()
+            .find(|tool| tool.name == name)
+            .and_then(|tool| tool.defer_loading)
+    };
+
+    // Benign read-only first-turn set stays active so the opening Arcee
+    // request clears Cloudflare's WAF.
+    for active in [
+        "read_file",
+        "list_dir",
+        "git_status",
+        "git_diff",
+        "grep_files",
+        "file_search",
+        "update_plan",
+        "checklist_write",
+    ] {
+        assert_eq!(defer(active), Some(false), "{active} should stay active");
+    }
+    // Tool-search stays active so the deferred tail remains discoverable.
+    assert_eq!(defer("tool_search_tool_regex"), Some(false));
+    assert_eq!(defer("tool_search_tool_bm25"), Some(false));
+    // WAF-risky / mutating tools are deferred on the first Arcee turn.
+    for deferred in [
+        "exec_shell",
+        "apply_patch",
+        "write_file",
+        "edit_file",
+        "fetch_url",
+        "web_search",
+    ] {
+        assert_eq!(defer(deferred), Some(true), "{deferred} should be deferred");
+    }
+
+    let active = initial_active_tools(&catalog);
+    assert!(active.contains("read_file"));
+    assert!(active.contains("tool_search_tool_regex"));
+    assert!(!active.contains("exec_shell"));
+    assert!(!active.contains("apply_patch"));
+}
+
+#[test]
+fn provider_tool_policy_is_noop_for_non_waf_providers() {
+    let always_load = HashSet::new();
+    let mut catalog = vec![api_tool("exec_shell"), api_tool("read_file")];
+
+    // DeepSeek has no reduced first-turn surface: the policy must leave the
+    // default deferral flags untouched (here: still unset).
+    apply_provider_tool_policy(&mut catalog, ApiProvider::Deepseek, &always_load);
+
+    assert!(catalog.iter().all(|tool| tool.defer_loading.is_none()));
+}
+
+#[test]
+fn arcee_provider_policy_honors_always_load_override() {
+    let mut always_load = HashSet::new();
+    always_load.insert("exec_shell".to_string());
+    let mut catalog = vec![api_tool("exec_shell"), api_tool("apply_patch")];
+
+    apply_provider_tool_policy(&mut catalog, ApiProvider::Arcee, &always_load);
+
+    let defer = |name: &str| {
+        catalog
+            .iter()
+            .find(|tool| tool.name == name)
+            .and_then(|tool| tool.defer_loading)
+    };
+    // A user-pinned always_load tool stays active even on Arcee.
+    assert_eq!(defer("exec_shell"), Some(false));
+    // Other risky tools remain deferred.
+    assert_eq!(defer("apply_patch"), Some(true));
 }
 
 #[test]
@@ -595,9 +800,48 @@ fn agent_catalog_keeps_edit_file_loaded_when_fuzz_is_omitted() {
 
 #[test]
 fn tools_always_load_overrides_default_native_deferral() {
-    let always_load = HashSet::from(["git_show".to_string()]);
+    let always_load = HashSet::from(["git_blame".to_string()]);
     assert!(!should_default_defer_tool(
+        "git_blame",
+        AppMode::Agent,
+        &always_load
+    ));
+}
+
+// [pinvou3-fork] 回归保护:Yolo(GUI 单 session)下,pinvou3 必需但不在上游
+// DEFAULT_ACTIVE_NATIVE_TOOLS 白名单的工具(request_user_input / append_file)
+// 必须 offer(不 defer),否则 GUI 调不出 request_user_input 气泡 / 大文件 append_file。
+// 此前 v0.8.47 sync 因上游把 deferral 从 blocklist 改 allowlist 静默踩过(symptom: 气泡消失)。
+//
+// 2026-05-28 补强:`request_user_input` 跨所有 mode 永不 defer(Plan/Agent 也要,
+// 因为 pinvou3 instructions §1.4 + Plan reminder 都引导 AI 用这工具问澄清,
+// 工具表必须永远有它)。实测 case: Plan 模式问"我要做俄罗斯方块"AI 用 text
+// 列 A/B/C 选项而不是 request_user_input 气泡,根因就是非 Yolo 下被 defer。
+#[test]
+fn pinvou3_yolo_offers_nonblocklisted_tools_outside_upstream_default() {
+    let always_load = HashSet::new();
+    for tool in ["request_user_input", "append_file"] {
+        assert!(
+            !pinvou3_should_defer_native_tool(tool, AppMode::Yolo, &always_load),
+            "{tool} 在 Yolo 下不应被 defer(pinvou3 blocklist 模型,GUI 必需)"
+        );
+    }
+    // 黑名单工具即便 Yolo 也 defer
+    assert!(pinvou3_should_defer_native_tool(
         "git_show",
+        AppMode::Yolo,
+        &always_load
+    ));
+    // request_user_input 跨所有 mode 都不 defer(pinvou3 instructions §1.4 引导用它问澄清)
+    for mode in [AppMode::Yolo, AppMode::Plan, AppMode::Agent] {
+        assert!(
+            !pinvou3_should_defer_native_tool("request_user_input", mode, &always_load),
+            "request_user_input 在 {mode:?} 下不应被 defer(pinvou3 引导调它问澄清,工具表必须有)"
+        );
+    }
+    // 其他非白名单工具(如 append_file)在非 Yolo 下仍回落上游 allowlist 被 defer
+    assert!(pinvou3_should_defer_native_tool(
+        "append_file",
         AppMode::Agent,
         &always_load
     ));
@@ -656,7 +900,6 @@ fn print_agent_tool_catalog_metrics() {
         .with_plan_tool(new_shared_plan_state())
         .with_review_tool(None, DEFAULT_TEXT_MODEL.to_string())
         .with_rlm_tool(None, DEFAULT_TEXT_MODEL.to_string())
-        .with_recall_archive_tool()
         .with_notify_tool()
         .with_subagent_tools(manager, runtime)
         .build(context);
@@ -903,6 +1146,68 @@ fn deferred_tool_preflight_loads_edit_schema_without_executing_bad_aliases() {
 }
 
 #[test]
+fn deferred_tool_preflight_guides_rlm_open_misnamed_source_fields() {
+    let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
+    let registry = engine
+        .build_turn_tool_registry_builder(
+            AppMode::Agent,
+            engine.config.todos.clone(),
+            engine.config.plan_state.clone(),
+        )
+        .build(engine.build_tool_context(AppMode::Agent, false));
+    let always_load = HashSet::new();
+    let mut catalog = build_model_tool_catalog(
+        registry.to_api_tools_with_cache(true),
+        vec![],
+        AppMode::Agent,
+        &always_load,
+    );
+    catalog
+        .iter_mut()
+        .find(|tool| tool.name == "rlm_open")
+        .expect("rlm_open registered")
+        .defer_loading = Some(true);
+    let mut active = initial_active_tools(&catalog);
+    assert!(!active.contains("rlm_open"));
+
+    let result = preflight_requested_deferred_tool(
+        "rlm_open",
+        &json!({
+            "name": "active_prompt",
+            "prompt": "inspect this",
+            "path": "src/lib.rs"
+        }),
+        &catalog,
+        &mut active,
+    )
+    .expect("deferred rlm_open should preflight");
+
+    assert!(active.contains("rlm_open"));
+    assert!(result.success);
+    assert!(result.content.contains("Tool `rlm_open` was deferred"));
+    assert!(result.content.contains("The tool was not executed"));
+    assert!(result.content.contains("session_object: string"));
+    assert!(
+        result.content.contains(
+            "prompt -> file_path (local file), content (inline text), url, or session_object"
+        ),
+        "prompt correction includes session_object: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains(
+            "path -> file_path (local file), content (inline text), url, or session_object"
+        ),
+        "path correction includes session_object: {}",
+        result.content
+    );
+    assert_eq!(
+        result.metadata.as_ref().unwrap()["deferred_tool_loaded"],
+        json!(true)
+    );
+}
+
+#[test]
 fn deferred_tool_preflight_guides_checklist_update_list_replacement() {
     let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
     let registry = engine
@@ -950,6 +1255,156 @@ fn deferred_tool_preflight_guides_checklist_update_list_replacement() {
     assert!(result.content.contains("Use checklist_write"));
 }
 
+#[tokio::test]
+async fn run_shell_command_op_requests_approval_and_executes_shell() {
+    let (mut engine, handle) = Engine::new(EngineConfig::default(), &Config::default());
+    let handle_for_approval = handle.clone();
+
+    let task = tokio::spawn(async move {
+        engine
+            .handle_run_shell_command(
+                "echo bang-ok".to_string(),
+                AppMode::Agent,
+                false,
+                false,
+                crate::tui::approval::ApprovalMode::Suggest,
+            )
+            .await;
+    });
+
+    let mut saw_started = false;
+    let mut saw_approval = false;
+    let mut saw_complete = false;
+    let mut saw_turn_complete = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = rx.recv().await {
+        match event {
+            Event::TurnStarted { turn_id } => {
+                assert!(turn_id.starts_with(USER_SHELL_TOOL_ID_PREFIX));
+            }
+            Event::ToolCallStarted { id, name, input } => {
+                saw_started = true;
+                assert!(id.starts_with(USER_SHELL_TOOL_ID_PREFIX));
+                assert_eq!(name, "exec_shell");
+                assert_eq!(input["command"], json!("echo bang-ok"));
+                assert_eq!(input["source"], json!("user"));
+            }
+            Event::ApprovalRequired { id, tool_name, .. } => {
+                saw_approval = true;
+                assert!(id.starts_with(USER_SHELL_TOOL_ID_PREFIX));
+                assert_eq!(tool_name, "exec_shell");
+                handle_for_approval
+                    .approve_tool_call(id)
+                    .await
+                    .expect("approve shell");
+            }
+            Event::ToolCallComplete { id, name, result } => {
+                saw_complete = true;
+                assert!(id.starts_with(USER_SHELL_TOOL_ID_PREFIX));
+                assert_eq!(name, "exec_shell");
+                let result = result.expect("shell result");
+                assert!(result.success, "{result:?}");
+                assert!(result.content.contains("bang-ok"), "{result:?}");
+            }
+            Event::TurnComplete { status, .. } => {
+                saw_turn_complete = true;
+                assert_eq!(status, TurnOutcomeStatus::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(rx);
+    task.await.expect("shell op task");
+
+    assert!(saw_started);
+    assert!(saw_approval);
+    assert!(saw_complete);
+    assert!(saw_turn_complete);
+}
+
+#[tokio::test]
+async fn run_shell_command_op_skips_approval_when_auto_approved() {
+    let (mut engine, handle) = Engine::new(EngineConfig::default(), &Config::default());
+
+    engine
+        .handle_run_shell_command(
+            "echo bang-yolo".to_string(),
+            AppMode::Yolo,
+            true,
+            true,
+            crate::tui::approval::ApprovalMode::Auto,
+        )
+        .await;
+
+    let mut saw_complete = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = rx.recv().await {
+        match event {
+            Event::ApprovalRequired { .. } => {
+                panic!("auto-approved shell shortcut should not request approval");
+            }
+            Event::ToolCallComplete { result, .. } => {
+                saw_complete = true;
+                let result = result.expect("shell result");
+                assert!(result.success, "{result:?}");
+                assert!(result.content.contains("bang-yolo"), "{result:?}");
+            }
+            Event::TurnComplete { status, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_complete);
+}
+
+#[tokio::test]
+async fn run_shell_command_op_preserves_plan_mode_shell_block() {
+    let (mut engine, handle) = Engine::new(EngineConfig::default(), &Config::default());
+
+    engine
+        .handle_run_shell_command(
+            "echo blocked".to_string(),
+            AppMode::Plan,
+            false,
+            false,
+            crate::tui::approval::ApprovalMode::Suggest,
+        )
+        .await;
+
+    let mut saw_complete = false;
+    let mut saw_turn_complete = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = rx.recv().await {
+        match event {
+            Event::ApprovalRequired { .. } => {
+                panic!("Plan mode shell should be blocked before approval");
+            }
+            Event::ToolCallComplete { name, result, .. } => {
+                saw_complete = true;
+                assert_eq!(name, "exec_shell");
+                let err = result.expect_err("plan shell should fail");
+                assert!(
+                    err.to_string().contains("unavailable in Plan mode"),
+                    "{err}"
+                );
+            }
+            Event::TurnComplete { status, .. } => {
+                saw_turn_complete = true;
+                assert_eq!(status, TurnOutcomeStatus::Failed);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_complete);
+    assert!(saw_turn_complete);
+}
+
 #[test]
 fn deferred_tool_preflight_skips_already_active_tools() {
     let mut tool = api_tool("deferred_tool");
@@ -995,8 +1450,6 @@ fn turn_tool_registry_builder_keeps_plan_mode_read_only_for_files() {
     assert!(registry.contains("task_list"));
     assert!(registry.contains("task_read"));
     assert!(registry.contains("handle_read"));
-    assert!(registry.contains("recall_archive"));
-
     let plan_state_tools = [
         "checklist_add",
         "checklist_update",
@@ -1024,24 +1477,135 @@ fn turn_tool_registry_builder_keeps_plan_mode_read_only_for_files() {
     );
 }
 
+/// Plan mode toggle must not change the byte representation of the tool
+/// catalog head. DeepSeek's KV prefix cache includes the tools array in
+/// the immutable prefix; if toggling between Plan and Agent mode changes
+/// the tool bytes, every mode switch forces a full re-prefill.
+///
+/// This test verifies two invariants:
+/// 1. Building the catalog twice for the same mode produces identical bytes.
+/// 2. The head of the catalog (non-deferred tools) preserves its order
+///    when deferred tools are activated mid-session.
 #[test]
-fn parent_turn_registry_includes_recall_archive_for_investigative_modes() {
-    let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
+fn plan_mode_toggle_preserves_catalog_byte_stability() {
+    let always_load = HashSet::new();
 
-    for mode in [AppMode::Plan, AppMode::Agent, AppMode::Yolo] {
-        let registry = engine
-            .build_turn_tool_registry_builder(
-                mode,
-                engine.config.todos.clone(),
-                engine.config.plan_state.clone(),
-            )
-            .build(engine.build_tool_context(mode, false));
+    // Build catalog for Plan mode twice — must be byte-identical.
+    let plan_native = vec![
+        api_tool("read_file"),
+        api_tool("list_dir"),
+        api_tool("write_file"),
+        api_tool("edit_file"),
+        api_tool("exec_shell"),
+    ];
+    let plan_mcp = vec![api_tool("mcp_search"), api_tool("mcp_write")];
 
-        assert!(
-            registry.contains("recall_archive"),
-            "parent {mode:?} registry should expose recall_archive"
-        );
-    }
+    let catalog_a = build_model_tool_catalog(
+        plan_native.clone(),
+        plan_mcp.clone(),
+        AppMode::Plan,
+        &always_load,
+    );
+    let catalog_b = build_model_tool_catalog(
+        plan_native.clone(),
+        plan_mcp.clone(),
+        AppMode::Plan,
+        &always_load,
+    );
+
+    let json_a = serde_json::to_string(&catalog_a).unwrap();
+    let json_b = serde_json::to_string(&catalog_b).unwrap();
+    assert_eq!(
+        json_a, json_b,
+        "building the catalog twice for Plan mode must produce identical bytes"
+    );
+
+    // Build catalog for Agent mode twice — must be byte-identical.
+    let agent_catalog_a = build_model_tool_catalog(
+        plan_native.clone(),
+        plan_mcp.clone(),
+        AppMode::Agent,
+        &always_load,
+    );
+    let agent_catalog_b = build_model_tool_catalog(
+        plan_native.clone(),
+        plan_mcp.clone(),
+        AppMode::Agent,
+        &always_load,
+    );
+
+    let agent_json_a = serde_json::to_string(&agent_catalog_a).unwrap();
+    let agent_json_b = serde_json::to_string(&agent_catalog_b).unwrap();
+    assert_eq!(
+        agent_json_a, agent_json_b,
+        "building the catalog twice for Agent mode must produce identical bytes"
+    );
+
+    // Verify that the non-deferred tools that are common to both modes
+    // appear in the same order. Plan mode excludes execution tools, but
+    // the tools that are present in both modes must have stable ordering.
+    let plan_names: Vec<&str> = catalog_a
+        .iter()
+        .filter(|t| !t.defer_loading.unwrap_or(false))
+        .map(|t| t.name.as_str())
+        .collect();
+    let agent_names: Vec<&str> = agent_catalog_a
+        .iter()
+        .filter(|t| !t.defer_loading.unwrap_or(false))
+        .map(|t| t.name.as_str())
+        .collect();
+
+    // The common prefix of non-deferred tools must be identical.
+    let common_len = plan_names.len().min(agent_names.len());
+    assert_eq!(
+        &plan_names[..common_len],
+        &agent_names[..common_len],
+        "non-deferred tools common to Plan and Agent must appear in the same order"
+    );
+
+    // Verify that activating a deferred tool mid-session appends to the
+    // tail without reordering the head.
+    let mut tools_with_deferred = plan_native.clone();
+    tools_with_deferred.push({
+        let mut t = api_tool("deferred_search");
+        t.defer_loading = Some(true);
+        t
+    });
+    let catalog_with_deferred = build_model_tool_catalog(
+        tools_with_deferred,
+        plan_mcp.clone(),
+        AppMode::Agent,
+        &always_load,
+    );
+
+    // Activate the deferred tool.
+    let mut active: HashSet<String> = catalog_with_deferred
+        .iter()
+        .filter(|t| !t.defer_loading.unwrap_or(false))
+        .map(|t| t.name.clone())
+        .collect();
+    active.insert("deferred_search".to_string());
+
+    let listed = active_tools_for_step(&catalog_with_deferred, &active, false);
+    let listed_names: Vec<&str> = listed.iter().map(|t| t.name.as_str()).collect();
+
+    // The head (non-deferred tools) must still be in their original order.
+    let head_names: Vec<&str> = catalog_with_deferred
+        .iter()
+        .filter(|t| !t.defer_loading.unwrap_or(false))
+        .map(|t| t.name.as_str())
+        .collect();
+    assert!(
+        listed_names.starts_with(&head_names),
+        "activating a deferred tool must not reorder the catalog head: \
+         expected {head_names:?} as prefix, got {listed_names:?}"
+    );
+    // The deferred tool must be at the tail.
+    assert_eq!(
+        listed_names.last(),
+        Some(&"deferred_search"),
+        "deferred tool must be appended at the tail"
+    );
 }
 
 #[test]
@@ -1209,6 +1773,159 @@ async fn session_update_preserves_reasoning_tool_only_turn() {
     };
 
     assert_eq!(messages, vec![assistant]);
+}
+
+#[tokio::test]
+async fn set_model_reloads_instruction_sources_and_updates_session_prompt() {
+    let tmp = tempdir().expect("tempdir");
+    let instructions = tmp.path().join("instructions.md");
+    fs::write(&instructions, "FLASH_INSTRUCTIONS_MARKER").expect("write instructions");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        model: "deepseek-v4-flash".to_string(),
+        instructions: vec![instructions.clone().into()],
+        ..Default::default()
+    };
+    let (engine, handle) = Engine::new(config, &Config::default());
+    fs::write(&instructions, "PRO_INSTRUCTIONS_MARKER").expect("rewrite instructions");
+
+    let run = tokio::spawn(engine.run());
+    handle
+        .send(Op::SetModel {
+            model: "deepseek-v4-pro".to_string(),
+            mode: AppMode::Agent,
+        })
+        .await
+        .expect("send set model");
+
+    let (model, prompt) = {
+        let mut rx = handle.rx_event.write().await;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("session update after model switch")
+                .expect("event");
+            if let Event::SessionUpdated {
+                model,
+                system_prompt,
+                ..
+            } = event
+            {
+                let prompt = match system_prompt.expect("system prompt") {
+                    SystemPrompt::Text(text) => text,
+                    SystemPrompt::Blocks(blocks) => blocks
+                        .into_iter()
+                        .map(|block| block.text)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                };
+                break (model, prompt);
+            }
+        }
+    };
+    run.abort();
+
+    assert_eq!(model, "deepseek-v4-pro");
+    assert!(prompt.contains("PRO_INSTRUCTIONS_MARKER"));
+    assert!(!prompt.contains("FLASH_INSTRUCTIONS_MARKER"));
+}
+
+#[tokio::test]
+async fn change_mode_refreshes_session_prompt_and_updates_session() {
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        model: "deepseek-v4-pro".to_string(),
+        ..Default::default()
+    };
+    let (engine, handle) = Engine::new(config, &Config::default());
+
+    let run = tokio::spawn(engine.run());
+    handle
+        .send(Op::ChangeMode {
+            mode: AppMode::Yolo,
+        })
+        .await
+        .expect("send change mode");
+
+    let prompt = {
+        let mut rx = handle.rx_event.write().await;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("session update after mode switch")
+                .expect("event");
+            if let Event::SessionUpdated { system_prompt, .. } = event {
+                break match system_prompt.expect("system prompt") {
+                    SystemPrompt::Text(text) => text,
+                    SystemPrompt::Blocks(blocks) => blocks
+                        .into_iter()
+                        .map(|block| block.text)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                };
+            }
+        }
+    };
+    run.abort();
+
+    assert!(prompt.contains("Mode: YOLO"));
+    assert!(prompt.contains("Approval Policy: Auto"));
+}
+
+#[tokio::test]
+async fn change_mode_op_injects_runtime_event_into_session_messages() {
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        model: "deepseek-v4-pro".to_string(),
+        ..Default::default()
+    };
+    let (engine, handle) = Engine::new(config, &Config::default());
+
+    let run = tokio::spawn(engine.run());
+    // Switch from default Agent → YOLO
+    handle
+        .send(Op::ChangeMode {
+            mode: AppMode::Yolo,
+        })
+        .await
+        .expect("send change mode");
+
+    // Collect session-updated events until we see the injected message
+    let messages = {
+        let mut rx = handle.rx_event.write().await;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("session update after mode switch")
+                .expect("event");
+            if let Event::SessionUpdated { messages, .. } = event {
+                // The last message should be our runtime event
+                if let Some(last) = messages.last()
+                    && let ContentBlock::Text { text, .. } =
+                        last.content.first().expect("text block")
+                    && text.contains("kind=\"mode_change\"")
+                {
+                    break messages;
+                }
+            }
+        }
+    };
+    run.abort();
+
+    let last = messages.last().expect("at least one message");
+    let ContentBlock::Text { text, .. } = last.content.first().expect("text block") else {
+        panic!("expected text block");
+    };
+    assert!(
+        text.contains("Agent mode") && text.contains("YOLO mode"),
+        "should contain both previous and new mode: {text}"
+    );
+    assert!(
+        text.contains("Re-evaluate"),
+        "should tell agent to re-evaluate: {text}"
+    );
 }
 
 #[test]
@@ -1400,6 +2117,143 @@ fn subagent_results_are_summarized_before_parent_context_insertion() {
 }
 
 #[test]
+fn run_verifiers_results_are_structured_before_context_insertion() {
+    let noisy_failure = "node lint failure detail\n".repeat(300);
+    let noisy_success = "successful check output\n".repeat(300);
+    let output = ToolResult::success(
+        json!({
+            "success": false,
+            "profile": "auto",
+            "level": "quick",
+            "workspace": "/repo",
+            "gate_count": 3,
+            "passed": 1,
+            "failed": 1,
+            "skipped": 1,
+            "summary": "1 passed, 1 failed, 1 skipped",
+            "gates": [
+                {
+                    "name": "rust-check",
+                    "ecosystem": "rust",
+                    "status": "passed",
+                    "command": "cargo check --workspace --locked",
+                    "cwd": "/repo",
+                    "exit_code": 0,
+                    "duration_ms": 110,
+                    "stdout": noisy_success.clone(),
+                    "stderr": "",
+                    "stdout_truncated": false,
+                    "stderr_truncated": false,
+                    "skipped_reason": null
+                },
+                {
+                    "name": "node-lint",
+                    "ecosystem": "node",
+                    "status": "failed",
+                    "command": "npm run lint",
+                    "cwd": "/repo",
+                    "exit_code": 1,
+                    "duration_ms": 220,
+                    "stdout": "",
+                    "stderr": noisy_failure,
+                    "stdout_truncated": false,
+                    "stderr_truncated": false,
+                    "skipped_reason": null
+                },
+                {
+                    "name": "python-pytest",
+                    "ecosystem": "python",
+                    "status": "skipped",
+                    "command": "",
+                    "cwd": "/repo",
+                    "exit_code": null,
+                    "duration_ms": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "stdout_truncated": false,
+                    "stderr_truncated": false,
+                    "skipped_reason": "pytest is not installed"
+                }
+            ]
+        })
+        .to_string(),
+    );
+
+    let context = compact_tool_result_for_context("deepseek-v4-pro", "run_verifiers", &output);
+
+    assert!(context.contains("[run_verifiers result summarized for context]"));
+    assert!(context.contains("summary: 1 passed, 1 failed, 1 skipped"));
+    assert!(context.contains("selection: profile=auto, level=quick"));
+    assert!(context.contains("- node-lint (node): failed exit=1"));
+    assert!(context.contains("command: npm run lint"));
+    assert!(context.contains("- python-pytest (python): skipped"));
+    assert!(context.contains("pytest is not installed"));
+    assert!(context.contains("- rust-check (rust): passed exit=0"));
+    assert!(context.len() < output.content.len());
+    assert!(
+        !context.contains(&noisy_success),
+        "successful gate stdout should not be copied into parent context"
+    );
+}
+
+#[test]
+fn run_tests_results_are_structured_before_context_insertion() {
+    let stdout = "running test suite\n".repeat(500);
+    let stderr = "error[E0425]: cannot find value `missing`\n".repeat(500);
+    let output = ToolResult::success(
+        json!({
+            "success": false,
+            "exit_code": 101,
+            "stdout": stdout,
+            "stderr": stderr,
+            "command": "(cd /repo && cargo test --workspace --all-features)"
+        })
+        .to_string(),
+    );
+
+    let context = compact_tool_result_for_context("deepseek-v4-pro", "run_tests", &output);
+
+    assert!(context.contains("[run_tests result summarized for context]"));
+    assert!(context.contains("status: failed, exit_code: 101"));
+    assert!(context.contains("cargo test --workspace --all-features"));
+    assert!(context.contains("error[E0425]"));
+    assert!(context.contains("running test suite"));
+    assert!(context.len() < output.content.len());
+}
+
+#[test]
+fn task_gate_run_results_are_structured_before_context_insertion() {
+    let output = ToolResult::success(
+        json!({
+            "gate": {
+                "id": "gate_abcd1234",
+                "gate": "clippy",
+                "command": "cargo clippy -p codewhale-tui --all-targets --all-features --locked -- -D warnings",
+                "cwd": "/repo",
+                "exit_code": 1,
+                "status": "failed",
+                "classification": "compile_failure",
+                "duration_ms": 5000,
+                "summary": "warning promoted to error in verifier.rs",
+                "log_path": "/repo/.codewhale/runtime/gate.log",
+                "recorded_at": "2026-06-01T12:00:00Z"
+            },
+            "stdout_summary": "",
+            "stderr_summary": "warning promoted to error"
+        })
+        .to_string(),
+    );
+
+    let context = compact_tool_result_for_context("deepseek-v4-pro", "task_gate_run", &output);
+
+    assert!(context.contains("[task_gate_run result summarized for context]"));
+    assert!(context.contains("gate: clippy, status: failed, exit_code: 1"));
+    assert!(context.contains("cargo clippy -p codewhale-tui"));
+    assert!(context.contains("summary: warning promoted to error"));
+    assert!(context.contains("log_path: /repo/.codewhale/runtime/gate.log"));
+}
+
+#[test]
 fn refresh_system_prompt_leaves_working_set_out_of_system_prompt() {
     let tmp = tempdir().expect("tempdir");
     fs::create_dir_all(tmp.path().join("src")).expect("mkdir");
@@ -1465,6 +2319,7 @@ fn working_set_reaches_model_as_turn_metadata() {
 fn turn_metadata_includes_current_local_date_without_working_set() {
     let tmp = tempdir().expect("tempdir");
     let config = EngineConfig {
+        model: "deepseek-v4-flash".to_string(),
         workspace: tmp.path().to_path_buf(),
         ..Default::default()
     };
@@ -1484,6 +2339,123 @@ fn turn_metadata_includes_current_local_date_without_working_set() {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     assert!(text.starts_with("<turn_meta>\n"));
     assert!(text.contains(&format!("Current local date: {today}")));
+    assert!(text.contains("Current model: deepseek-v4-flash"));
+}
+
+#[test]
+fn turn_metadata_includes_auto_model_route() {
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let (engine, _handle) = Engine::new(config, &Config::default());
+
+    let user_msg = engine.user_text_message_with_turn_metadata_for_route(
+        "debug this regression".to_string(),
+        AppMode::Agent,
+        "deepseek-v4-pro",
+        true,
+        Some("max"),
+        true,
+    );
+    let first_block = user_msg.content.first().expect("turn metadata block");
+    let ContentBlock::Text { text, .. } = first_block else {
+        panic!("expected text metadata block");
+    };
+
+    assert!(text.contains("Current model: deepseek-v4-pro"));
+    assert!(text.contains("Auto model route: deepseek-v4-pro"));
+    assert!(text.contains("Auto reasoning effort: max"));
+    assert!(!text.contains("debug this regression"));
+}
+
+#[test]
+fn turn_metadata_includes_current_mode() {
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let (engine, _handle) = Engine::new(config, &Config::default());
+
+    let user_msg = engine.user_text_message_with_turn_metadata_for_route(
+        "test mode metadata".to_string(),
+        AppMode::Yolo,
+        "deepseek-v4-flash",
+        false,
+        None,
+        false,
+    );
+    let first_block = user_msg.content.first().expect("turn metadata block");
+    let ContentBlock::Text { text, .. } = first_block else {
+        panic!("expected text metadata block");
+    };
+
+    assert!(
+        text.contains("Current mode: YOLO mode - full tool access without approvals"),
+        "turn metadata should include the current mode label, got: {text}"
+    );
+}
+
+#[test]
+fn turn_metadata_mode_updates_with_change_mode_op() {
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let (mut engine, _handle) = Engine::new(config, &Config::default());
+
+    // In agent mode by default
+    let msg = engine.user_text_message_with_turn_metadata("hello".to_string());
+    let first_block = msg.content.first().expect("turn metadata block");
+    let ContentBlock::Text { text, .. } = first_block else {
+        panic!("expected text metadata block");
+    };
+    assert!(
+        text.contains("Agent mode"),
+        "initial mode should be Agent, got: {text}"
+    );
+
+    // Switch to YOLO — user_text_message_with_turn_metadata should reflect the new mode
+    engine.current_mode = AppMode::Yolo;
+    let msg = engine.user_text_message_with_turn_metadata("hello again".to_string());
+    let first_block = msg.content.first().expect("turn metadata block");
+    let ContentBlock::Text { text, .. } = first_block else {
+        panic!("expected text metadata block");
+    };
+    assert!(
+        text.contains("YOLO mode"),
+        "mode after change should be YOLO, got: {text}"
+    );
+}
+
+#[test]
+fn mode_change_runtime_message_format() {
+    let msg = Engine::mode_change_runtime_message(AppMode::Agent, AppMode::Yolo);
+
+    assert_eq!(msg.role, "user");
+    let ContentBlock::Text { text, .. } = msg.content.first().expect("text block") else {
+        panic!("expected text block");
+    };
+
+    assert!(
+        text.contains("codewhale:runtime_event"),
+        "should be a runtime event message"
+    );
+    assert!(
+        text.contains("kind=\"mode_change\""),
+        "should have mode_change kind"
+    );
+    assert!(
+        text.contains("Agent mode") && text.contains("YOLO mode"),
+        "should mention both previous and new mode: {text}"
+    );
+    assert!(
+        text.contains("Re-evaluate"),
+        "should tell agent to re-evaluate blocked operations: {text}"
+    );
 }
 
 #[test]
@@ -2151,6 +3123,96 @@ fn tool_search_activates_discovered_deferred_tools() {
     assert!(active.contains("read_file"));
 }
 
+fn tool_search_catalog_with_matches(count: usize) -> Vec<Tool> {
+    let mut catalog = (0..count)
+        .map(|idx| Tool {
+            tool_type: None,
+            name: format!("matching_tool_{idx:03}"),
+            description: "Matching deferred test tool".to_string(),
+            input_schema: json!({"type":"object","properties":{"query":{"type":"string"}}}),
+            allowed_callers: Some(vec!["direct".to_string()]),
+            defer_loading: Some(true),
+            input_examples: None,
+            strict: None,
+            cache_control: None,
+        })
+        .collect::<Vec<_>>();
+    let always_load = HashSet::new();
+    ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
+    catalog
+}
+
+fn tool_search_reference_count(result: &ToolResult) -> usize {
+    result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("tool_references"))
+        .and_then(|references| references.as_array())
+        .map_or(0, Vec::len)
+}
+
+#[test]
+fn tool_search_defaults_to_twenty_results_for_regex_and_bm25() {
+    let catalog = tool_search_catalog_with_matches(25);
+
+    for tool_name in [TOOL_SEARCH_REGEX_NAME, TOOL_SEARCH_BM25_NAME] {
+        let mut active = initial_active_tools(&catalog);
+        let result = execute_tool_search(
+            tool_name,
+            &json!({"query":"matching"}),
+            &catalog,
+            &mut active,
+        )
+        .expect("search succeeds");
+
+        assert_eq!(tool_search_reference_count(&result), 20);
+    }
+}
+
+#[test]
+fn tool_search_respects_and_caps_max_results() {
+    let catalog = tool_search_catalog_with_matches(120);
+
+    let mut active = initial_active_tools(&catalog);
+    let limited = execute_tool_search(
+        TOOL_SEARCH_BM25_NAME,
+        &json!({"query":"matching","max_results":7}),
+        &catalog,
+        &mut active,
+    )
+    .expect("search succeeds");
+    assert_eq!(tool_search_reference_count(&limited), 7);
+
+    let mut active = initial_active_tools(&catalog);
+    let capped = execute_tool_search(
+        TOOL_SEARCH_REGEX_NAME,
+        &json!({"query":"matching","max_results":999}),
+        &catalog,
+        &mut active,
+    )
+    .expect("search succeeds");
+    assert_eq!(tool_search_reference_count(&capped), 100);
+}
+
+#[test]
+fn tool_search_schema_exposes_max_results_default_and_cap() {
+    let mut catalog = Vec::new();
+    let always_load = HashSet::new();
+    ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
+
+    for tool_name in [TOOL_SEARCH_REGEX_NAME, TOOL_SEARCH_BM25_NAME] {
+        let tool = catalog
+            .iter()
+            .find(|tool| tool.name == tool_name)
+            .expect("tool search definition exists");
+        let schema = &tool.input_schema["properties"]["max_results"];
+
+        assert_eq!(schema["default"], 20);
+        assert_eq!(schema["maximum"], 100);
+        assert_eq!(schema["minimum"], 1);
+    }
+}
+
 #[tokio::test]
 async fn code_execution_runs_python_and_returns_result_payload() {
     let tmp = tempdir().expect("tempdir");
@@ -2259,6 +3321,56 @@ fn missing_tool_error_message_includes_discovery_guidance_when_no_match() {
 
     let message = missing_tool_error_message("totally_unknown_tool", &catalog);
     assert!(message.contains("not available in the current tool catalog"));
+    assert!(message.contains(TOOL_SEARCH_BM25_NAME));
+}
+
+#[test]
+fn missing_shell_tool_error_message_names_allow_shell_gate() {
+    let catalog = vec![api_tool("read_file")];
+
+    for tool_name in [
+        "exec_shell",
+        "exec_shell_wait",
+        "exec_shell_interact",
+        "task_shell_start",
+        "task_shell_wait",
+    ] {
+        let message = missing_tool_error_message(tool_name, &catalog);
+        assert!(message.contains("not available in the current tool catalog"));
+        assert!(message.contains("allow_shell"), "{tool_name}: {message}");
+        assert!(
+            message.contains("/config allow_shell true"),
+            "{tool_name}: {message}"
+        );
+        assert!(message.contains("--save"), "{tool_name}: {message}");
+        assert!(message.contains("Agent mode"), "{tool_name}: {message}");
+        assert!(
+            message.contains("approval gating"),
+            "{tool_name}: {message}"
+        );
+        assert!(!message.contains("YOLO"), "{tool_name}: {message}");
+        assert!(!message.contains("auto-approve"), "{tool_name}: {message}");
+        assert!(
+            message.contains(TOOL_SEARCH_BM25_NAME),
+            "{tool_name}: {message}"
+        );
+    }
+}
+
+#[test]
+fn missing_shell_tool_error_message_keeps_allow_shell_hint_with_suggestions() {
+    let catalog = vec![api_tool("exec")];
+
+    let message = missing_tool_error_message("exec_shell", &catalog);
+
+    assert!(message.contains("Did you mean:"));
+    assert!(message.contains("exec"));
+    assert!(message.contains("allow_shell"));
+    assert!(message.contains("/config allow_shell true"));
+    assert!(message.contains("--save"));
+    assert!(message.contains("Agent mode"));
+    assert!(!message.contains("YOLO"));
+    assert!(!message.contains("auto-approve"));
     assert!(message.contains(TOOL_SEARCH_BM25_NAME));
 }
 

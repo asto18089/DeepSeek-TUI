@@ -1,44 +1,69 @@
-//! Project context loading for CodeWhale.
+//! Project context loading.
 //!
 //! This module handles loading project-specific context files that provide
-//! instructions and context to the AI agent. These include:
+//! instructions and context to the AI agent.
 //!
-//! - `WHALE.md` - CodeWhale-native project instructions (highest priority)
-//! - `AGENTS.md` - Generic agent instructions (compatible with other agents)
-//! - `.claude/instructions.md` - Claude-style hidden instructions
-//! - `CLAUDE.md` - Claude-style instructions
-//! - `.codewhale/instructions.md` - Hidden instructions file (new)
-//! - `.deepseek/instructions.md` - Hidden instructions file (legacy)
+//! **pinvou3 fork (P-brand cleanup)**: the upstream multi-path scan list
+//! (`AGENTS.md` / `WHALE.md` / `.claude/instructions.md` / `CLAUDE.md` /
+//! `.codewhale/instructions.md` / `.deepseek/instructions.md`) + global
+//! agents fallback (`~/.codewhale/{AGENTS,WHALE}.md` / `~/.agents/*` /
+//! `~/.deepseek/*`) has been scrapped. pinvou3 only recognizes inline
+//! workspace context injected via `InstructionSource::Inline`; other-AI-tool
+//! global config files are not read. v0.8.53 上游新增的 `.codewhale/
+//! constitution.json` authority 层也一并不采纳(见 load_repo_constitution_block
+//! 的 pinvou3 短路 + §5 禁令: ~/.codewhale 禁读)。
 //!
-//! The loaded content is injected into the system prompt to give the agent
-//! context about the project's conventions, structure, and requirements.
+//! CodeWhale-specific repo authority/prioritization policy lives separately in
+//! `.codewhale/constitution.json` and is rendered as its own higher-authority
+//! block. The loaded content is injected into the system prompt to give the
+//! agent context about the project's conventions, structure, and requirements.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Names of project context files to look for, in priority order.
-/// WHALE.md is the CodeWhale-native convention; AGENTS.md and CLAUDE.md
-/// provide compatibility with other coding agents. `.codewhale/` is the
-/// new config directory; `.deepseek/` is the legacy fallback.
-const PROJECT_CONTEXT_FILES: &[&str] = &[
-    "WHALE.md",
-    "AGENTS.md",
-    ".claude/instructions.md",
-    "CLAUDE.md",
-    ".codewhale/instructions.md",
-    ".deepseek/instructions.md",
-];
+// pinvou3 fork (C 方案 P-no-disk 最终态): PROJECT_CONTEXT_FILES 砍空。
+// 之前砍到 1 条 `.pinvou3/workspace_context.md`,但仍是 disk 文件暴露给 LLM
+// (`<project_instructions source="…">` 显示 disk 路径)。配套 C 方案彻底走
+// inline:pinvou3 把 workspace context 合并进 INSTRUCTIONS_MD §0 通过
+// `InstructionSource::Inline` 注入,不再需要 disk 文件。底座 load_project_context
+// 自然返回空,`<project_instructions>` tag 不再注入。
+const PROJECT_CONTEXT_FILES: &[&str] = &[];
 
-/// User-level project instructions loaded as a fallback when the workspace and
-/// its parents do not define project context. `.codewhale/` takes priority
-/// over `.deepseek/` for both WHALE.md and AGENTS.md.
+// pinvou3 fork (P-brand cleanup): 砍掉底座 `~/.codewhale/*` / `~/.agents/*` /
+// `~/.deepseek/*` 等全局 fallback 路径(上游 v0.8.49 又新增 vendor-neutral
+// `.agents/` 一档,一并砍)。pinvou3 不识别其他 AI 工具的全局 agents 配置。
+// 保留空数组让 `load_global_agents_context` 走 early return 不扫盘。
+const GLOBAL_PATHS: &[&[&str]] = &[];
+
+// —— v0.8.53 上游新增 WHALE.md 弃用 + .codewhale/constitution.json authority 层。
+// pinvou3 不采纳该子系统(workspace=$HOME GUI 场景、§5 禁读 ~/.codewhale),
+// load_repo_constitution_block 已短路。下列常量保留仅为让上游自动合进来的
+// 函数体编译通过(PROJECT_CONTEXT_FILES/GLOBAL_PATHS 砍空后它们的扫描路径不可达,
+// 故多为 dead_code,留 #[allow] 抑制 warning)。
+#[allow(dead_code)]
+const DEPRECATED_WHALE_FILENAME: &str = "WHALE.md";
+#[allow(dead_code)]
+const WHALE_DEPRECATION_WARNING: &str = "WHALE.md is deprecated; move project instructions to AGENTS.md, or CodeWhale-specific authority policy to .codewhale/constitution.json. WHALE.md is still read for now but will be dropped from default discovery in a future release.";
+#[allow(dead_code)]
+const REPO_CONSTITUTION_RELATIVE_PATH: &[&str] = &[".codewhale", "constitution.json"];
+#[allow(dead_code)]
+const SUPPORTED_CONSTITUTION_SCHEMA: u32 = 1;
+#[allow(dead_code)]
 const GLOBAL_AGENTS_RELATIVE_PATH: &[&str] = &[".codewhale", "AGENTS.md"];
+#[allow(dead_code)]
+const GLOBAL_AGENTS_VENDOR_NEUTRAL_PATH: &[&str] = &[".agents", "AGENTS.md"];
+#[allow(dead_code)]
 const GLOBAL_AGENTS_LEGACY_PATH: &[&str] = &[".deepseek", "AGENTS.md"];
+#[allow(dead_code)]
 const GLOBAL_WHALE_RELATIVE_PATH: &[&str] = &[".codewhale", "WHALE.md"];
+#[allow(dead_code)]
+const GLOBAL_WHALE_VENDOR_NEUTRAL_PATH: &[&str] = &[".agents", "WHALE.md"];
+#[allow(dead_code)]
 const GLOBAL_WHALE_LEGACY_PATH: &[&str] = &[".deepseek", "WHALE.md"];
 
 /// Maximum size for project context files (to prevent loading huge files)
@@ -50,6 +75,7 @@ const PACK_MAX_CONFIG_FILES: usize = 60;
 const PACK_MAX_DEPTH: usize = 4;
 const PACK_IGNORED_DIRS: &[&str] = &[
     ".git",
+    ".worktrees",
     "node_modules",
     ".venv",
     "venv",
@@ -103,6 +129,10 @@ pub struct ProjectContext {
     pub source_path: Option<PathBuf>,
     /// Any warnings during loading
     pub warnings: Vec<String>,
+    /// Rendered `.codewhale/constitution.json` authority block, if present.
+    /// CodeWhale-specific repo authority/prioritization policy — distinct from
+    /// the cross-agent prose in `instructions`.
+    pub constitution_block: Option<String>,
     /// Project root directory
     #[allow(dead_code)] // Part of ProjectContext public interface
     pub project_root: PathBuf,
@@ -117,6 +147,7 @@ impl ProjectContext {
             instructions: None,
             source_path: None,
             warnings: Vec::new(),
+            constitution_block: None,
             project_root,
             is_trusted: false,
         }
@@ -127,9 +158,13 @@ impl ProjectContext {
         self.instructions.is_some()
     }
 
-    /// Get the instructions as a formatted block for system prompt
+    /// Get the instructions as a formatted block for system prompt.
+    ///
+    /// The CodeWhale repo constitution (`.codewhale/constitution.json`), when
+    /// present, is emitted first as a higher-authority block, followed by the
+    /// cross-agent `<project_instructions>` prose. Either may be absent.
     pub fn as_system_block(&self) -> Option<String> {
-        self.instructions.as_ref().map(|content| {
+        let instructions_block = self.instructions.as_ref().map(|content| {
             let source = self
                 .source_path
                 .as_ref()
@@ -138,8 +173,180 @@ impl ProjectContext {
             format!(
                 "<project_instructions source=\"{source}\">\n{content}\n</project_instructions>"
             )
-        })
+        });
+
+        match (self.constitution_block.as_ref(), instructions_block) {
+            (Some(constitution), Some(instructions)) => {
+                Some(format!("{constitution}\n\n{instructions}"))
+            }
+            (Some(constitution), None) => Some(constitution.clone()),
+            (None, Some(instructions)) => Some(instructions),
+            (None, None) => None,
+        }
     }
+}
+
+/// CodeWhale-specific repo authority/prioritization policy, loaded from
+/// `.codewhale/constitution.json`. All fields are optional so a minimal file
+/// (or a future schema) still parses; unknown fields are ignored.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RepoConstitution {
+    #[serde(default)]
+    schema_version: Option<u32>,
+    /// Ordered list of sources to trust when local sources conflict
+    /// (highest authority first).
+    #[serde(default)]
+    authority: Option<Vec<String>>,
+    /// Repo invariants the agent must not break.
+    #[serde(default)]
+    protected_invariants: Option<Vec<String>>,
+    /// Branch / release policy in effect (e.g. "PRs target codex/v0.8.53").
+    #[serde(default)]
+    branch_policy: Option<String>,
+    /// Conditions under which the agent should stop and escalate to the user.
+    #[serde(default)]
+    escalate_when: Option<Vec<String>>,
+    #[serde(default)]
+    verification_policy: Option<VerificationPolicy>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct VerificationPolicy {
+    /// Steps to perform before claiming a task is done.
+    #[serde(default)]
+    before_claiming_done: Option<Vec<String>>,
+}
+
+impl RepoConstitution {
+    /// True when the file carried no usable policy (so we can skip emitting an
+    /// empty block).
+    fn is_empty(&self) -> bool {
+        let list_empty = |l: &Option<Vec<String>>| l.as_ref().is_none_or(Vec::is_empty);
+        list_empty(&self.authority)
+            && list_empty(&self.protected_invariants)
+            && list_empty(&self.escalate_when)
+            && self
+                .branch_policy
+                .as_ref()
+                .is_none_or(|s| s.trim().is_empty())
+            && self
+                .verification_policy
+                .as_ref()
+                .and_then(|p| p.before_claiming_done.as_ref())
+                .is_none_or(Vec::is_empty)
+    }
+
+    /// Render a model-facing authority block (concise prose, per the layered
+    /// model: base myth → global constitution → repo constitution = local law).
+    fn render_block(&self, source: &Path) -> String {
+        let mut body = String::new();
+        if let Some(authority) = self.authority.as_ref().filter(|a| !a.is_empty()) {
+            body.push_str(
+                "When local sources conflict, trust them in this order (highest first):\n",
+            );
+            for (idx, item) in authority.iter().enumerate() {
+                body.push_str(&format!("{}. {item}\n", idx + 1));
+            }
+        }
+        if let Some(invariants) = self.protected_invariants.as_ref().filter(|i| !i.is_empty()) {
+            body.push_str("\nProtected invariants — do not break:\n");
+            for item in invariants {
+                body.push_str(&format!("- {item}\n"));
+            }
+        }
+        if let Some(policy) = self.branch_policy.as_ref().filter(|s| !s.trim().is_empty()) {
+            body.push_str(&format!("\nBranch / release policy: {}\n", policy.trim()));
+        }
+        if let Some(steps) = self
+            .verification_policy
+            .as_ref()
+            .and_then(|p| p.before_claiming_done.as_ref())
+            .filter(|s| !s.is_empty())
+        {
+            body.push_str("\nBefore claiming a task is done:\n");
+            for step in steps {
+                body.push_str(&format!("- {step}\n"));
+            }
+        }
+        if let Some(conditions) = self.escalate_when.as_ref().filter(|c| !c.is_empty()) {
+            body.push_str("\nStop and escalate to the user when:\n");
+            for item in conditions {
+                body.push_str(&format!("- {item}\n"));
+            }
+        }
+        format!(
+            "<codewhale_repo_constitution source=\"{}\">\nCodeWhale-specific repo authority policy (local law: subordinate to the global Constitution and the current user request, but above memory and old handoffs; takes precedence over a legacy WHALE.md).\n\n{}</codewhale_repo_constitution>",
+            source.display(),
+            body.trim_end()
+        )
+    }
+}
+
+/// Discover and render `.codewhale/constitution.json` from `workspace` or, if
+/// absent, its parent directories up to the git root. Returns the rendered
+/// authority block plus any parse warnings.
+fn load_repo_constitution_block(workspace: &Path) -> (Option<String>, Vec<String>) {
+    // pinvou3 fork (P-brand cleanup): v0.8.53 上游引入 `.codewhale/constitution.json`
+    // 仓库 authority 层。pinvou3 不采纳——workspace=$HOME 的 GUI 助手场景下这会读
+    // `~/.codewhale/constitution.json`,与 §5 禁令(~/.codewhale 禁读)直接冲突,且
+    // pinvou3 走 inline 注入不依赖任何 disk 项目配置。短路 early-return,保留函数体
+    // 防上游 sync 回退。
+    {
+        let _ = workspace;
+        return (None, Vec::new());
+    }
+    #[allow(unreachable_code)]
+    let mut warnings = Vec::new();
+    let git_root = crate::project_doc::find_git_root(workspace);
+    let mut current = workspace.to_path_buf();
+    loop {
+        let mut path = current.clone();
+        for component in REPO_CONSTITUTION_RELATIVE_PATH {
+            path.push(component);
+        }
+        if path.is_file() {
+            match fs::read_to_string(&path) {
+                Ok(raw) => match serde_json::from_str::<RepoConstitution>(&raw) {
+                    Ok(constitution) if !constitution.is_empty() => {
+                        if let Some(version) = constitution.schema_version
+                            && version != SUPPORTED_CONSTITUTION_SCHEMA
+                        {
+                            warnings.push(format!(
+                                "{} declares schema_version {version}; this build supports {SUPPORTED_CONSTITUTION_SCHEMA}. Reading it on a best-effort basis.",
+                                path.display()
+                            ));
+                        }
+                        return (Some(constitution.render_block(&path)), warnings);
+                    }
+                    Ok(_) => {
+                        warnings.push(format!(
+                            "{} has no authority/verification policy; ignoring.",
+                            path.display()
+                        ));
+                        return (None, warnings);
+                    }
+                    Err(e) => {
+                        warnings.push(format!("Failed to parse {}: {e}", path.display()));
+                        return (None, warnings);
+                    }
+                },
+                Err(e) => {
+                    warnings.push(format!("Failed to read {}: {e}", path.display()));
+                    return (None, warnings);
+                }
+            }
+        }
+        if let Some(ref root) = git_root
+            && current == *root
+        {
+            break;
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    (None, warnings)
 }
 
 #[derive(Debug, Serialize)]
@@ -166,7 +373,7 @@ struct ReadmePack {
 pub fn generate_project_context_pack(workspace: &Path) -> Option<String> {
     let mut entries = Vec::new();
     collect_pack_entries(workspace, workspace, 0, &mut entries);
-    entries.sort();
+    sort_pack_paths(&mut entries);
     entries.truncate(PACK_MAX_ENTRIES);
 
     let mut config_files = entries
@@ -175,7 +382,7 @@ pub fn generate_project_context_pack(workspace: &Path) -> Option<String> {
         .take(PACK_MAX_CONFIG_FILES)
         .cloned()
         .collect::<Vec<_>>();
-    config_files.sort();
+    sort_pack_paths(&mut config_files);
 
     let mut key_source_files = entries
         .iter()
@@ -183,7 +390,7 @@ pub fn generate_project_context_pack(workspace: &Path) -> Option<String> {
         .take(PACK_MAX_SOURCE_FILES)
         .cloned()
         .collect::<Vec<_>>();
-    key_source_files.sort();
+    sort_pack_paths(&mut key_source_files);
 
     let readme = read_readme_excerpt(workspace, &entries);
     let mut counts = BTreeMap::new();
@@ -285,10 +492,50 @@ fn relative_slash_path(root: &Path, path: &Path) -> Option<String> {
     for component in relative.components() {
         parts.push(component.as_os_str().to_string_lossy().to_string());
     }
-    if parts.is_empty() {
-        None
+    normalize_pack_relative_path(&parts.join("/"))
+}
+
+fn normalize_pack_relative_path(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let mut parts = Vec::new();
+    for part in normalized.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            return None;
+        }
+        parts.push(part);
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+fn sort_pack_paths(paths: &mut [String]) {
+    paths.sort_by(|a, b| {
+        pack_path_priority(a)
+            .cmp(&pack_path_priority(b))
+            .then_with(|| pack_path_sort_key(a).cmp(&pack_path_sort_key(b)))
+            .then_with(|| a.cmp(b))
+    });
+}
+
+fn pack_path_sort_key(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn pack_path_priority(path: &str) -> u8 {
+    let lower = pack_path_sort_key(path);
+    let name = lower.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    if matches!(name, "readme.md" | "readme.txt" | "readme") {
+        0
+    } else if is_config_file(&lower) {
+        1
+    } else if is_source_file(&lower) {
+        2
+    } else if lower.ends_with('/') {
+        3
     } else {
-        Some(parts.join("/"))
+        4
     }
 }
 
@@ -389,6 +636,10 @@ pub fn load_project_context(workspace: &Path) -> ProjectContext {
                         file_path.display(),
                         content.len()
                     );
+                    if *filename == DEPRECATED_WHALE_FILENAME {
+                        tracing::warn!("{WHALE_DEPRECATION_WARNING}");
+                        ctx.warnings.push(WHALE_DEPRECATION_WARNING.to_string());
+                    }
                     ctx.instructions = Some(content);
                     ctx.source_path = Some(file_path);
                     break;
@@ -436,7 +687,7 @@ fn load_project_context_with_parents_and_home(
         }
     }
 
-    // Always check `~/.deepseek/AGENTS.md` so user-wide preferences
+    // Always check global instruction files so user-wide preferences
     // travel into every session (#1157). When both global and project
     // instructions exist, the global block prepends the project's so
     // workspace overrides win the last word; when only global exists,
@@ -483,15 +734,24 @@ fn load_project_context_with_parents_and_home(
         }
     }
 
+    // Load the CodeWhale-specific repo authority policy
+    // (.codewhale/constitution.json) independently of the prose instructions —
+    // it is a distinct, higher-authority artifact and may exist with or without
+    // an AGENTS.md. When present it takes precedence over a legacy WHALE.md.
+    // Loaded last so the auto-generate fallback above (which rebuilds `ctx`)
+    // cannot clobber it.
+    let (constitution_block, constitution_warnings) = load_repo_constitution_block(workspace);
+    ctx.warnings.extend(constitution_warnings);
+    ctx.constitution_block = constitution_block;
+
     ctx
 }
 
-/// Combine `~/.deepseek/AGENTS.md` (global, user-wide preferences) with a
-/// project-local AGENTS.md/CLAUDE.md/instructions.md. Global comes first
-/// so workspace-specific rules can override it — the model reads in
-/// declared order. Each block is wrapped in a labelled fence so the
-/// model can tell which level any rule comes from when the two sets
-/// disagree (#1157).
+/// Combine global user-wide preferences with a project-local
+/// AGENTS.md/CLAUDE.md/instructions.md. Global comes first so
+/// workspace-specific rules can override it — the model reads in declared
+/// order. Each block is wrapped in a labelled fence so the model can tell
+/// which level any rule comes from when the two sets disagree (#1157).
 fn merge_global_and_project_instructions(
     global: &str,
     global_source: Option<&Path>,
@@ -510,17 +770,15 @@ fn merge_global_and_project_instructions(
 fn load_global_agents_context(workspace: &Path, home_dir: Option<&Path>) -> Option<ProjectContext> {
     let home = home_dir?;
 
-    // Priority order:
-    // 1. ~/.codewhale/WHALE.md      (CodeWhale-native)
-    // 2. ~/.codewhale/AGENTS.md     (new config directory)
-    // 3. ~/.deepseek/WHALE.md       (legacy fallback)
-    // 4. ~/.deepseek/AGENTS.md      (legacy fallback)
-    let candidates: &[&[&str]] = &[
-        GLOBAL_WHALE_RELATIVE_PATH,
-        GLOBAL_AGENTS_RELATIVE_PATH,
-        GLOBAL_WHALE_LEGACY_PATH,
-        GLOBAL_AGENTS_LEGACY_PATH,
-    ];
+    // pinvou3 fork (P-brand cleanup): GLOBAL_PATHS 已砍空,
+    // pinvou3 不识别其他 AI 工具的 ~/.codewhale/AGENTS.md / ~/.agents/WHALE.md /
+    // ~/.deepseek/WHALE.md 等全局 fallback。这里早返回 None,留函数 shell 防上游
+    // sync 时回退;真正的 pinvou3 workspace context 通过 inline 注入。
+    let candidates: &[&[&str]] = GLOBAL_PATHS;
+    if candidates.is_empty() {
+        let _ = home;
+        return None;
+    }
 
     let mut warnings = Vec::new();
 
@@ -533,6 +791,11 @@ fn load_global_agents_context(workspace: &Path, home_dir: Option<&Path>) -> Opti
         if path.exists() && path.is_file() {
             match load_context_file(&path) {
                 Ok(content) => {
+                    if path.file_name().and_then(|n| n.to_str()) == Some(DEPRECATED_WHALE_FILENAME)
+                    {
+                        tracing::warn!("{WHALE_DEPRECATION_WARNING}");
+                        warnings.push(WHALE_DEPRECATION_WARNING.to_string());
+                    }
                     let mut ctx = ProjectContext::empty(workspace.to_path_buf());
                     ctx.instructions = Some(content);
                     ctx.source_path = Some(path);
@@ -556,43 +819,13 @@ fn load_global_agents_context(workspace: &Path, home_dir: Option<&Path>) -> Opti
 /// Generate a context file from project tree + summary and write it to
 /// `.codewhale/instructions.md` (or `.deepseek/instructions.md` as legacy
 /// fallback). Returns the generated content on success.
-fn auto_generate_context(workspace: &Path) -> Option<String> {
-    let codewhale_dir = workspace.join(".codewhale");
-    let instructions_path = codewhale_dir.join("instructions.md");
-    let legacy_instructions_path = workspace.join(".deepseek/instructions.md");
-
-    // Don't overwrite an existing file (check both locations)
-    if instructions_path.exists() || legacy_instructions_path.exists() {
-        return None;
-    }
-
-    let summary = crate::utils::summarize_project(workspace);
-    let tree = crate::utils::project_tree(workspace, 2);
-
-    let content = format!(
-        "# Project Structure (Auto-generated)\n\n\
-         > This file was automatically generated by CodeWhale.\n\
-         > You can edit or delete it at any time.\n\n\
-         **Summary:** {summary}\n\n\
-         **Tree:**\n```\n{tree}\n```"
-    );
-
-    // Create .codewhale/ directory
-    if let Err(e) = std::fs::create_dir_all(&codewhale_dir) {
-        tracing::warn!("Failed to create .codewhale/ directory: {e}");
-        return None;
-    }
-
-    match std::fs::write(&instructions_path, &content) {
-        Ok(()) => {
-            tracing::info!("Auto-generated {}", instructions_path.display());
-            Some(content)
-        }
-        Err(e) => {
-            tracing::warn!("Failed to write {}: {e}", instructions_path.display());
-            None
-        }
-    }
+fn auto_generate_context(_workspace: &Path) -> Option<String> {
+    // pinvou3 fork (C 方案 P-no-disk 最终态): PROJECT_CONTEXT_FILES 砍空后
+    // workspace 上下文走 INSTRUCTIONS_MD §0 内嵌(Inline),不再有任何 disk 文件,
+    // 也不需要 auto-gen 任何 disk 内容。函数保留 shell 防上游 sync 时直接回退;
+    // 永不触发(因为 load_project_context 先扫 PROJECT_CONTEXT_FILES 砍空 → 无入口
+    // 调到这里)。
+    None
 }
 
 /// Load a context file with size checking
@@ -741,6 +974,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_load_project_context_agents_md() {
         let tmp = tempdir().expect("tempdir");
         let agents_path = tmp.path().join("AGENTS.md");
@@ -759,6 +993,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_load_project_context_priority() {
         let tmp = tempdir().expect("tempdir");
 
@@ -780,6 +1015,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_load_project_context_hidden_dir() {
         let tmp = tempdir().expect("tempdir");
         let hidden_dir = tmp.path().join(".deepseek");
@@ -798,6 +1034,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_as_system_block() {
         let tmp = tempdir().expect("tempdir");
         let agents_path = tmp.path().join("AGENTS.md");
@@ -812,6 +1049,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_empty_file_warning() {
         let tmp = tempdir().expect("tempdir");
         let agents_path = tmp.path().join("AGENTS.md");
@@ -849,6 +1087,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_load_with_parents() {
         let tmp = tempdir().expect("tempdir");
 
@@ -890,6 +1129,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_load_with_parents_searches_above_git_root_when_needed() {
         let tmp = tempdir().expect("tempdir");
 
@@ -911,6 +1151,110 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .contains("Organization instructions")
+        );
+    }
+
+    #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES 砍空,AGENTS/WHALE 扫描场景不可达"]
+    fn agents_md_preferred_over_deprecated_whale_md() {
+        let tmp = tempdir().expect("tempdir");
+        fs::write(tmp.path().join("AGENTS.md"), "AGENTS canonical").expect("write agents");
+        fs::write(tmp.path().join("WHALE.md"), "WHALE legacy").expect("write whale");
+
+        let ctx = load_project_context(tmp.path());
+        let instructions = ctx.instructions.expect("instructions loaded");
+        assert!(instructions.contains("AGENTS canonical"), "{instructions}");
+        assert!(!instructions.contains("WHALE legacy"), "{instructions}");
+        // No deprecation warning since AGENTS.md won.
+        assert!(
+            !ctx.warnings
+                .iter()
+                .any(|w| w.contains("WHALE.md is deprecated")),
+            "{:?}",
+            ctx.warnings
+        );
+    }
+
+    #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES 砍空,WHALE.md 扫描场景不可达"]
+    fn whale_md_alone_is_still_read_with_deprecation_warning() {
+        let tmp = tempdir().expect("tempdir");
+        fs::write(tmp.path().join("WHALE.md"), "WHALE legacy body").expect("write whale");
+
+        let ctx = load_project_context(tmp.path());
+        assert!(
+            ctx.instructions.as_deref() == Some("WHALE legacy body"),
+            "legacy WHALE.md must still be read"
+        );
+        assert!(
+            ctx.warnings
+                .iter()
+                .any(|w| w.contains("WHALE.md is deprecated")),
+            "expected deprecation warning, got {:?}",
+            ctx.warnings
+        );
+    }
+
+    #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): load_repo_constitution_block 已短路(不读 ~/.codewhale/constitution.json,§5 禁令)"]
+    fn constitution_json_renders_authority_block() {
+        let tmp = tempdir().expect("tempdir");
+        fs::create_dir(tmp.path().join(".git")).expect("mkdir .git");
+        fs::create_dir(tmp.path().join(".codewhale")).expect("mkdir .codewhale");
+        fs::write(
+            tmp.path().join(".codewhale").join("constitution.json"),
+            r#"{
+                "schema_version": 1,
+                "authority": ["current user request", "live code and tests", "AGENTS.md"],
+                "protected_invariants": ["keep the tool-catalog head byte-stable"],
+                "branch_policy": "PRs target codex/v0.8.53, not main",
+                "verification_policy": { "before_claiming_done": ["run focused tests"] },
+                "escalate_when": ["a destructive action was not authorized"]
+            }"#,
+        )
+        .expect("write constitution");
+
+        let ctx = load_project_context_with_parents(tmp.path());
+        let block = ctx
+            .constitution_block
+            .as_deref()
+            .expect("constitution block rendered");
+        assert!(block.contains("<codewhale_repo_constitution"));
+        assert!(block.contains("current user request"));
+        assert!(block.contains("run focused tests"));
+        assert!(block.contains("keep the tool-catalog head byte-stable"));
+        assert!(block.contains("PRs target codex/v0.8.53"));
+        assert!(block.contains("a destructive action was not authorized"));
+        assert!(block.contains("takes precedence over a legacy WHALE.md"));
+        // It also surfaces through the system block.
+        assert!(
+            ctx.as_system_block()
+                .expect("system block")
+                .contains("codewhale_repo_constitution")
+        );
+    }
+
+    #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): load_repo_constitution_block 已短路(不读 ~/.codewhale/constitution.json,§5 禁令)"]
+    fn malformed_constitution_warns_without_crashing() {
+        let tmp = tempdir().expect("tempdir");
+        fs::create_dir(tmp.path().join(".git")).expect("mkdir .git");
+        fs::create_dir(tmp.path().join(".codewhale")).expect("mkdir .codewhale");
+        fs::write(
+            tmp.path().join(".codewhale").join("constitution.json"),
+            "{ not valid json",
+        )
+        .expect("write bad constitution");
+
+        let ctx = load_project_context_with_parents(tmp.path());
+        assert!(
+            ctx.constitution_block.is_none(),
+            "no block for invalid JSON"
+        );
+        assert!(
+            ctx.warnings.iter().any(|w| w.contains("Failed to parse")),
+            "expected parse warning, got {:?}",
+            ctx.warnings
         );
     }
 
@@ -1022,7 +1366,56 @@ mod tests {
         );
     }
 
+    fn project_context_pack_sort_is_cross_platform_and_priority_aware() {
+        let mut unix_paths = vec![
+            "src/z.rs".to_string(),
+            "docs/".to_string(),
+            "README.md".to_string(),
+            "Cargo.toml".to_string(),
+            "src/a.rs".to_string(),
+            "notes.txt".to_string(),
+        ];
+        let mut windows_paths = vec![
+            "src\\z.rs".to_string(),
+            "docs\\".to_string(),
+            "README.md".to_string(),
+            "Cargo.toml".to_string(),
+            "src\\a.rs".to_string(),
+            "notes.txt".to_string(),
+        ];
+
+        sort_pack_paths(&mut unix_paths);
+        sort_pack_paths(&mut windows_paths);
+
+        let normalized_windows = windows_paths
+            .iter()
+            .map(|path| path.replace('\\', "/"))
+            .collect::<Vec<_>>();
+        assert_eq!(unix_paths, normalized_windows);
+        assert_eq!(
+            unix_paths,
+            vec![
+                "README.md",
+                "Cargo.toml",
+                "src/a.rs",
+                "src/z.rs",
+                "docs/",
+                "notes.txt",
+            ]
+        );
+    }
+
     #[test]
+    fn normalize_pack_relative_path_rejects_parent_segments() {
+        assert_eq!(
+            normalize_pack_relative_path(".\\src\\main.rs"),
+            Some("src/main.rs".to_string())
+        );
+        assert_eq!(normalize_pack_relative_path("../secret.txt"), None);
+    }
+
+    #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_load_global_agents_when_project_has_no_context() {
         let workspace = tempdir().expect("workspace tempdir");
         let home = tempdir().expect("home tempdir");
@@ -1044,6 +1437,128 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): GLOBAL_PATHS scrapped, global fallback paths unreachable"]
+    fn test_load_global_agents_falls_back_to_vendor_neutral_path() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let home = tempdir().expect("home tempdir");
+        let global_dir = home.path().join(".agents");
+        fs::create_dir(&global_dir).expect("mkdir .agents");
+        let global_agents = global_dir.join("AGENTS.md");
+        fs::write(&global_agents, "Vendor-neutral instructions").expect("write global agents");
+
+        let ctx = load_project_context_with_parents_and_home(workspace.path(), Some(home.path()));
+
+        assert!(ctx.has_instructions());
+        assert!(
+            ctx.instructions
+                .as_ref()
+                .unwrap()
+                .contains("Vendor-neutral instructions")
+        );
+        assert_eq!(ctx.source_path, Some(global_agents));
+    }
+
+    #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): GLOBAL_PATHS scrapped, global fallback paths unreachable"]
+    fn test_codewhale_specific_path_wins_over_agents_path() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let home = tempdir().expect("home tempdir");
+
+        let codewhale_dir = home.path().join(".codewhale");
+        fs::create_dir(&codewhale_dir).expect("mkdir .codewhale");
+        let codewhale_agents = codewhale_dir.join("AGENTS.md");
+        fs::write(&codewhale_agents, "CodeWhale-specific instructions")
+            .expect("write codewhale agents");
+
+        let agents_dir = home.path().join(".agents");
+        fs::create_dir(&agents_dir).expect("mkdir .agents");
+        fs::write(agents_dir.join("AGENTS.md"), "Vendor-neutral instructions")
+            .expect("write vendor-neutral agents");
+
+        let ctx = load_project_context_with_parents_and_home(workspace.path(), Some(home.path()));
+
+        assert!(ctx.has_instructions());
+        let instructions = ctx.instructions.as_ref().unwrap();
+        assert!(
+            instructions.contains("CodeWhale-specific instructions"),
+            "CodeWhale-specific global file should win:\n{instructions}"
+        );
+        assert!(
+            !instructions.contains("Vendor-neutral instructions"),
+            "lower-priority .agents file should be skipped:\n{instructions}"
+        );
+        assert_eq!(ctx.source_path, Some(codewhale_agents));
+    }
+
+    #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): global AGENTS/WHALE multi-path scanning scrapped (GLOBAL_PATHS empty), scenario unreachable"]
+    fn test_global_agents_wins_over_global_whale_across_paths() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let home = tempdir().expect("home tempdir");
+
+        let codewhale_dir = home.path().join(".codewhale");
+        fs::create_dir(&codewhale_dir).expect("mkdir .codewhale");
+        fs::write(codewhale_dir.join("WHALE.md"), "Global WHALE legacy")
+            .expect("write codewhale whale");
+
+        let agents_dir = home.path().join(".agents");
+        fs::create_dir(&agents_dir).expect("mkdir .agents");
+        let global_agents = agents_dir.join("AGENTS.md");
+        fs::write(&global_agents, "Global AGENTS canonical").expect("write global agents");
+
+        let ctx = load_project_context_with_parents_and_home(workspace.path(), Some(home.path()));
+
+        assert!(ctx.has_instructions());
+        let instructions = ctx.instructions.as_ref().unwrap();
+        assert!(
+            instructions.contains("Global AGENTS canonical"),
+            "global AGENTS.md should win:\n{instructions}"
+        );
+        assert!(
+            !instructions.contains("Global WHALE legacy"),
+            "global WHALE.md content should be skipped when any global AGENTS.md exists:\n{instructions}"
+        );
+        assert!(
+            !ctx.warnings
+                .iter()
+                .any(|warning| warning.contains("WHALE.md is deprecated")),
+            "losing WHALE.md should not emit deprecation warning: {:?}",
+            ctx.warnings
+        );
+        assert_eq!(ctx.source_path, Some(global_agents));
+    }
+
+    #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): global WHALE fallback scanning scrapped (GLOBAL_PATHS empty), scenario unreachable"]
+    fn test_global_whale_fallback_warns_when_no_global_agents_exists() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let home = tempdir().expect("home tempdir");
+
+        let codewhale_dir = home.path().join(".codewhale");
+        fs::create_dir(&codewhale_dir).expect("mkdir .codewhale");
+        let global_whale = codewhale_dir.join("WHALE.md");
+        fs::write(&global_whale, "Global WHALE legacy").expect("write codewhale whale");
+
+        let ctx = load_project_context_with_parents_and_home(workspace.path(), Some(home.path()));
+
+        assert!(ctx.has_instructions());
+        let instructions = ctx.instructions.as_ref().unwrap();
+        assert!(
+            instructions.contains("Global WHALE legacy"),
+            "legacy WHALE.md must still be read when no global AGENTS.md exists:\n{instructions}"
+        );
+        assert!(
+            ctx.warnings
+                .iter()
+                .any(|warning| warning.contains("WHALE.md is deprecated")),
+            "expected global WHALE.md deprecation warning, got {:?}",
+            ctx.warnings
+        );
+        assert_eq!(ctx.source_path, Some(global_whale));
+    }
+
+    #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped, upstream local+global merge scenario unreachable"]
     fn test_local_and_global_agents_merge_when_both_exist() {
         // #1157: when both `~/.deepseek/AGENTS.md` and a project AGENTS.md
         // exist, the prompt should carry user-wide preferences AND the
@@ -1090,6 +1605,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_global_agents_only_no_project_unchanged_fallback() {
         // Sanity: when only the global file exists, the historical
         // fallback behaviour is preserved — no merge framing leaks in.
@@ -1113,6 +1629,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork (P-brand cleanup): PROJECT_CONTEXT_FILES / GLOBAL_PATHS scrapped to one path, upstream multi-path scenarios no longer reachable"]
     fn test_invalid_global_agents_warns_and_falls_back_to_generated_context() {
         let workspace = tempdir().expect("workspace tempdir");
         let home = tempdir().expect("home tempdir");

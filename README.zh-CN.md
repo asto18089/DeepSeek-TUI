@@ -4,12 +4,14 @@
 
 [English README](README.md)
 [日本語 README](README.ja-JP.md)
+[Tiếng Việt README](README.vi.md)
+
 
 ## 安装
 
 `codewhale` 以一组自包含 Rust 发布二进制安装：`codewhale` 调度器命令，
-以及它在交互会话中启动的同级 `codewhale-tui` 运行时。npm、Homebrew 和
-Docker 会自动安装这两个二进制；Cargo 或手动下载时必须把两者放在同一目录
+以及它在交互会话中启动的同级 `codewhale-tui` 运行时。npm 和 Docker
+会自动安装这两个二进制；Cargo 或手动下载时必须把两者放在同一目录
 （通常是 `PATH` 上的某个目录）。运行时不依赖 Node.js 或 Python。
 
 ```bash
@@ -22,8 +24,9 @@ npm install -g codewhale
 cargo install codewhale-cli --locked   # `codewhale` 入口
 cargo install codewhale-tui     --locked   # `codewhale-tui` TUI 二进制
 
-# 3. Homebrew —— macOS 包管理器。
-#    tap/formula 名称仍是旧名；实际安装 codewhale 和 codewhale-tui。
+# 3. Homebrew —— 仅用于旧安装兼容。
+#    tap/formula 仍使用旧的 deepseek-tui 名称。新安装请优先使用
+#    npm、Cargo、Docker 或直接下载，直到 formula 完成改名。
 brew tap Hmbown/deepseek-tui
 brew install deepseek-tui
 
@@ -55,10 +58,12 @@ docker run --rm -it \
 ```bash
 codewhale update                         # release 二进制更新器
 npm install -g codewhale@latest      # npm 包装器
-brew update && brew upgrade deepseek-tui
+brew update && brew upgrade deepseek-tui  # 仅旧 Homebrew 安装
 cargo install codewhale-cli --locked --force
 cargo install codewhale-tui     --locked --force
 ```
+> codewhale update 现在可添加 --proxy ,通过代理下载更新
+> eg: codewhale update --proxy https://localhost:7897
 
 [![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/codewhale)](https://www.npmjs.com/package/codewhale)
@@ -103,7 +108,7 @@ Fin——关闭思考的廉价 Flash 调用——每轮处理模型自动路由�
 
 子智能体并发运行（最多 20 个）。`agent_open` 立即返回；结果以内联完成哨兵形式到达，携带摘要。完整对话记录通过 `agent_eval` 的有界句柄保存。详见 [docs/SUBAGENTS.md](docs/SUBAGENTS.md)。
 
-其余功能面：每次编辑后的 LSP 诊断（rust-analyzer、pyright、typescript-language-server、gopls、clangd）、RLM 会话批量分析、MCP 协议、HTTP/SSE 运行时 API、持久化任务队列、Zed 的 ACP 适配器、SWE-bench 导出、以及带缓存命中/未命中明细的实时成本追踪。
+其余功能面：每次编辑后的 LSP 诊断（rust-analyzer、pyright、typescript-language-server、gopls、clangd、jdtls、vue-language-server）、RLM 会话批量分析、MCP 协议、HTTP/SSE 运行时 API、持久化任务队列、Zed 的 ACP 适配器、SWE-bench 导出、以及带缓存命中/未命中明细的实时成本追踪。
 
 ---
 
@@ -258,6 +263,13 @@ codewhale --provider wanjie-ark --model deepseek-reasoner
 # OpenRouter
 codewhale auth set --provider openrouter --api-key "YOUR_OPENROUTER_API_KEY"
 codewhale --provider openrouter --model deepseek/deepseek-v4-pro
+codewhale --provider openrouter --model arcee-ai/trinity-large-thinking
+codewhale --provider openrouter --model qwen/qwen3.7-max
+
+# Xiaomi MiMo
+codewhale auth set --provider xiaomi-mimo --api-key "YOUR_XIAOMI_MIMO_API_KEY"
+codewhale --provider xiaomi-mimo --model mimo-v2.5-pro
+codewhale --provider xiaomi-mimo speech "???MiMo" --model tts -o hello.wav
 
 # Novita
 codewhale auth set --provider novita --api-key "YOUR_NOVITA_API_KEY"
@@ -266,6 +278,10 @@ codewhale --provider novita --model deepseek/deepseek-v4-pro
 # Fireworks
 codewhale auth set --provider fireworks --api-key "YOUR_FIREWORKS_API_KEY"
 codewhale --provider fireworks --model deepseek-v4-pro
+
+# SiliconFlow
+codewhale auth set --provider siliconflow --api-key "YOUR_SILICONFLOW_API_KEY"
+codewhale --provider siliconflow --model deepseek-ai/DeepSeek-V4-Pro
 
 # 通用 OpenAI 兼容端点
 codewhale auth set --provider openai --api-key "YOUR_OPENAI_COMPATIBLE_API_KEY"
@@ -280,6 +296,10 @@ VLLM_BASE_URL="http://localhost:8000/v1" codewhale --provider vllm --model deeps
 # 自托管 Ollama
 ollama pull codewhale-coder:1.3b
 codewhale --provider ollama --model codewhale-coder:1.3b
+
+# Hugging Face Inference Providers
+codewhale auth set --provider huggingface --api-key "YOUR_HF_TOKEN"
+codewhale --provider huggingface --model deepseek-ai/DeepSeek-V4-Pro
 ```
 
 在 TUI 内，`/provider` 打开提供方选择器，`/model` 打开本地模型/思考模式
@@ -316,6 +336,7 @@ codewhale resume --last                         # 恢复最近会话
 codewhale resume <SESSION_ID>                   # 按 UUID 恢复指定会话
 codewhale fork <SESSION_ID>                     # 将已保存会话分叉为兄弟路径
 codewhale serve --http                          # HTTP/SSE API 服务
+codewhale serve --mobile                        # 局域网移动端控制页，默认启用 token 保护
 codewhale serve --acp                           # Zed/自定义智能体的 ACP stdio 适配器
 codewhale run pr <N>                            # 获取 PR 并预填审查提示
 codewhale mcp list                              # 列出已配置 MCP 服务器
@@ -400,23 +421,28 @@ DeepSeek 可作为自定义 Agent Client Protocol 服务器运行，供 Zed 等�
 | `DEEPSEEK_HTTP_HEADERS` | 可选模型请求头，例如 `X-Model-Provider-Id=your-model-provider` |
 | `DEEPSEEK_MODEL` | 默认模型 |
 | `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` | 流式响应空闲超时秒数，默认 `300`，限制在 `1..=3600` |
-| `DEEPSEEK_PROVIDER` | `codewhale`（默认）、`nvidia-nim`、`openai`、`atlascloud`、`wanjie-ark`、`openrouter`、`novita`、`fireworks`、`sglang`、`vllm`、`ollama` |
+| `CODEWHALE_PROVIDER` / `DEEPSEEK_PROVIDER` | `deepseek`（默认）、`nvidia-nim`、`openai`、`atlascloud`、`wanjie-ark`、`volcengine`、`openrouter`、`xiaomi-mimo`、`novita`、`fireworks`、`siliconflow`、`moonshot`、`sglang`、`vllm`、`ollama`、`huggingface` |
 | `DEEPSEEK_PROFILE` | 配置 profile 名称 |
 | `DEEPSEEK_MEMORY` | 设为 `on` 启用用户记忆 |
 | `DEEPSEEK_ALLOW_INSECURE_HTTP=1` | 在可信网络上允许非本机 `http://` API base URL |
-| `NVIDIA_API_KEY` / `OPENAI_API_KEY` / `ATLASCLOUD_API_KEY` / `WANJIE_ARK_API_KEY` / `OPENROUTER_API_KEY` / `NOVITA_API_KEY` / `FIREWORKS_API_KEY` / `SGLANG_API_KEY` / `VLLM_API_KEY` / `OLLAMA_API_KEY` | 提供商认证 |
+| `NVIDIA_API_KEY` / `OPENAI_API_KEY` / `ATLASCLOUD_API_KEY` / `WANJIE_ARK_API_KEY` / `VOLCENGINE_API_KEY` / `ARK_API_KEY` / `OPENROUTER_API_KEY` / `XIAOMI_MIMO_API_KEY` / `MIMO_API_KEY` / `NOVITA_API_KEY` / `FIREWORKS_API_KEY` / `SILICONFLOW_API_KEY` / `MOONSHOT_API_KEY` / `KIMI_API_KEY` / `SGLANG_API_KEY` / `VLLM_API_KEY` / `OLLAMA_API_KEY` / `HUGGINGFACE_API_KEY` / `HF_TOKEN` | 提供商认证 |
 | `OPENAI_BASE_URL` / `OPENAI_MODEL` | 通用 OpenAI 兼容端点和模型 ID |
 | `ATLASCLOUD_BASE_URL` / `ATLASCLOUD_MODEL` | AtlasCloud 端点和模型覆盖 |
 | `WANJIE_ARK_BASE_URL` / `WANJIE_ARK_MODEL` | Wanjie Ark 端点和模型覆盖 |
+| `VOLCENGINE_BASE_URL` / `ARK_BASE_URL` / `VOLCENGINE_MODEL` / `ARK_MODEL` | Volcengine Ark 端点和模型覆盖 |
 | `OPENROUTER_BASE_URL` | OpenRouter 端点覆盖 |
+| `XIAOMI_MIMO_BASE_URL` / `MIMO_BASE_URL` / `XIAOMI_MIMO_MODEL` / `MIMO_MODEL` | Xiaomi MiMo 端点和模型覆盖 |
 | `NOVITA_BASE_URL` | Novita 端点覆盖 |
 | `FIREWORKS_BASE_URL` | Fireworks 端点覆盖 |
+| `SILICONFLOW_BASE_URL` / `SILICONFLOW_MODEL` | SiliconFlow 端点和模型覆盖 |
 | `SGLANG_BASE_URL` | 自托管 SGLang 端点 |
 | `SGLANG_MODEL` | 自托管 SGLang 模型 ID |
 | `VLLM_BASE_URL` | 自托管 vLLM 端点 |
 | `VLLM_MODEL` | 自托管 vLLM 模型 ID |
 | `OLLAMA_BASE_URL` | 自托管 Ollama 端点 |
 | `OLLAMA_MODEL` | 自托管 Ollama 模型标签 |
+| `HUGGINGFACE_API_KEY` / `HF_TOKEN` | Hugging Face 认证 |
+| `HUGGINGFACE_BASE_URL` / `HUGGINGFACE_MODEL` | Hugging Face 端点和模型覆盖 |
 | `NO_ANIMATIONS=1` | 启动时强制无障碍模式 |
 | `SSL_CERT_FILE` | 企业代理的自定义 CA 包 |
 
@@ -494,7 +520,7 @@ description: 当 DeepSeek 需要遵循我的自定义工作流时使用这个技
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | 完整配置参考 |
 | [MODES.md](docs/MODES.md) | Plan / Agent / YOLO 模式 |
 | [MCP.md](docs/MCP.md) | Model Context Protocol 集成 |
-| [RUNTIME_API.md](docs/RUNTIME_API.md) | HTTP/SSE API 服务 |
+| [RUNTIME_API.md](docs/RUNTIME_API.md) | HTTP/SSE API 服务和移动端控制页 |
 | [INSTALL.md](docs/INSTALL.md) | 各平台安装指南 |
 | [DOCKER.md](docs/DOCKER.md) | GHCR 镜像、volume 和 Docker 用法 |
 | [CNB_MIRROR.md](docs/CNB_MIRROR.md) | CNB 镜像和中国大陆友好安装说明 |
@@ -519,6 +545,10 @@ description: 当 DeepSeek 需要遵循我的自定义工作流时使用这个技
 - **[Open Design](https://github.com/nexu-io/open-design)** — 感谢 Open Design 对面向设计的智能体工作流提供支持与协作。
 
 本项目由不断壮大的贡献者社区共同打造：
+
+v0.8.48 合并或吸收的贡献者包括：**[@cy2311](https://github.com/cy2311)**、**[@LING71671](https://github.com/LING71671)**、**[@axobase001](https://github.com/axobase001)**、**[@dzyuan](https://github.com/dzyuan)**、**[@mvanhorn](https://github.com/mvanhorn)**、**[@malsony](https://github.com/malsony)**、**[@gaord](https://github.com/gaord)**、**[@yuanchenglu](https://github.com/yuanchenglu)**、**[@idling11](https://github.com/idling11)**、**[@h3c-hexin](https://github.com/h3c-hexin)**、**[@AdityaVG13](https://github.com/AdityaVG13)**、**[@Sskift](https://github.com/Sskift)**、**[@cyq1017](https://github.com/cyq1017)**、**[@HUQIANTAO](https://github.com/HUQIANTAO)**、**[@New2Niu](https://github.com/New2Niu)**、**[@AiurArtanis](https://github.com/AiurArtanis)**、**[@Lee-take](https://github.com/Lee-take)**、**[@nightt5879](https://github.com/nightt5879)**、**[@AresNing](https://github.com/AresNing)**、**[@AccMoment](https://github.com/AccMoment)**、**[@reidliu41](https://github.com/reidliu41)**、**[@aboimpinto](https://github.com/aboimpinto)**、**[@zhuangbiaowei](https://github.com/zhuangbiaowei)**、**[@donglovejava](https://github.com/donglovejava)**、**[@hongqitai](https://github.com/hongqitai)**、**[@zlh124](https://github.com/zlh124)**、**[@encyc](https://github.com/encyc)**、**[@Implementist](https://github.com/Implementist)**、**[@lihuan215](https://github.com/lihuan215)**、**[@LeoAlex0](https://github.com/LeoAlex0)**、**[@jimmyzhuu](https://github.com/jimmyzhuu)**、**[@rockyzhang](https://github.com/rockyzhang)**、**[@mo-vic](https://github.com/mo-vic)**、**[@hufanexplore](https://github.com/hufanexplore)**、**[@hoclaptrinh33](https://github.com/hoclaptrinh33)** 和 **[@BryonGo](https://github.com/BryonGo)**。
+
+同样感谢提供报告、复现和验证的 **[@buko](https://github.com/buko)**、**[@yyyCode](https://github.com/yyyCode)**、**[@gaslebinh-glitch](https://github.com/gaslebinh-glitch)**、**[@Dr3259](https://github.com/Dr3259)**、**[@lpeng1711694086-lang](https://github.com/lpeng1711694086-lang)**、**[@VerrPower](https://github.com/VerrPower)**、**[@yan-zay](https://github.com/yan-zay)**、**[@jretz](https://github.com/jretz)**、**[@Neo-millunnium](https://github.com/Neo-millunnium)**、**[@caeserchen](https://github.com/caeserchen)**、**[@T-Phuong-Nguyen](https://github.com/T-Phuong-Nguyen)**、**[@zhyuzhyu](https://github.com/zhyuzhyu)**、**[@0gl20shk0sbt36](https://github.com/0gl20shk0sbt36)**、**[@hatakes](https://github.com/hatakes)**、**[@goodvecn-dev](https://github.com/goodvecn-dev)**、**[@bevis-wong](https://github.com/bevis-wong)**、**[@PurplePulse](https://github.com/PurplePulse)** 和 **[@nbiish](https://github.com/nbiish)**。
 
 - **[merchloubna70-dot](https://github.com/merchloubna70-dot)** — 28 个 PR，涵盖功能、修复和 VS Code 扩展基础架构 (#645–#681)
 - **[WyxBUPT-22](https://github.com/WyxBUPT-22)** — Markdown 表格、粗体/斜体和水平线渲染 (#579)
