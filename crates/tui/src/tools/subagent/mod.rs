@@ -3812,6 +3812,8 @@ async fn run_subagent_task(task: SubAgentTask) {
             id: agent_id.clone(),
             result: payload,
             role,
+            // [pinvou3-fork] SDAN Result.status：Err = failed，宿主据此走失败路径。
+            failed: result.is_err(),
         });
     }
 }
@@ -5463,15 +5465,32 @@ impl SubAgentToolRegistry {
         // review, RLM, sub-agent management (so grandchildren can spawn),
         // plus per-child fresh todo/plan state.
         let context = runtime.context.clone();
-        let mut registry = ToolRegistryBuilder::new().with_full_agent_surface(
-            Some(runtime.client.clone()),
-            runtime.model.clone(),
-            runtime.manager.clone(),
-            runtime.clone(),
-            runtime.allow_shell,
-            todo_list,
-            plan_state,
-        );
+        let mut registry = ToolRegistryBuilder::new()
+            .with_full_agent_surface(
+                Some(runtime.client.clone()),
+                runtime.model.clone(),
+                runtime.manager.clone(),
+                runtime.clone(),
+                runtime.allow_shell,
+                todo_list,
+                plan_state,
+            )
+            // [pinvou3-fork] with_full_agent_surface 的注释承诺 children inherit web，
+            // 但实现漏掉 with_web_tools（主 session 在 tool_setup.rs 按 Feature::WebSearch
+            // 另行注册）→ allowed_tools 含 web_search/fetch_url 的 workflow 角色
+            // (researcher/product_manager) spawn 即死于 unavailable-tools 检查。
+            // 此处补上；实际能否搜索仍由 context.search_provider 在执行时裁决。
+            .with_web_tools();
+
+        // [pinvou3-fork] custom_tools(host 应用注册的原生 tool,如 compose_deck /
+        // submit_slots / image_gen)同样漏注册进 SubAgent surface——with_full_agent_surface
+        // 不含它们,而 `RuntimeToolServices.custom_tools` 的契约明写「cloned into child
+        // registries so sub-agents can call wrapper-provided tools」。不补,则 allowed_tools
+        // 含 custom_tool 的 workflow 角色(designer→compose_deck / slide_writer→submit_slots
+        // / illustrator→image_gen)spawn 即死于 unavailable-tools 检查。与上面 web_tools 同类洞。
+        for tool in &runtime.context.runtime.custom_tools {
+            registry = registry.with_tool(tool.clone());
+        }
 
         if let Some(pool) = runtime.mcp_pool.as_ref() {
             registry = registry.with_mcp_tools(std::sync::Arc::clone(pool));

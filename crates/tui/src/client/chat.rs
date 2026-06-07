@@ -2500,10 +2500,12 @@ mod stream_diagnostics_tests {
 
     #[test]
     fn stream_open_timeout_defaults_and_clamps_env_values() {
-        assert_eq!(stream_open_timeout_from_env(None), Duration::from_secs(45));
+        // [2026-06-06] 45→110 对齐 DEFAULT_STREAM_OPEN_TIMEOUT 故意调升(c3f95305:
+        // 本地 vLLM 冷启 JIT 首 token TTFT 实测 >45s)——当时漏更新本断言。
+        assert_eq!(stream_open_timeout_from_env(None), Duration::from_secs(110));
         assert_eq!(
             stream_open_timeout_from_env(Some("not-a-number")),
-            Duration::from_secs(45)
+            Duration::from_secs(110)
         );
         assert_eq!(
             stream_open_timeout_from_env(Some("1")),
