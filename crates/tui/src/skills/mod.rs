@@ -66,6 +66,74 @@ pub struct Skill {
     /// or manually-placed skills, so callers must use this rather than
     /// reconstructing `<dir>/<name>/SKILL.md`.
     pub path: PathBuf,
+    /// Pipeline phase list parsed from the `phases:` frontmatter line.
+    /// Format: `p0:Intake|p1:Gather|p2:Research*|...` where `*` suffix
+    /// marks a phase that has an internal loop. Empty if absent.
+    pub phases: Vec<PhaseDef>,
+    /// "What this skill produces" preview metadata (pinvou3 MVP2). Lets
+    /// the UI surface a sample artefact before the user commits to a
+    /// long-running skill so they know what to expect.
+    pub demo: DemoInfo,
+}
+
+/// One phase entry from the SKILL.md `phases:` frontmatter line.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PhaseDef {
+    pub id: String,
+    pub title: String,
+    #[serde(rename = "loop")]
+    pub is_loop: bool,
+}
+
+/// Demo / "sample artefact" metadata declared in SKILL.md frontmatter.
+/// Maps to four optional fields:
+///
+/// ```yaml
+/// demo_file: assets/demo.html        # the artefact itself
+/// demo_preview: assets/preview.png   # thumbnail (optional)
+/// demo_desc: H3C 蓝版示例 PPT, 5 页
+/// demo_duration: 首跑约 4 小时
+/// ```
+///
+/// File / preview paths are resolved against the SKILL.md's parent
+/// directory at discovery time so callers don't need to.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DemoInfo {
+    pub file: Option<PathBuf>,
+    pub preview: Option<PathBuf>,
+    pub description: Option<String>,
+    pub duration_estimate: Option<String>,
+}
+
+impl DemoInfo {
+    /// True when at least one of file / preview is set — what the UI
+    /// uses to decide whether the "[预览成品]" button is visible.
+    pub fn is_present(&self) -> bool {
+        self.file.is_some() || self.preview.is_some()
+    }
+}
+
+fn parse_phases_line(raw: &str) -> Vec<PhaseDef> {
+    raw.split('|')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (id_part, title_part) = entry.split_once(':')?;
+            let mut title = title_part.trim().to_string();
+            let is_loop = title.ends_with('*');
+            if is_loop {
+                title.pop();
+                title = title.trim_end().to_string();
+            }
+            Some(PhaseDef {
+                id: id_part.trim().to_string(),
+                title,
+                is_loop,
+            })
+        })
+        .collect()
 }
 
 /// Collection of discovered skills.
@@ -182,6 +250,15 @@ impl SkillRegistry {
                             continue;
                         }
                         skill.path = skill_path.clone();
+                        // Resolve demo paths against the skill's directory so
+                        // downstream callers (UI, get_skill_demo command) get
+                        // ready-to-open absolute paths.
+                        if let Some(rel) = skill.demo.file.take() {
+                            skill.demo.file = Some(path.join(rel));
+                        }
+                        if let Some(rel) = skill.demo.preview.take() {
+                            skill.demo.preview = Some(path.join(rel));
+                        }
                         registry.skills.push(skill);
                         // This directory IS a skill. Don't descend further:
                         // any nested `SKILL.md` would be a fixture or
@@ -386,6 +463,16 @@ impl SkillRegistry {
                 .ok_or_else(|| "missing required frontmatter field: name".to_string())?;
 
             let description = metadata.get("description").cloned().unwrap_or_default();
+            let phases = metadata
+                .get("phases")
+                .map(|s| parse_phases_line(s))
+                .unwrap_or_default();
+            let demo = DemoInfo {
+                file: metadata.get("demo_file").map(PathBuf::from),
+                preview: metadata.get("demo_preview").map(PathBuf::from),
+                description: metadata.get("demo_desc").cloned(),
+                duration_estimate: metadata.get("demo_duration").cloned(),
+            };
 
             return Ok(Skill {
                 name,
@@ -394,6 +481,8 @@ impl SkillRegistry {
                 // Filled in by `discover` after parse succeeds; default to an
                 // empty path so direct constructors (e.g. tests) compile.
                 path: PathBuf::new(),
+                phases,
+                demo,
             });
         }
 
@@ -414,6 +503,8 @@ impl SkillRegistry {
             description: String::new(),
             body: content.trim().to_string(),
             path: PathBuf::new(),
+            phases: Vec::new(),
+            demo: DemoInfo::default(),
         })
     }
 
@@ -721,6 +812,57 @@ instructions when using a specific skill.\n\n",
 - Safety: do not execute scripts from a community skill unless the user explicitly asks or the skill has been trusted for script use.\n",
     );
 
+    let phased_skills: Vec<&Skill> = registry
+        .list()
+        .iter()
+        .filter(|s| !s.phases.is_empty())
+        .collect();
+    if !phased_skills.is_empty() {
+        out.push_str(
+            "\n### Phase tracking — MANDATORY for phased skills (pinvou3)\n\
+The skills below declare a `phases:` pipeline. When the user invokes one of them, treat it as a sequential workflow, NOT a reference manual:\n\n\
+1. **Every assistant reply must begin** with a single line `<phase id=\"ID\"/>` (literal angle-bracket string, e.g. `<phase id=\"p0\"/>`). No text, no quotes, no whitespace before it. The line is consumed by the pinvou3 UI as a state signal — keep it on its own line, then a blank line, then your actual reply.\n\
+2. **Start from the first phase** (typically p0). Do NOT skip phases. Walk in the order written in `phases:`.\n\
+3. **Do not advance** to the next phase until the current phase's expected output is delivered. If the current phase requires user input, use `request_user_input` and stop the turn — do not pre-emptively do work for later phases.\n\
+4. **Use phase IDs exactly** as in the skill's `phases:` list. Re-emit the same marker on consecutive replies while you remain in the same phase; emit a new marker only when you actually transition.\n\
+5. Even if the user says 'just make the deliverable' or 'skip the questions', you must still emit the marker and start at p0 — the phase ordering exists because past projects without it failed.\n\n\
+### Skills with phases (workflow definitions)\n",
+        );
+        for skill in &phased_skills {
+            let chips: Vec<String> = skill
+                .phases
+                .iter()
+                .map(|p| {
+                    if p.is_loop {
+                        format!("{}:{}↻", p.id, p.title)
+                    } else {
+                        format!("{}:{}", p.id, p.title)
+                    }
+                })
+                .collect();
+            out.push_str(&format!(
+                "- **{}** ({} phases): {}\n",
+                skill.name,
+                skill.phases.len(),
+                chips.join(" → ")
+            ));
+        }
+        out.push_str(
+            "\n### Phased reply — correct format example\n\
+User: 用 h3c-ppt 帮我做 PPT。\n\
+Assistant:\n\
+```\n\
+<phase id=\"p0\"/>\n\
+\n\
+开工前先按 h3c-ppt 的 P0 五问对一下:\n\
+1. 受众是谁? (客户高管 / 政府 / 销售 / 多方)\n\
+2. 截止日期 + 是否多版本?\n\
+...\n\
+```\n\
+The first line is *exactly* `<phase id=\"p0\"/>` — do not paraphrase, do not say 'I will output marker', do not omit it. If you find yourself writing prose first, stop and prepend the marker line.\n",
+        );
+    }
+
     Some(out)
 }
 
@@ -784,6 +926,81 @@ mod tests {
         let skill_dir = tmpdir.path().join("skills").join(skill_name);
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join("SKILL.md"), skill_content).unwrap();
+    }
+
+    #[test]
+    fn discover_parses_demo_frontmatter_and_resolves_paths() {
+        // pinvou3 MVP2: SKILL.md demo_* 字段被解析, 相对路径 resolved 到 skill dir。
+        let tmpdir = TempDir::new().unwrap();
+        create_skill_dir(
+            &tmpdir,
+            "demo-skill",
+            "---\nname: demo-skill\ndescription: x\ndemo_file: assets/sample.html\n\
+             demo_preview: assets/preview.png\ndemo_desc: 5 页示例\ndemo_duration: 约 4 小时\n---\nbody",
+        );
+        let registry = super::SkillRegistry::discover(&tmpdir.path().join("skills"));
+        let skill = registry.get("demo-skill").expect("demo-skill loaded");
+        assert!(skill.demo.is_present());
+        assert_eq!(skill.demo.description.as_deref(), Some("5 页示例"));
+        assert_eq!(skill.demo.duration_estimate.as_deref(), Some("约 4 小时"));
+        let file = skill.demo.file.as_ref().expect("demo_file resolved");
+        assert!(
+            file.is_absolute(),
+            "demo_file should be resolved to absolute"
+        );
+        assert!(file.ends_with("assets/sample.html"));
+
+        // Skill without demo_* must keep is_present() = false.
+        create_skill_dir(
+            &tmpdir,
+            "plain-skill",
+            "---\nname: plain-skill\ndescription: no demo\n---\nbody",
+        );
+        let registry2 = super::SkillRegistry::discover(&tmpdir.path().join("skills"));
+        let plain = registry2.get("plain-skill").expect("plain-skill loaded");
+        assert!(!plain.demo.is_present());
+    }
+
+    #[test]
+    fn discover_parses_phases_frontmatter_for_pipeline_visualization() {
+        // pinvou3 MVP1: SKILL.md `phases:` 一行管道分隔 + `*` 表 loop。
+        let tmpdir = TempDir::new().unwrap();
+        create_skill_dir(
+            &tmpdir,
+            "phased-skill",
+            "---\nname: phased-skill\ndescription: has phases\nphases: p0:Intake|p1:Research*|p2:Synthesize\n---\nbody",
+        );
+        let registry = super::SkillRegistry::discover(&tmpdir.path().join("skills"));
+        let skill = registry.get("phased-skill").expect("phased-skill loaded");
+        assert_eq!(skill.phases.len(), 3);
+        assert_eq!(skill.phases[0].id, "p0");
+        assert_eq!(skill.phases[0].title, "Intake");
+        assert!(!skill.phases[0].is_loop);
+        assert_eq!(skill.phases[1].id, "p1");
+        assert_eq!(skill.phases[1].title, "Research");
+        assert!(skill.phases[1].is_loop);
+        assert_eq!(skill.phases[2].id, "p2");
+        assert!(!skill.phases[2].is_loop);
+
+        // Skills without `phases:` must keep working with empty vec.
+        create_skill_dir(
+            &tmpdir,
+            "legacy-skill",
+            "---\nname: legacy-skill\ndescription: no phases\n---\nbody",
+        );
+        let registry2 = super::SkillRegistry::discover(&tmpdir.path().join("skills"));
+        let legacy = registry2.get("legacy-skill").expect("legacy-skill loaded");
+        assert!(legacy.phases.is_empty());
+
+        // Rendered skill context must include the phase-tracking prompt when
+        // at least one skill has phases (so the LLM knows to emit markers).
+        let rendered =
+            crate::skills::render_available_skills_context(&tmpdir.path().join("skills"))
+                .expect("skill context");
+        assert!(
+            rendered.contains("Phase tracking"),
+            "phase prompt missing when skill has phases:\n{rendered}"
+        );
     }
 
     #[test]
@@ -946,6 +1163,8 @@ mod tests {
                 .join("skills")
                 .join("workspace-priority")
                 .join("SKILL.md"),
+            phases: Vec::new(),
+            demo: super::DemoInfo::default(),
         });
 
         let big_desc = "y".repeat(super::MAX_SKILL_DESCRIPTION_CHARS - 20);
@@ -960,6 +1179,8 @@ mod tests {
                     .join("skills")
                     .join(format!("aaa-global-{i:03}"))
                     .join("SKILL.md"),
+                phases: Vec::new(),
+                demo: super::DemoInfo::default(),
             });
         }
 

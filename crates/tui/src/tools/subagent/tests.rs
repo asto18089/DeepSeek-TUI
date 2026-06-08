@@ -5,6 +5,19 @@ fn make_assignment() -> SubAgentAssignment {
     SubAgentAssignment::new("prompt".to_string(), Some("worker".to_string()))
 }
 
+#[test]
+fn file_output_gate_retries_before_empty_stop() {
+    let assignment = make_assignment().with_expects_file_output(true);
+
+    assert!(should_retry_file_output_gate(&assignment, false, 0));
+    assert!(!should_retry_file_output_gate(&assignment, true, 0));
+    assert!(!should_retry_file_output_gate(
+        &assignment,
+        false,
+        MAX_STRUCTURED_OUTPUT_RETRIES
+    ));
+}
+
 fn make_snapshot(status: SubAgentStatus) -> SubAgentResult {
     SubAgentResult {
         name: "agent_test".to_string(),
@@ -249,6 +262,7 @@ fn test_implementer_allowed_tools_include_writes() {
     #[allow(deprecated)]
     let tools = SubAgentType::Implementer.allowed_tools();
     assert!(tools.contains(&"write_file"));
+    assert!(tools.contains(&"append_file"));
     assert!(tools.contains(&"edit_file"));
     assert!(tools.contains(&"apply_patch"));
 }
@@ -264,6 +278,7 @@ fn test_verifier_allowed_tools_include_test_runner_but_no_writes() {
     assert!(tools.contains(&"run_verifiers"));
     assert!(tools.contains(&"diagnostics"));
     assert!(!tools.contains(&"write_file"));
+    assert!(!tools.contains(&"append_file"));
     assert!(!tools.contains(&"apply_patch"));
 }
 
@@ -862,6 +877,49 @@ async fn tool_agent_route_forces_flash_with_thinking_off() {
     assert_eq!(route.reasoning_effort.as_deref(), Some("off"));
 }
 
+// [pinvou3-fork-guard #7] tool_agent 必须**继承父 runtime.model**,不能用上游硬编码
+// 的 "deepseek-v4-flash"（本地 vLLM 无此模型 → 404）。
+// 上面那条 `..._forces_flash` 测试的 stub model 恰好就是 deepseek-v4-flash,所以
+// 即使上游把 model 改回硬编码它也照样通过(假阳性)。这里显式用一个**区别于上游
+// 硬编码值**的 model 名,才能真正拦住 fork patch 被静默回退。
+#[tokio::test]
+async fn forkguard_tool_agent_route_inherits_parent_model_not_hardcoded_flash() {
+    let mut runtime = stub_runtime();
+    runtime.model = "qwen36_35b_256k".to_string();
+    let runtime = runtime
+        .with_auto_model(false)
+        .with_reasoning_effort(Some("max".to_string()), false);
+
+    let route = resolve_subagent_assignment_route(
+        &runtime,
+        Some("deepseek-v4-pro".to_string()),
+        "run OCR on this screenshot",
+        &SubAgentType::ToolAgent,
+    )
+    .await;
+
+    assert_eq!(
+        route.model, "qwen36_35b_256k",
+        "tool_agent 必须继承父 model;若回退上游硬编码 deepseek-v4-flash,本地 vLLM 会 404"
+    );
+    assert_eq!(route.reasoning_effort.as_deref(), Some("off"));
+}
+
+// [pinvou3-fork-guard #1/#2] 本地弱模型预算:单 agent 步数 20、墙钟上限 1500s。
+// 上游 #2034 倾向 u32::MAX / 取消 elapsed cap,sync 时极易被静默改回 → 弱模型
+// 死磕 17min。这条常量断言比指纹 grep 更稳(grep 抓不住值被改)。
+// [2026-06-06] 300→1500 对齐 c3f95305(2026-06-02 故意提:slide_writer 12页×~50s/页,
+// 300s 砍到 5 页留空壳;registry slide_writer.timeout_secs=1500)——当时漏更新本守卫。
+#[test]
+fn forkguard_subagent_step_and_elapsed_caps_match_local_budget() {
+    assert_eq!(DEFAULT_MAX_STEPS, 20, "弱模型 step 预算被改动");
+    assert_eq!(
+        DEFAULT_SUBAGENT_ELAPSED_MAX,
+        std::time::Duration::from_secs(1500),
+        "subagent 墙钟上限被改动(预期 1500s=registry 最大角色预算,见 c3f95305)"
+    );
+}
+
 #[test]
 fn subagent_auto_reasoning_resolves_to_distinct_v4_tiers() {
     let runtime = stub_runtime().with_reasoning_effort(Some("high".to_string()), true);
@@ -925,6 +983,36 @@ fn test_subagent_tool_registry_reports_unavailable_tools() {
     assert_eq!(
         registry.unavailable_allowed_tools(),
         vec!["missing_tool".to_string()]
+    );
+}
+
+/// [pinvou3-fork] 子 agent 注册表必须含 web 工具（with_web_tools 补丁守卫）。
+/// 回归背景(2026-06-06)：with_full_agent_surface 注释承诺 children inherit web
+/// 但实现没注册 → workflow 角色 researcher/product_manager(allowed_tools 带
+/// web_search/fetch_url)被派即死于 unavailable-tools 检查，0 步 Failed；
+/// harness 又拿上一轮陈旧产物过了 gate。本测试钉死：web_search/fetch_url
+/// 对 Custom 子 agent 永远可用（实际搜索由 context.search_provider 执行时裁决）。
+#[test]
+fn forkguard_subagent_registry_includes_web_tools() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    runtime.allow_shell = false;
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::Custom,
+        Some(vec![
+            "read_file".to_string(),
+            "write_file".to_string(),
+            "web_search".to_string(),
+            "fetch_url".to_string(),
+        ]),
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    );
+    assert!(
+        registry.unavailable_allowed_tools().is_empty(),
+        "web_search/fetch_url 必须注册在子 agent 注册表里，否则带它们的 workflow 角色 spawn 即死"
     );
 }
 
@@ -1897,8 +1985,10 @@ async fn auto_approved_parent_runs_required_tools_in_subagent() {
 
 #[test]
 fn subagent_request_budget_allows_large_write_file_arguments() {
+    // [2026-06-06] 16_384→32_768 对齐 mod.rs 故意调升(slide_writer 单步整页 HTML,
+    // 16K 写一半 finish=length;合并 4bab1ef2 明确"32K预算保留")——当时漏更新本断言。
     assert_eq!(
-        SUBAGENT_RESPONSE_MAX_TOKENS, 16_384,
+        SUBAGENT_RESPONSE_MAX_TOKENS, 32_768,
         "non-streaming sub-agent tool calls need enough output budget for large write_file arguments"
     );
 }
@@ -2200,6 +2290,7 @@ fn stub_runtime() -> SubAgentRuntime {
         fork_context: None,
         mcp_pool: None,
         step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
+        user_input_tx: None,
         speech_output_dir: None,
     }
 }
@@ -2657,4 +2748,39 @@ fn subagent_completion_payload_carries_existing_sentinel_format() {
         !second.contains("Found three errors."),
         "sentinel should not duplicate the human summary line"
     );
+}
+
+// [pinvou3-fork] LLM may truncate the "agent_" prefix; resolve_agent_ref
+// should tolerate this and reconstruct the full id.
+#[test]
+fn resolve_agent_ref_tolerates_truncated_agent_prefix() {
+    let mut manager = SubAgentManager::new(PathBuf::from("."), 1);
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let agent = SubAgent::new(
+        "agent_f8f4b687".to_string(),
+        SubAgentType::Explore,
+        "prompt".to_string(),
+        make_assignment(),
+        "test-model".to_string(),
+        None,
+        None,
+        input_tx,
+        "boot_test".to_string(),
+    );
+    manager.agents.insert(agent.id.clone(), agent);
+
+    // Exact match by full agent_id
+    assert_eq!(
+        manager.resolve_agent_ref("agent_f8f4b687").unwrap(),
+        "agent_f8f4b687"
+    );
+
+    // Truncated prefix is reconstructed
+    assert_eq!(
+        manager.resolve_agent_ref("f8f4b687").unwrap(),
+        "agent_f8f4b687"
+    );
+
+    // Non-existent agent still fails
+    assert!(manager.resolve_agent_ref("nonexistent").is_err());
 }

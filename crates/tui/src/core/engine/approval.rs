@@ -15,6 +15,12 @@ const USER_INPUT_TIMEOUT: Duration = Duration::from_secs(300);
 
 use super::Engine;
 
+// [pinvou3-fork] `UserInputDecision` moved to `tools::user_input` (pub) so
+// sub-agent turn loops can subscribe to the same broadcast channel and route
+// answers by `tool_call_id`. Re-exported here so existing `super::approval::
+// UserInputDecision` import paths (handle.rs, engine.rs) keep working.
+pub(super) use crate::tools::user_input::UserInputDecision;
+
 #[derive(Debug, Clone)]
 pub(super) enum ApprovalDecision {
     Approved {
@@ -27,17 +33,6 @@ pub(super) enum ApprovalDecision {
     RetryWithPolicy {
         id: String,
         policy: crate::sandbox::SandboxPolicy,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub(super) enum UserInputDecision {
-    Submitted {
-        id: String,
-        response: UserInputResponse,
-    },
-    Cancelled {
-        id: String,
     },
 }
 
@@ -127,43 +122,29 @@ impl Engine {
                         format!("Request cancelled while awaiting user input{suffix}"),
                     ));
                 }
-                result = tokio::time::timeout(USER_INPUT_TIMEOUT, self.rx_user_input.recv()) => {
-                    match result {
-                        Ok(Some(decision)) => {
-                            match decision {
-                                UserInputDecision::Submitted { id, response } if id == tool_id => {
-                                    return Ok(response);
-                                }
-                                UserInputDecision::Cancelled { id } if id == tool_id => {
-                                    return Err(ToolError::execution_failed(
-                                        "User input cancelled".to_string(),
-                                    ));
-                                }
-                                _ => continue,
-                            }
-                        }
-                        Ok(None) => {
+                decision = self.rx_user_input.recv() => {
+                    // [pinvou3-fork] broadcast channel: skip Lagged (low-frequency
+                    // user input never realistically lags), error on Closed.
+                    let decision = match decision {
+                        Ok(d) => d,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             return Err(ToolError::execution_failed(
                                 "User input channel closed".to_string(),
                             ));
                         }
-                        Err(_) => {
-                            let _ = self
-                                .tx_event
-                                .send(Event::Status {
-                                    message: format!(
-                                        "User input timed out after {}s",
-                                        USER_INPUT_TIMEOUT.as_secs()
-                                    ),
-                                })
-                                .await;
+                    };
+                    match decision {
+                        UserInputDecision::Submitted { id, response } if id == tool_id => {
+                            return Ok(response);
+                        }
+                        UserInputDecision::Cancelled { id } if id == tool_id => {
                             return Err(ToolError::execution_failed(
-                                format!(
-                                    "User input timed out after {}s",
-                                    USER_INPUT_TIMEOUT.as_secs()
-                                ),
+                                "User input cancelled".to_string(),
                             ));
                         }
+                        // 别的 tool_call_id 的决定(其它 agent/主循环)——继续等
+                        _ => continue,
                     }
                 }
             }

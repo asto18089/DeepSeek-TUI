@@ -314,9 +314,10 @@ fn clean_pdf_text(raw: &str) -> String {
     // would also strip intentional indentation (e.g. centred titles).
     if any_content {
         let start = out.find(|c: char| c != '\n').unwrap_or(0);
-        // Walk back from end to find the last non-newline character. `rfind`
-        // returns the byte index where the character starts; adding 1 can land
-        // inside a multi-byte character (for example Chinese punctuation).
+        // Walk back from end to find the last non-newline character.
+        // [pinvou3-fork] rfind 返回字符的【起始】字节索引，`+1` 在多字节字符上（中文
+        // '。'占 3 字节）会落进字符中间 → out[start..end] panic（not a char boundary）。
+        // 改用 char_indices 取该字符的【结束】边界 = 起始 + len_utf8，UTF-8 安全。
         let end = out
             .char_indices()
             .rev()
@@ -371,12 +372,15 @@ fn read_pdf_via_pdf_extract(
         // pdf-extract returns pages in document order; `start`/`end` are
         // 1-indexed inclusive (validated above), so we convert to a
         // 0-indexed half-open slice with bounds clamping.
+        // [pinvou3-fork] catch_unwind 包住：pdf-extract 0.7 对部分字体编码（Identity-H
+        // CMap 等）会 panic 而非返回 Err（lib.rs:942 assertion），不包会崩掉整个 SubAgent
+        // task → 节点僵死。包住后该 PDF 优雅报错，agent 收到错误继续跑。
         let pages = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             pdf_extract::extract_text_by_pages(path)
         }))
         .map_err(|_| {
             ToolError::execution_failed(format!(
-                "pdf-extract panicked on {} (PDF font encoding unsupported; try `prefer_external_pdftotext = true`)",
+                "pdf-extract panicked on {} (PDF 字体编码不支持，如 Identity-H；请提供文本版或转换后重试)",
                 path.display()
             ))
         })?
@@ -399,10 +403,11 @@ fn read_pdf_via_pdf_extract(
             }
         }
     } else {
+        // [pinvou3-fork] 同上：catch_unwind 防 pdf-extract panic 崩 SubAgent。
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pdf_extract::extract_text(path)))
             .map_err(|_| {
                 ToolError::execution_failed(format!(
-                    "pdf-extract panicked on {} (PDF font encoding unsupported; try `prefer_external_pdftotext = true`)",
+                    "pdf-extract panicked on {} (PDF 字体编码不支持，如 Identity-H；请提供文本版或转换后重试)",
                     path.display()
                 ))
             })?
@@ -1500,11 +1505,17 @@ mod tests {
         assert_eq!(cleaned, "   indented line\nregular line");
     }
 
+    /// [pinvou3-fork] 回归守卫（2026-06-06）：旧实现 `out.rfind(...).map_or(_, |i| i+1)`
+    /// 在多字节字符结尾（中文'。'占 3 字节）上 `i+1` 落进字符中间 → `out[start..end]`
+    /// panic（byte index not a char boundary，实测崩 materials_auditor 读中文 PDF）。
+    /// 改用 char_indices + len_utf8 取字符结束边界后 UTF-8 安全。本测试钉死：中文结尾
+    /// （含尾随空行）不 panic 且保留末尾字符。
     #[test]
     fn forkguard_clean_pdf_text_chinese_trailing_no_panic() {
         let raw = "新华三嘿板OS智慧教室方案。\n\n\n";
-        let cleaned = super::clean_pdf_text(raw);
+        let cleaned = super::clean_pdf_text(raw); // 不 panic 即过核心
         assert!(cleaned.ends_with('。'), "末尾中文字符应保留: {cleaned:?}");
+        // 多个不同长度的多字节字符混合结尾也安全
         assert_eq!(super::clean_pdf_text("①性能：测试\n"), "①性能：测试");
     }
 

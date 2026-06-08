@@ -518,6 +518,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
         shell_manager: Some(shell_manager),
         task_manager: Some(task_manager.clone()),
         automations: Some(automations),
+        custom_tools: app.runtime_services.custom_tools.clone(),
         task_data_dir: Some(task_manager.data_dir()),
         active_task_id: None,
         active_thread_id: None,
@@ -884,6 +885,8 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         search_provider: config.search_provider(),
         search_api_key: config.search.as_ref().and_then(|s| s.api_key.clone()),
         tools_always_load: config.tools_always_load(),
+        custom_tools: Vec::new(),
+        tool_whitelist: None,
         tools: config.tools.clone(),
     }
 }
@@ -2116,7 +2119,7 @@ async fn run_event_loop(
                         }
                         app.status_message = Some(format!("Sub-agent {id}: {display}"));
                     }
-                    EngineEvent::AgentComplete { id, result } => {
+                    EngineEvent::AgentComplete { id, result, .. } => {
                         execute_subagent_observer_hook(
                             app,
                             HookEvent::SubagentComplete,
@@ -2362,6 +2365,11 @@ async fn run_event_loop(
                             app.status_message =
                                 Some(format!("Sandbox blocked {tool_name}: {denial_reason}"));
                         }
+                    }
+                    EngineEvent::PhaseChanged { phase_id: _ } => {
+                        // pinvou3 MVP1: phase tracking is rendered by pinvou3-app's
+                        // WorkFlow pipeline view. The native TUI does not display
+                        // a phase strip yet — emit is silently consumed.
                     }
                 }
             }

@@ -243,7 +243,7 @@ When context is deep (past a soft seam): cache reasoning conclusions in concise 
 ## Toolbox (fast reference — tool descriptions are authoritative)
 
 - **Planning / tracking**: `checklist_write` (primary Work progress under the active task/thread), `checklist_add` / `checklist_update` / `checklist_list`, `update_plan` (optional high-level strategy metadata for complex initiatives), `task_create` / `task_list` / `task_read` / `task_cancel` (durable work objects), `todo_*` aliases (legacy compatibility), `note` (persistent memory).
-- **File I/O**: `read_file` (PDFs auto-extracted), `list_dir`, `write_file`, `edit_file`, `apply_patch`, `retrieve_tool_result` for prior spilled large tool outputs.
+- **File I/O**: `read_file` (PDFs auto-extracted), `list_dir`, `write_file`, `append_file`, `edit_file`, `apply_patch`, `retrieve_tool_result` for prior spilled large tool outputs.
 - **Shell**: `task_shell_start` + `task_shell_wait` for long-running commands, diagnostics, tests, searches, and servers; `exec_shell` for bounded cancellable foreground commands; `exec_shell_wait`, `exec_shell_interact`. If foreground `exec_shell` times out, the process was killed; rerun long work with `task_shell_start` or `exec_shell` using `background: true`, then poll/wait.
 - **Task evidence**: `task_gate_run` for verification gates; `pr_attempt_record` / `pr_attempt_list` / `pr_attempt_read` / `pr_attempt_preflight`; for GitHub issue/PR/release triage, prefer the native `gh ... --json` CLI through shell because it is authenticated, structured, and reproducible; `github_issue_context` / `github_pr_context` are read-only fallbacks when the CLI route is unavailable; `github_comment` / `github_close_issue` require approval + evidence; `automation_*` scheduling tools.
 - **Structured search**: `grep_files`, `file_search`, `web_search`, `fetch_url`, `web.run` (browse).
@@ -259,7 +259,7 @@ Multiple `tool_calls` in one turn run in parallel. `web_search` returns `ref_id`
 ## Tool Selection Guide
 
 ### `apply_patch`
-Use `apply_patch` for structural edits, coordinated changes, or cases where line context matters. Use `write_file` for brand-new files, full-file rewrites, or large existing-file changes where several intertwined edits make local replacement fragile. Use `edit_file` for a single unambiguous replacement.
+Use `apply_patch` for structural edits, coordinated changes, or cases where line context matters. Use `write_file` for brand-new files, full-file rewrites, or large existing-file changes where several intertwined edits make local replacement fragile. Use `append_file` to add bounded chunks to large generated artifacts after a skeleton file exists. Use `edit_file` for a single unambiguous replacement.
 
 ### `edit_file`
 Use `edit_file` for one clear replacement in one file. Do not use it for multi-block deletions, cross-cutting refactors, or changes that touch more than one logical unit; use `apply_patch` or `write_file` for those.

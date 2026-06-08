@@ -96,6 +96,23 @@ pub struct UserInputResponse {
     pub answers: Vec<UserInputAnswer>,
 }
 
+/// Engine ↔ UI handshake payload for a `request_user_input` prompt.
+///
+/// Lives here (not in `core/engine/approval.rs`) so both the engine's main
+/// turn loop **and** sub-agent turn loops can subscribe to the same
+/// broadcast channel and route answers by `id` (`tool_call_id`). `Clone`
+/// is required by `tokio::sync::broadcast`.
+#[derive(Debug, Clone)]
+pub enum UserInputDecision {
+    Submitted {
+        id: String,
+        response: UserInputResponse,
+    },
+    Cancelled {
+        id: String,
+    },
+}
+
 pub struct RequestUserInputTool;
 
 #[async_trait]

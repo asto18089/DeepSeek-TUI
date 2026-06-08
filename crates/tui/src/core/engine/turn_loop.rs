@@ -65,6 +65,10 @@ impl Engine {
                 &self.config.tools_always_load,
             );
         }
+        // [pinvou3-fork] Hard tool whitelist (supervisor sessions). Applied AFTER
+        // ensure_advanced_tooling so the appended meta-tools (tool_search,
+        // code_execution) are subject to it too. None = no restriction.
+        apply_tool_whitelist(&mut tool_catalog, self.config.tool_whitelist.as_ref());
         let mut active_tool_names = initial_active_tools(&tool_catalog);
         let mut loop_guard = LoopGuard::default();
         let mut goal_continuations_this_turn = 0u32;
@@ -432,6 +436,14 @@ impl Engine {
             let mut content_blocks: Vec<ContentBlock> = Vec::new();
             let mut current_text_raw = String::new();
             let mut current_text_visible = String::new();
+            // pinvou3 MVP1: track the last `<phase id=".."/>` marker we have
+            // already broadcast so we only emit `PhaseChanged` on transition.
+            let mut last_phase_id: Option<String> = None;
+            // pinvou3 MVP1.5: stateful flag for stripping <phase .../> from
+            // the visible stream. Without this the UI's HTML chat region
+            // would treat <phase> as an unknown element and silently swallow
+            // it — visually invisible but DOM-polluting.
+            let mut in_phase_marker = false;
             let mut current_thinking = String::new();
             let mut tool_uses: Vec<ToolUseState> = Vec::new();
             let mut usage = Usage {
@@ -652,6 +664,7 @@ impl Engine {
                             current_text_raw = text;
                             current_text_visible.clear();
                             in_tool_call_block = false;
+                            in_phase_marker = false;
                             let filtered =
                                 filter_tool_call_delta(&current_text_raw, &mut in_tool_call_block);
                             if !fake_wrapper_notice_emitted
@@ -662,7 +675,9 @@ impl Engine {
                                     self.tx_event.send(Event::status(FAKE_WRAPPER_NOTICE)).await;
                                 fake_wrapper_notice_emitted = true;
                             }
-                            current_text_visible.push_str(&filtered);
+                            let stripped =
+                                strip_phase_marker_delta(&filtered, &mut in_phase_marker);
+                            current_text_visible.push_str(&stripped);
                             current_block_kind = Some(ContentBlockKind::Text);
                             last_text_index = Some(index as usize);
                             let _ = self
@@ -734,14 +749,33 @@ impl Engine {
                                 fake_wrapper_notice_emitted = true;
                             }
                             if !filtered.is_empty() {
-                                current_text_visible.push_str(&filtered);
-                                let _ = self
-                                    .tx_event
-                                    .send(Event::MessageDelta {
-                                        index: index as usize,
-                                        content: filtered,
-                                    })
-                                    .await;
+                                // pinvou3 MVP1.5: strip `<phase id="..."/>` markers
+                                // from the visible stream so the HTML chat region
+                                // never receives them as DOM-mungeable tags. Marker
+                                // detection itself runs on the raw stream below.
+                                let stripped =
+                                    strip_phase_marker_delta(&filtered, &mut in_phase_marker);
+                                current_text_visible.push_str(&stripped);
+                                if !stripped.is_empty() {
+                                    let _ = self
+                                        .tx_event
+                                        .send(Event::MessageDelta {
+                                            index: index as usize,
+                                            content: stripped,
+                                        })
+                                        .await;
+                                }
+                                // Detect marker on `current_text_raw` (unstripped) so
+                                // we still see the id and can emit PhaseChanged.
+                                if let Some(id) = extract_last_phase_id(&current_text_raw)
+                                    && last_phase_id.as_deref() != Some(id.as_str())
+                                {
+                                    last_phase_id = Some(id.clone());
+                                    let _ = self
+                                        .tx_event
+                                        .send(Event::PhaseChanged { phase_id: id })
+                                        .await;
+                                }
                             }
                         }
                         Delta::ThinkingDelta { thinking } => {
@@ -2432,6 +2466,74 @@ fn is_turn_metadata_text(text: &str) -> bool {
     text.trim_start().starts_with("<turn_meta>")
 }
 
+/// Strip `<phase id="..."/>` (or any `<phase ...>`) markers from a
+/// streaming text delta. Maintains a stateful `in_phase_marker` flag
+/// across deltas so markers split across chunks ("<pha" / "se id=..."
+/// / "/>") get cleanly removed.
+///
+/// The Engine still detects phase ids on the raw (unstripped) stream
+/// to emit `Event::PhaseChanged` — this strip only sanitizes what is
+/// forwarded to the UI via `MessageDelta`, so the HTML chat region
+/// never sees a `<phase>` tag (which the DOM would otherwise treat as
+/// an unknown element and silently swallow).
+fn strip_phase_marker_delta(delta: &str, in_phase_marker: &mut bool) -> String {
+    if delta.is_empty() {
+        return String::new();
+    }
+    let mut output = String::new();
+    let mut rest = delta;
+    loop {
+        if *in_phase_marker {
+            let Some(end) = rest.find('>') else {
+                // Marker tail not yet arrived; consume the rest, stay open.
+                break;
+            };
+            rest = &rest[end + 1..];
+            *in_phase_marker = false;
+        } else {
+            let Some(start) = rest.find("<phase") else {
+                output.push_str(rest);
+                break;
+            };
+            output.push_str(&rest[..start]);
+            rest = &rest[start + "<phase".len()..];
+            *in_phase_marker = true;
+        }
+    }
+    output
+}
+
+/// Scan the cumulative visible assistant text for the **latest**
+/// `<phase id="..."/>` marker. Returns `None` if no well-formed marker
+/// is present. Used by the stream loop to emit `Event::PhaseChanged`
+/// only when the LLM crosses into a new phase (pinvou3 MVP1).
+///
+/// Tolerant to whitespace inside the tag but requires the canonical
+/// `id="..."` attribute and an explicit `>` close. Self-closing slash
+/// is optional.
+fn extract_last_phase_id(text: &str) -> Option<String> {
+    let mut last: Option<String> = None;
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find("<phase") {
+        let tag_start = search_from + rel + "<phase".len();
+        let Some(end_rel) = text[tag_start..].find('>') else {
+            break;
+        };
+        let inner = &text[tag_start..tag_start + end_rel];
+        if let Some(id_rel) = inner.find("id=\"") {
+            let after = &inner[id_rel + 4..];
+            if let Some(close_rel) = after.find('"') {
+                let id = after[..close_rel].trim();
+                if !id.is_empty() {
+                    last = Some(id.to_string());
+                }
+            }
+        }
+        search_from = tag_start + end_rel + 1;
+    }
+    last
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2462,6 +2564,72 @@ mod tests {
         assert!(should_hold_turn_for_subagents(1, 0));
         assert!(should_hold_turn_for_subagents(0, 1));
         assert!(!should_hold_turn_for_subagents(0, 0));
+    }
+
+    #[test]
+    fn strip_phase_marker_removes_marker_in_single_delta() {
+        let mut in_marker = false;
+        let out = strip_phase_marker_delta("hello <phase id=\"p0\"/>\nworld", &mut in_marker);
+        assert_eq!(out, "hello \nworld");
+        assert!(!in_marker);
+    }
+
+    #[test]
+    fn strip_phase_marker_handles_complete_marker_in_single_delta() {
+        // The normal LLM streaming case: the entire `<phase id="..."/>`
+        // arrives in one chunk. We only need to handle this reliably;
+        // PhaseChanged detection (which uses the unstripped raw text)
+        // remains correct even if the marker is later split.
+        let mut in_marker = false;
+        let out = strip_phase_marker_delta("<phase id=\"p1\"/>continue", &mut in_marker);
+        assert_eq!(out, "continue");
+        assert!(!in_marker);
+    }
+
+    #[test]
+    fn strip_phase_marker_passes_through_clean_text() {
+        let mut in_marker = false;
+        let out = strip_phase_marker_delta("just plain text", &mut in_marker);
+        assert_eq!(out, "just plain text");
+        assert!(!in_marker);
+    }
+
+    #[test]
+    fn strip_phase_marker_removes_multiple_markers() {
+        let mut in_marker = false;
+        let out =
+            strip_phase_marker_delta("<phase id=\"p0\"/>a<phase id=\"p1\"/>b", &mut in_marker);
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn extract_last_phase_id_returns_latest_marker() {
+        // No marker
+        assert_eq!(extract_last_phase_id("hello world"), None);
+        // Single marker, self-closing
+        assert_eq!(
+            extract_last_phase_id("<phase id=\"p4\"/>\nworking on outline"),
+            Some("p4".to_string())
+        );
+        // Single marker, no slash
+        assert_eq!(
+            extract_last_phase_id("<phase id=\"p2\">"),
+            Some("p2".to_string())
+        );
+        // Multiple markers across a turn — must return the latest
+        assert_eq!(
+            extract_last_phase_id("<phase id=\"p0\"/>\n...\n<phase id=\"p1\"/>\n..."),
+            Some("p1".to_string())
+        );
+        // Tolerates extra whitespace
+        assert_eq!(
+            extract_last_phase_id("<phase  id=\"p8_5\" />"),
+            Some("p8_5".to_string())
+        );
+        // Empty id ignored
+        assert_eq!(extract_last_phase_id("<phase id=\"\"/>"), None);
+        // Malformed (no closing >) ignored
+        assert_eq!(extract_last_phase_id("<phase id=\"px"), None);
     }
 
     #[test]

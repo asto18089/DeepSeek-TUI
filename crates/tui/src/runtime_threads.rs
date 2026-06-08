@@ -2012,6 +2012,7 @@ impl RuntimeThreadManager {
                 active_task_id: thread.task_id.clone(),
                 active_thread_id: Some(thread.id.clone()),
                 shell_manager: None,
+                custom_tools: Vec::new(),
                 hook_executor: None,
                 handle_store: crate::tools::handle::new_shared_handle_store(),
                 rlm_sessions: crate::rlm::session::new_shared_rlm_session_store(),
@@ -2039,6 +2040,8 @@ impl RuntimeThreadManager {
             search_provider: self.config.search_provider(),
             search_api_key: self.config.search.as_ref().and_then(|s| s.api_key.clone()),
             tools_always_load: self.config.tools_always_load(),
+            custom_tools: Vec::new(),
+            tool_whitelist: None,
             tools: self.config.tools.clone(),
         };
 
@@ -2602,7 +2605,7 @@ impl RuntimeThreadManager {
                     )
                     .await?;
                 }
-                EngineEvent::AgentComplete { id, result } => {
+                EngineEvent::AgentComplete { id, result, .. } => {
                     let message = format!(
                         "Sub-agent {id} completed: {}",
                         summarize_text(&result, SUMMARY_LIMIT)

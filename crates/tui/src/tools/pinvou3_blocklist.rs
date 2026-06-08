@@ -39,6 +39,13 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     "rlm_eval",
     "rlm_configure",
     "rlm_close",
+    // git（git_status/git_diff 已释放,其余用 exec_shell git）
+    "git_log",
+    "git_show",
+    "git_blame",
+    // patch / fim（edit_file 已覆盖；patch DSL 弱模型用不好）
+    "apply_patch",
+    "fim_edit",
     // 状态管理 - goal（GUI 单 session 不需要持久化目标跟踪）
     "create_goal",
     "get_goal",

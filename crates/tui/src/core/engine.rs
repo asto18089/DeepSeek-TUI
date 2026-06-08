@@ -18,7 +18,7 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use serde_json::json;
-use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::DeepSeekClient;
@@ -45,13 +45,14 @@ use crate::tools::shell::{SharedShellManager, new_shared_shell_manager};
 use crate::tools::spec::RuntimeToolServices;
 use crate::tools::spec::{ApprovalRequirement, ToolError, ToolResult};
 use crate::tools::subagent::{
-    Mailbox, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext, SubAgentResult,
-    SubAgentRuntime, SubAgentStatus, SubAgentType, new_shared_subagent_manager_with_timeout,
+    Mailbox, SharedSubAgentManager, SubAgentAssignment, SubAgentCompletion, SubAgentForkContext,
+    SubAgentResult, SubAgentRuntime, SubAgentSpawnOptions, SubAgentStatus, SubAgentType,
+    new_shared_subagent_manager, new_shared_subagent_manager_with_timeout,
     resolve_subagent_assignment_route,
 };
 use crate::tools::todo::{SharedTodoList, TodoListSnapshot, new_shared_todo_list};
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
-use crate::tools::{ToolContext, ToolRegistryBuilder};
+use crate::tools::{ToolContext, ToolRegistryBuilder, spec::ToolSpec};
 use crate::tui::app::AppMode;
 use crate::utils::spawn_supervised;
 use crate::working_set::WorkingSet;
@@ -207,7 +208,7 @@ impl StructuredState {
 // === Types ===
 
 /// Configuration for the engine
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EngineConfig {
     /// Model identifier to use for responses.
     pub model: String,
@@ -321,10 +322,21 @@ pub struct EngineConfig {
     /// Native tools that should stay in the model-visible catalog even when
     /// they are outside the small default core surface (#2076).
     pub tools_always_load: HashSet<String>,
+    /// Host application supplied native tools. Used by wrappers to add
+    /// domain tools without carrying product-specific implementations in this
+    /// crate.
+    pub custom_tools: Vec<Arc<dyn ToolSpec>>,
     /// When true and `/usr/bin/bwrap` is present on Linux, route exec_shell
     /// through bubblewrap instead of relying solely on Landlock (#2184).
     #[allow(dead_code)] // Wired through ShellManager in follow-up PR
     pub prefer_bwrap: bool,
+    /// [pinvou3-fork] Hard per-session tool whitelist. `None` = no restriction
+    /// (all normal sessions unchanged). `Some(set)` = the model-visible catalog
+    /// is filtered down to exactly these tool names — a true allowlist, not a
+    /// `defer_loading` soft-hide: non-whitelisted tools are removed entirely so
+    /// `tool_search` cannot re-activate them. Used to structurally constrain the
+    /// workflow-session supervisor (品悟) to read + review tools only.
+    pub tool_whitelist: Option<HashSet<String>>,
     /// Tool override and plugin configuration (`[tools]` table in config.toml).
     /// Applied to the per-turn tool registry after built-in tools are registered.
     /// When `None`, no overrides or plugin loading occurs.
@@ -380,7 +392,9 @@ impl Default for EngineConfig {
                 crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS,
             ),
             tools_always_load: HashSet::new(),
+            custom_tools: Vec::new(),
             prefer_bwrap: false,
+            tool_whitelist: None,
             tools: None,
         }
     }
@@ -435,8 +449,10 @@ pub struct EngineHandle {
     cancel_reason: Arc<StdMutex<Option<CancelReason>>>,
     /// Send approval decisions to the engine
     tx_approval: mpsc::Sender<ApprovalDecision>,
-    /// Send user input responses to the engine
-    tx_user_input: mpsc::Sender<UserInputDecision>,
+    /// Send user input responses to the engine. [pinvou3-fork] broadcast so the
+    /// main turn loop and every live sub-agent can subscribe; routing is by
+    /// `tool_call_id` (globally unique), so a single fan-out channel suffices.
+    tx_user_input: broadcast::Sender<UserInputDecision>,
     /// Send steer input for an in-flight turn.
     tx_steer: mpsc::Sender<String>,
 }
@@ -458,7 +474,11 @@ pub struct Engine {
     mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
     rx_op: mpsc::Receiver<Op>,
     rx_approval: mpsc::Receiver<ApprovalDecision>,
-    rx_user_input: mpsc::Receiver<UserInputDecision>,
+    rx_user_input: broadcast::Receiver<UserInputDecision>,
+    /// [pinvou3-fork] Broadcast sender kept on the engine so it can hand a
+    /// `subscribe()`-able clone to each sub-agent runtime (so sub-agent turn
+    /// loops can await `request_user_input` answers routed by `tool_call_id`).
+    tx_user_input: broadcast::Sender<UserInputDecision>,
     rx_steer: mpsc::Receiver<String>,
     tx_event: mpsc::Sender<Event>,
     /// Wakeup channel for the parent turn loop when a direct child sub-agent
@@ -586,7 +606,10 @@ impl Engine {
         let (tx_op, rx_op) = mpsc::channel(32);
         let (tx_event, rx_event) = mpsc::channel(256);
         let (tx_approval, rx_approval) = mpsc::channel(64);
-        let (tx_user_input, rx_user_input) = mpsc::channel(32);
+        // [pinvou3-fork] broadcast (not mpsc): the engine subscribes for the
+        // main turn loop and hands `tx_user_input.clone()` to each sub-agent
+        // runtime so sub-agent loops can await `request_user_input` answers.
+        let (tx_user_input, rx_user_input) = broadcast::channel(32);
         let (tx_steer, rx_steer) = mpsc::channel(64);
         let (tx_subagent_completion, rx_subagent_completion) = mpsc::unbounded_channel();
         let cancel_token = CancellationToken::new();
@@ -736,6 +759,7 @@ impl Engine {
             rx_op,
             rx_approval,
             rx_user_input,
+            tx_user_input: tx_user_input.clone(),
             rx_steer,
             tx_event,
             tx_subagent_completion,
@@ -1086,7 +1110,26 @@ impl Engine {
                         .send(Event::status(format!("Denied tool call: {id}")))
                         .await;
                 }
-                Op::SpawnSubAgent { prompt } => {
+                Op::SpawnSubAgent {
+                    prompt,
+                    role_id,
+                    allowed_tools,
+                    max_steps,
+                    output_schema,
+                    expects_file_output,
+                } => {
+                    // [pinvou3-fork] Custom sub-agents require a non-empty tool
+                    // whitelist (build_allowed_tools enforces this); fail fast
+                    // with a clear message rather than a generic spawn error.
+                    if allowed_tools.is_empty() {
+                        let _ = self
+                            .tx_event
+                            .send(Event::error(ErrorEnvelope::fatal(format!(
+                                "Cannot spawn role '{role_id}': empty allowed_tools whitelist"
+                            ))))
+                            .await;
+                        continue;
+                    }
                     let Some(client) = self.deepseek_client.clone() else {
                         let message = self
                             .deepseek_client_error
@@ -1125,6 +1168,7 @@ impl Engine {
                     )
                     .with_max_spawn_depth(self.config.max_spawn_depth)
                     .with_step_api_timeout(self.config.subagent_api_timeout)
+                    .with_user_input_tx(self.tx_user_input.clone())
                     .with_speech_output_dir(self.config.speech_output_dir.clone())
                     .with_mcp_pool(mcp_pool)
                     .background_runtime();
@@ -1132,7 +1176,7 @@ impl Engine {
                         &runtime,
                         None,
                         &prompt,
-                        &SubAgentType::General,
+                        &SubAgentType::Custom,
                     )
                     .await;
                     runtime.model = route.model;
@@ -1141,12 +1185,31 @@ impl Engine {
 
                     let result = {
                         let mut manager = self.subagent_manager.write().await;
-                        manager.spawn_background(
+                        // [pinvou3-fork] Custom agent with the registry role's
+                        // tool whitelist + step budget. name=None on purpose: a
+                        // role gets re-dispatched on gate L1/L2 failure or user
+                        // rejection, and the manager rejects a duplicate
+                        // `session_name` (mod.rs ~1377), which would silently drop
+                        // the rerun. The forwarder correlates the result via
+                        // harness_phase (`executing:{role}`), not the session name.
+                        manager.spawn_background_with_assignment_options(
                             Arc::clone(&self.subagent_manager),
                             runtime,
-                            SubAgentType::General,
+                            SubAgentType::Custom,
                             prompt.clone(),
-                            None,
+                            // [pinvou3-fork] role=role_id(修 transcript role 显示 custom 的问题);
+                            // output_schema 透传以触发 submit_output 强制提交。
+                            SubAgentAssignment::new(prompt.clone(), Some(role_id.clone()))
+                                .with_output_schema(output_schema)
+                                .with_expects_file_output(expects_file_output),
+                            Some(allowed_tools),
+                            SubAgentSpawnOptions {
+                                name: None,
+                                model: None,
+                                nickname: None,
+                                fork_context: false,
+                                max_steps,
+                            },
                         )
                     };
 
@@ -1693,6 +1756,7 @@ In {new} mode: {policy}\n\n\
                         )
                         .with_max_spawn_depth(self.config.max_spawn_depth)
                         .with_step_api_timeout(self.config.subagent_api_timeout)
+                        .with_user_input_tx(self.tx_user_input.clone())
                         .with_speech_output_dir(self.config.speech_output_dir.clone())
                         .with_mcp_pool(mcp_pool.clone())
                         .with_parent_completion_tx(self.tx_subagent_completion.clone());
@@ -2604,7 +2668,7 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
     let (tx_op, rx_op) = mpsc::channel(32);
     let (tx_event, rx_event) = mpsc::channel(256);
     let (tx_approval, rx_approval) = mpsc::channel(64);
-    let (tx_user_input, _rx_user_input) = mpsc::channel(32);
+    let (tx_user_input, _rx_user_input) = broadcast::channel(32);
     let (tx_steer, rx_steer) = mpsc::channel(64);
     let cancel_token = CancellationToken::new();
     let shared_cancel_token = Arc::new(StdMutex::new(cancel_token.clone()));
@@ -2677,8 +2741,8 @@ use self::streaming::{
 use self::tool_catalog::{
     CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME,
     REQUEST_USER_INPUT_NAME, active_tools_for_step, apply_provider_tool_policy,
-    build_model_tool_catalog, ensure_advanced_tooling, execute_code_execution_tool,
-    execute_tool_search, initial_active_tools, is_tool_search_tool,
+    apply_tool_whitelist, build_model_tool_catalog, ensure_advanced_tooling,
+    execute_code_execution_tool, execute_tool_search, initial_active_tools, is_tool_search_tool,
     maybe_hydrate_requested_deferred_tool, missing_tool_error_message,
 };
 #[cfg(test)]

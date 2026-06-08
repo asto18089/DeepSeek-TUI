@@ -26,7 +26,11 @@ const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// `doctor` uses a bounded non-streaming request, but normal TUI turns first
 /// wait for the SSE response to open. On some Windows/proxy paths that wait can
 /// hang before any stream chunk exists, leaving the UI stuck at "Working...".
-const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(45);
+// [pinvou3-fork] 45s 是为云端调的;本地 vLLM(GB10)对大上下文 SubAgent 请求
+// (如 slide_writer 读 10+ 文件后)的首 token TTFT 偶发 >45s,撞这个墙导致
+// create_message 报 "did not receive response headers after 45s" → loop 早停不产出。
+// 提到 110s(留在外层 step_api_timeout=120s 之下);仍可经 DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS 覆盖。
+const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(110);
 
 /// Reads `DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS` as a bounded override for the
 /// response-header wait. This is intentionally shorter than the per-chunk idle
@@ -2496,10 +2500,12 @@ mod stream_diagnostics_tests {
 
     #[test]
     fn stream_open_timeout_defaults_and_clamps_env_values() {
-        assert_eq!(stream_open_timeout_from_env(None), Duration::from_secs(45));
+        // [2026-06-06] 45→110 对齐 DEFAULT_STREAM_OPEN_TIMEOUT 故意调升(c3f95305:
+        // 本地 vLLM 冷启 JIT 首 token TTFT 实测 >45s)——当时漏更新本断言。
+        assert_eq!(stream_open_timeout_from_env(None), Duration::from_secs(110));
         assert_eq!(
             stream_open_timeout_from_env(Some("not-a-number")),
-            Duration::from_secs(45)
+            Duration::from_secs(110)
         );
         assert_eq!(
             stream_open_timeout_from_env(Some("1")),

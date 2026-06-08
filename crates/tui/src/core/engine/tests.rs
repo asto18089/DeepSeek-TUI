@@ -609,6 +609,32 @@ fn model_tool_catalog_applies_native_and_mcp_deferral() {
     assert_eq!(defer_loading("mcp_server_write"), Some(true));
 }
 
+// [pinvou3-fork] hard tool whitelist (supervisor sessions): non-whitelisted
+// tools are removed from the catalog entirely (not just deferred), so they
+// cannot be re-surfaced by tool_search. None = no restriction.
+#[test]
+fn tool_whitelist_none_is_noop_some_hard_filters() {
+    let mut catalog = vec![
+        api_tool("read_file"),
+        api_tool("write_file"),
+        api_tool("exec_shell"),
+        api_tool("update_plan"),
+    ];
+
+    apply_tool_whitelist(&mut catalog, None);
+    assert_eq!(catalog.len(), 4, "None must not touch the catalog");
+
+    let whitelist: HashSet<String> = ["read_file", "update_plan"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    apply_tool_whitelist(&mut catalog, Some(&whitelist));
+    let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, vec!["read_file", "update_plan"]);
+    assert!(!catalog.iter().any(|t| t.name == "write_file"));
+    assert!(!catalog.iter().any(|t| t.name == "exec_shell"));
+}
+
 #[test]
 fn arcee_provider_policy_defers_risky_tools_keeps_read_only_and_tool_search() {
     let always_load = HashSet::new();
@@ -820,6 +846,10 @@ fn pinvou3_yolo_offers_nonblocklisted_tools_outside_upstream_default() {
         &always_load
     ));
 }
+
+// [2026-06-06 合并清残] 此处原有本测试的旧版重复体(同名 E0428,且断言
+// request_user_input 在 Agent 模式应 defer——与 2026-05-28 补强版语义相反)。
+// 实现(tool_catalog.rs:107 跨所有 mode 不 defer)以补强版为准,旧版删除。
 
 #[test]
 #[ignore = "one-shot metric for scripts/measure-tool-catalog.py"]

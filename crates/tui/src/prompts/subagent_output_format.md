@@ -60,7 +60,9 @@ not cover (build, test, format, lint, ad-hoc one-liners).
 - Single search/replace edit in one file: `edit_file`.
 - Multi-hunk or multi-file edits: `apply_patch` (NOT a sequence of
   `edit_file` calls — patches are atomic and easier for the parent to audit).
-- Brand-new file: `write_file` (NOT `apply_patch` against `/dev/null`).
+- Brand-new file: `write_file` (NOT `apply_patch` against `/dev/null`); for
+  large generated artifacts, write a small skeleton then add bounded chunks with
+  `append_file`.
 - Inspect git state: `git_status` / `git_diff` / `git_log` / `git_show` /
   `git_blame` (NOT `exec_shell` with `git`).
 - Web lookup: `web_search` / `fetch_url` (NOT `exec_shell` with `curl`).

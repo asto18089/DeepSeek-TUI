@@ -521,7 +521,7 @@ impl WebSearchTool {
         })?;
 
         // Bocha /v1/web-search returns `{"code": 200, "data": {"webPages": {"value": [...]}}}`.
-        // Keep the older `pages` fallbacks for compatibility with recorded fixtures
+        // Keep older `pages` fallbacks for compatibility with recorded fixtures
         // and deployments pinned to the previous API shape.
         let results: Vec<WebSearchEntry> = parsed
             .get("data")

@@ -133,7 +133,6 @@ pub(super) fn apply_native_tool_deferral(
     let deferred = catalog.len() - active.len();
     tracing::info!(
         target: "pinvou3.tool_catalog",
-        mode = ?mode,
         active_count = active.len(),
         deferred_count = deferred,
         total = catalog.len(),
@@ -190,13 +189,27 @@ pub(super) fn apply_provider_tool_policy(
     let Some(active) = provider_first_turn_native_tools(provider) else {
         return;
     };
-    for tool in catalog {
+    for tool in catalog.iter_mut() {
         if is_tool_search_tool(&tool.name) || always_load.contains(&tool.name) {
             tool.defer_loading = Some(false);
             continue;
         }
         tool.defer_loading = Some(!active.contains(&tool.name.as_str()));
     }
+    let active: Vec<&str> = catalog
+        .iter()
+        .filter(|t| !t.defer_loading.unwrap_or(false))
+        .map(|t| t.name.as_str())
+        .collect();
+    let deferred = catalog.len() - active.len();
+    tracing::info!(
+        target: "pinvou3.tool_catalog",
+        active_count = active.len(),
+        deferred_count = deferred,
+        total = catalog.len(),
+        active = ?active,
+        "native tool catalog deferral applied"
+    );
 }
 
 fn should_keep_mcp_tool_loaded(name: &str) -> bool {
@@ -351,6 +364,18 @@ pub(super) fn ensure_advanced_tooling(
             strict: None,
             cache_control: None,
         });
+    }
+}
+
+/// [pinvou3-fork] Hard tool whitelist: drop every tool whose name is not in
+/// `whitelist` from the model-visible catalog. A true allowlist, NOT a
+/// `defer_loading` soft-hide — non-whitelisted tools are removed entirely, so
+/// `tool_search` cannot re-surface them either. No-op when `whitelist` is
+/// `None`. Call AFTER `ensure_advanced_tooling` so the appended meta-tools
+/// (tool_search, code_execution) are subject to the same restriction.
+pub(super) fn apply_tool_whitelist(catalog: &mut Vec<Tool>, whitelist: Option<&HashSet<String>>) {
+    if let Some(set) = whitelist {
+        catalog.retain(|t| set.contains(&t.name));
     }
 }
 

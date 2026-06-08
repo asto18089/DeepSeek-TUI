@@ -1106,6 +1106,14 @@ pub(super) fn apply_reasoning_effort(
     provider: ApiProvider,
 ) {
     let Some(effort) = effort else {
+        // [pinvou3-fork] SubAgent 默认 reasoning_effort=None(没继承主 session 的 "off"),
+        // None 在这里直接 return 不设任何 thinking 参数 → 本地 vLLM(qwen36 reasoning 模型)
+        // 默认吐完整 reasoning trace(见下方 Vllm 分支注释)→ SubAgent 每步超长 thinking +
+        // context 累积 → SSE prefill 超 280s 上限(clamp 死) → designer/illustrator 等
+        // SubAgent spawn 即死。pinvou3 本地 vLLM 铁律:thinking 必须关。故 None 对 vLLM 视同 off。
+        if matches!(provider, ApiProvider::Vllm) {
+            body["chat_template_kwargs"] = json!({ "enable_thinking": false });
+        }
         return;
     };
     let normalized = effort.trim().to_ascii_lowercase();

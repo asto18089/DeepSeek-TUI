@@ -202,8 +202,18 @@ pub enum Event {
     /// Sub-agent progress update
     AgentProgress { id: String, status: String },
 
-    /// Sub-agent completed
-    AgentComplete { id: String, result: String },
+    /// Sub-agent completed.
+    /// [pinvou3-fork] `role` = 派发时 SubAgentAssignment.role（workflow 角色 id）。
+    /// SDAN 的 Result 信封带 `from`：让宿主靠它把结果关联回节点，不必猜。
+    /// [pinvou3-fork] `failed` = run_subagent 返回 Err（0 步即死/工具不可用/超时等）。
+    /// SDAN Result.status(completed|failed)：宿主靠它走失败路径，绝不许拿陈旧产物过 gate
+    /// （实锤：web_search 不可用 → PM 秒死 → gate 拿上一轮旧 brief 放行，见 2026-06-06）。
+    AgentComplete {
+        id: String,
+        result: String,
+        role: Option<String>,
+        failed: bool,
+    },
 
     /// Sub-agent listing
     AgentList { agents: Vec<SubAgentResult> },
@@ -286,6 +296,15 @@ pub enum Event {
         denial_reason: String,
         blocked_network: bool,
         blocked_write: bool,
+    },
+
+    // === Skill Phase Tracking (pinvou3 MVP1) ===
+    /// The assistant emitted a `<phase id="..."/>` marker indicating it
+    /// moved to a new phase of a phased skill. Carried verbatim so the
+    /// UI (pinvou3-app WorkFlow pipeline view) can highlight the chip.
+    PhaseChanged {
+        /// Phase id as written in the skill's `phases:` frontmatter.
+        phase_id: String,
     },
 
     // === Prefix-Cache Stability Events ===

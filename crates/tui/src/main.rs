@@ -5735,6 +5735,8 @@ async fn run_exec_agent(
         search_provider: config.search_provider(),
         search_api_key: config.search.as_ref().and_then(|s| s.api_key.clone()),
         tools_always_load: config.tools_always_load(),
+        custom_tools: Vec::new(),
+        tool_whitelist: None,
         tools: config.tools.clone(),
     };
 
@@ -5949,7 +5951,7 @@ async fn run_exec_agent(
             {
                 eprintln!("sub-agent {id}: {status}");
             }
-            Event::AgentComplete { id, result }
+            Event::AgentComplete { id, result, .. }
                 if output_format == ExecOutputFormat::Text && !json_output =>
             {
                 eprintln!(

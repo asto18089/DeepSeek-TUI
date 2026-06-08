@@ -38,6 +38,9 @@ pub struct RuntimeToolServices {
     pub shell_manager: Option<SharedShellManager>,
     pub task_manager: Option<crate::task_manager::SharedTaskManager>,
     pub automations: Option<crate::automation_manager::SharedAutomationManager>,
+    /// Host application supplied native tools. Cloned into child registries so
+    /// sub-agents can call wrapper-provided tools without shell approval.
+    pub custom_tools: Vec<Arc<dyn ToolSpec>>,
     pub task_data_dir: Option<PathBuf>,
     pub active_task_id: Option<String>,
     pub active_thread_id: Option<String>,
@@ -58,6 +61,7 @@ impl Default for RuntimeToolServices {
             shell_manager: None,
             task_manager: None,
             automations: None,
+            custom_tools: Vec::new(),
             task_data_dir: None,
             active_task_id: None,
             active_thread_id: None,
@@ -74,6 +78,7 @@ impl std::fmt::Debug for RuntimeToolServices {
             .field("shell_manager", &self.shell_manager.is_some())
             .field("task_manager", &self.task_manager.is_some())
             .field("automations", &self.automations.is_some())
+            .field("custom_tools", &self.custom_tools.len())
             .field("task_data_dir", &self.task_data_dir)
             .field("active_task_id", &self.active_task_id)
             .field("active_thread_id", &self.active_thread_id)
