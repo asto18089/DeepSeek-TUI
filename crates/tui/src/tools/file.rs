@@ -314,8 +314,14 @@ fn clean_pdf_text(raw: &str) -> String {
     // would also strip intentional indentation (e.g. centred titles).
     if any_content {
         let start = out.find(|c: char| c != '\n').unwrap_or(0);
-        // Walk back from end to find the last non-newline character.
-        let end = out.rfind(|c: char| c != '\n').map_or(out.len(), |i| i + 1);
+        // Walk back from end to find the last non-newline character. `rfind`
+        // returns the byte index where the character starts; adding 1 can land
+        // inside a multi-byte character (for example Chinese punctuation).
+        let end = out
+            .char_indices()
+            .rev()
+            .find(|(_, c)| *c != '\n')
+            .map_or(out.len(), |(i, c)| i + c.len_utf8());
         out[start..end].to_string()
     } else {
         String::new()
@@ -365,7 +371,16 @@ fn read_pdf_via_pdf_extract(
         // pdf-extract returns pages in document order; `start`/`end` are
         // 1-indexed inclusive (validated above), so we convert to a
         // 0-indexed half-open slice with bounds clamping.
-        let pages = pdf_extract::extract_text_by_pages(path).map_err(|e| {
+        let pages = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pdf_extract::extract_text_by_pages(path)
+        }))
+        .map_err(|_| {
+            ToolError::execution_failed(format!(
+                "pdf-extract panicked on {} (PDF font encoding unsupported; try `prefer_external_pdftotext = true`)",
+                path.display()
+            ))
+        })?
+        .map_err(|e| {
             ToolError::execution_failed(format!(
                 "pdf-extract failed on {}: {e} (set `prefer_external_pdftotext = true` in settings.toml to retry via pdftotext)",
                 path.display()
@@ -384,12 +399,19 @@ fn read_pdf_via_pdf_extract(
             }
         }
     } else {
-        pdf_extract::extract_text(path).map_err(|e| {
-            ToolError::execution_failed(format!(
-                "pdf-extract failed on {}: {e} (set `prefer_external_pdftotext = true` in settings.toml to retry via pdftotext)",
-                path.display()
-            ))
-        })?
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pdf_extract::extract_text(path)))
+            .map_err(|_| {
+                ToolError::execution_failed(format!(
+                    "pdf-extract panicked on {} (PDF font encoding unsupported; try `prefer_external_pdftotext = true`)",
+                    path.display()
+                ))
+            })?
+            .map_err(|e| {
+                ToolError::execution_failed(format!(
+                    "pdf-extract failed on {}: {e} (set `prefer_external_pdftotext = true` in settings.toml to retry via pdftotext)",
+                    path.display()
+                ))
+            })?
     };
     Ok(ToolResult::success(clean_pdf_text(&text)))
 }
@@ -1476,6 +1498,14 @@ mod tests {
         let raw = "   indented line\nregular line";
         let cleaned = super::clean_pdf_text(raw);
         assert_eq!(cleaned, "   indented line\nregular line");
+    }
+
+    #[test]
+    fn forkguard_clean_pdf_text_chinese_trailing_no_panic() {
+        let raw = "新华三嘿板OS智慧教室方案。\n\n\n";
+        let cleaned = super::clean_pdf_text(raw);
+        assert!(cleaned.ends_with('。'), "末尾中文字符应保留: {cleaned:?}");
+        assert_eq!(super::clean_pdf_text("①性能：测试\n"), "①性能：测试");
     }
 
     #[test]
