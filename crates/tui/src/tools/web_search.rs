@@ -25,7 +25,7 @@ use std::time::Duration;
 const DUCKDUCKGO_HOST: &str = "html.duckduckgo.com";
 const BING_HOST: &str = "www.bing.com";
 const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
-const BOCHA_ENDPOINT: &str = "https://api.bochaai.com/v1/ai/search";
+const BOCHA_ENDPOINT: &str = "https://api.bochaai.com/v1/web-search";
 const METASO_ENDPOINT: &str = "https://metaso.cn/api/v1";
 const BAIDU_ENDPOINT: &str = "https://qianfan.baidubce.com/v2/ai_search/web_search";
 const VOLCENGINE_RESPONSES_ENDPOINT: &str = "https://ark.cn-beijing.volces.com/api/v3/responses";
@@ -520,39 +520,11 @@ impl WebSearchTool {
             ToolError::execution_failed(format!("Failed to parse Bocha response: {e}"))
         })?;
 
-        // Bocha returns `{"code": 200, "data": {"pages": [...]}}`
-        let results: Vec<WebSearchEntry> = parsed
-            .get("data")
-            .and_then(|d| d.get("pages"))
-            .or_else(|| parsed.get("pages"))
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flat_map(|arr| arr.iter())
-            .filter_map(|item| {
-                let title = item
-                    .get("name")
-                    .or_else(|| item.get("title"))
-                    .and_then(|s| s.as_str())?
-                    .to_string();
-                let url = item
-                    .get("url")
-                    .or_else(|| item.get("link"))
-                    .and_then(|s| s.as_str())?
-                    .to_string();
-                let snippet = item
-                    .get("summary")
-                    .or_else(|| item.get("snippet"))
-                    .or_else(|| item.get("description"))
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string());
-                Some(WebSearchEntry {
-                    title,
-                    url,
-                    snippet,
-                })
-            })
-            .take(max_results)
-            .collect();
+        if let Some(error) = bocha_error_message(&parsed) {
+            return Err(ToolError::execution_failed(error));
+        }
+
+        let results = parse_bocha_results(&parsed, max_results);
 
         let message = if results.is_empty() {
             "No results found".to_string()
@@ -888,6 +860,63 @@ fn sanitize_error_body(body: &str) -> String {
     get_bearer_token_re()
         .replace_all(&visible, "Bearer [REDACTED]")
         .to_string()
+}
+
+fn parse_bocha_results(parsed: &Value, max_results: usize) -> Vec<WebSearchEntry> {
+    parsed
+        .get("data")
+        .and_then(|d| {
+            d.get("webPages")
+                .and_then(|w| w.get("value"))
+                .or_else(|| d.get("pages"))
+        })
+        .or_else(|| parsed.get("pages"))
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flat_map(|arr| arr.iter())
+        .filter_map(|item| {
+            let title = item
+                .get("name")
+                .or_else(|| item.get("title"))
+                .and_then(|s| s.as_str())?
+                .trim();
+            let url = item
+                .get("url")
+                .or_else(|| item.get("link"))
+                .and_then(|s| s.as_str())?
+                .trim();
+            if title.is_empty() || url.is_empty() {
+                return None;
+            }
+            let snippet = item
+                .get("summary")
+                .or_else(|| item.get("snippet"))
+                .or_else(|| item.get("description"))
+                .and_then(|s| s.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+            Some(WebSearchEntry {
+                title: title.to_string(),
+                url: url.to_string(),
+                snippet,
+            })
+        })
+        .take(max_results)
+        .collect()
+}
+
+fn bocha_error_message(parsed: &Value) -> Option<String> {
+    let code = parsed.get("code").and_then(|v| v.as_i64())?;
+    if code == 0 || code == 200 {
+        return None;
+    }
+    let message = parsed
+        .get("msg")
+        .or_else(|| parsed.get("message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown error");
+    Some(format!("Bocha search API error (code {code}: {message})"))
 }
 
 fn parse_baidu_results(parsed: &Value, max_results: usize) -> Vec<WebSearchEntry> {
@@ -1439,9 +1468,9 @@ fn extract_query_param(url: &str, key: &str) -> Option<String> {
 mod tests {
     use super::{
         ERROR_BODY_PREVIEW_BYTES, WebSearchEntry, WebSearchTool, baidu_search_payload,
-        decode_html_entities, extract_search_query, is_likely_spam_results, normalize_bing_url,
-        optional_search_max_results, parse_baidu_results, root_domain, sanitize_error_body,
-        truncate_error_body, volcengine_extract_text,
+        bocha_error_message, decode_html_entities, extract_search_query, is_likely_spam_results,
+        normalize_bing_url, optional_search_max_results, parse_baidu_results, parse_bocha_results,
+        root_domain, sanitize_error_body, truncate_error_body, volcengine_extract_text,
     };
     use serde_json::json;
 
@@ -1727,6 +1756,72 @@ mod tests {
 
         assert!(!sanitized.contains("test-token/with+chars="));
         assert!(sanitized.contains("Bearer [REDACTED]"));
+    }
+
+    #[test]
+    fn parse_bocha_web_pages_value_extracts_ranked_results() {
+        let body = json!({
+            "code": 200,
+            "msg": null,
+            "data": {
+                "webPages": {
+                    "value": [
+                        {
+                            "name": "广州天气",
+                            "url": "https://bocha.cn/share/weather",
+                            "snippet": "广州今日雷阵雨转晴。"
+                        },
+                        {
+                            "name": "中央气象台",
+                            "url": "https://www.weather.com.cn/",
+                            "summary": "天气实况。"
+                        }
+                    ]
+                }
+            }
+        });
+
+        let results = parse_bocha_results(&body, 10);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "广州天气");
+        assert_eq!(results[0].url, "https://bocha.cn/share/weather");
+        assert_eq!(results[0].snippet.as_deref(), Some("广州今日雷阵雨转晴。"));
+        assert_eq!(results[1].title, "中央气象台");
+    }
+
+    #[test]
+    fn parse_bocha_keeps_legacy_pages_shape() {
+        let body = json!({
+            "code": 200,
+            "data": {
+                "pages": [
+                    {
+                        "title": "Legacy title",
+                        "link": "https://example.com/legacy",
+                        "description": "Legacy description"
+                    }
+                ]
+            }
+        });
+
+        let results = parse_bocha_results(&body, 5);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Legacy title");
+        assert_eq!(results[0].url, "https://example.com/legacy");
+        assert_eq!(results[0].snippet.as_deref(), Some("Legacy description"));
+    }
+
+    #[test]
+    fn bocha_error_message_flags_non_success_business_code() {
+        let body = json!({"code": 401, "msg": "invalid api key"});
+
+        let error = bocha_error_message(&body).expect("non-success code should error");
+
+        assert!(error.contains("Bocha"));
+        assert!(error.contains("401"));
+        assert!(error.contains("invalid api key"));
     }
 
     #[test]
