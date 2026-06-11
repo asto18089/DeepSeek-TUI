@@ -42,6 +42,20 @@ pub(crate) fn should_drop_loading_mouse_motion(app: &App, mouse: MouseEvent) -> 
     }
 }
 
+fn toggle_tool_run_expand(app: &mut App, mouse: MouseEvent) -> bool {
+    if !app.tool_collapse_active() {
+        return false;
+    }
+    let Some(rendered_idx) = transcript_cell_index_from_mouse(app, mouse) else {
+        return false;
+    };
+    let original_idx = app.original_cell_index_for_rendered(rendered_idx);
+    if app.tool_run_start_for_history_index(original_idx) != Some(original_idx) {
+        return false;
+    }
+    app.toggle_tool_run_expansion_at(original_idx)
+}
+
 /// Handle mouse events on the sidebar resize handle (the 1-col vertical bar
 /// between the chat area and the sidebar). Returns true when the event was
 /// consumed so other handlers skip it.
@@ -289,11 +303,9 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
             // Update last mouse position for tooltip rendering.
             app.last_mouse_pos = Some((mouse.column, mouse.row));
 
-            // Check sidebar sections for hover tooltip. Only surface a tooltip
-            // when the hovered line was actually truncated to fit the panel
-            // width — otherwise it just paints a redundant copy of
-            // already-visible text over the neighbouring row, which reads as
-            // visual corruption.
+            // Check sidebar sections for hover popovers. Only surface a
+            // popover when the hovered row lost information in the compact
+            // sidebar view.
             let mut found = false;
             for section in &app.sidebar_hover.sections {
                 if mouse.column >= section.content_area.x
@@ -309,17 +321,35 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
                             .y
                             .saturating_add(section.content_area.height)
                 {
-                    let line_idx = (mouse.row.saturating_sub(section.content_area.y)) as usize;
-                    if let Some(full) = section.lines.get(line_idx) {
-                        let truncated = UnicodeWidthStr::width(full.as_str())
-                            > section.content_area.width as usize;
-                        let desired = truncated.then(|| full.clone());
+                    if let Some(row) = section.rows.iter().find(|row| row.row_y == mouse.row) {
+                        let desired = row.is_truncated.then(|| {
+                            if let Some(detail) = row.detail.as_deref()
+                                && !detail.trim().is_empty()
+                            {
+                                format!("{}\n{detail}", row.full_text)
+                            } else {
+                                row.full_text.clone()
+                            }
+                        });
                         if app.sidebar_hover_tooltip != desired {
                             app.sidebar_hover_tooltip = desired;
                             app.needs_redraw = true;
                         }
                         found = true;
                         break;
+                    } else if section.rows.is_empty() {
+                        let line_idx = (mouse.row.saturating_sub(section.content_area.y)) as usize;
+                        if let Some(full) = section.lines.get(line_idx) {
+                            let truncated =
+                                text_display_width(full) > section.content_area.width as usize;
+                            let desired = truncated.then(|| full.clone());
+                            if app.sidebar_hover_tooltip != desired {
+                                app.sidebar_hover_tooltip = desired;
+                                app.needs_redraw = true;
+                            }
+                            found = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -364,6 +394,10 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
 
             if mouse_hits_rect(mouse, app.viewport.jump_to_latest_button_area) {
                 app.scroll_to_bottom();
+                return Vec::new();
+            }
+
+            if toggle_tool_run_expand(app, mouse) {
                 return Vec::new();
             }
 
@@ -620,14 +654,7 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
     }
 
     if let Some(filtered_cell_index) = transcript_cell_index_from_mouse(app, mouse) {
-        // Convert filtered index → original virtual index using the
-        // mapping built in ChatWidget::new. When no cells are collapsed
-        // this is an identity mapping.
-        let cell_index = app
-            .collapsed_cell_map
-            .get(filtered_cell_index)
-            .copied()
-            .unwrap_or(filtered_cell_index);
+        let cell_index = app.original_cell_index_for_rendered(filtered_cell_index);
 
         let target = detail_target_label(app, cell_index)
             .map(|label| truncate_line_to_width(label.as_str(), 28))

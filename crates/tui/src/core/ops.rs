@@ -77,12 +77,15 @@ pub enum Op {
     #[allow(dead_code)]
     ChangeMode { mode: AppMode },
 
-    /// Update the model being used and refresh the prompt for the current mode.
+    /// Update the model being used and refresh stable prompt context.
     #[allow(dead_code)]
     SetModel { model: String, mode: AppMode },
 
     /// Update auto-compaction settings
     SetCompaction { config: CompactionConfig },
+
+    /// Update the SSE idle timeout used for subsequent streamed turns.
+    SetStreamChunkTimeout { timeout_secs: u64 },
 
     /// Sync engine session state (used for resume/load)
     SyncSession {

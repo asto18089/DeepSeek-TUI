@@ -18,6 +18,19 @@ The `type` field on `agent_open` selects a system-prompt posture for the child
 (`agent_type` is accepted as a compatibility alias). Each role is a distinct
 stance toward the work — not just a different label.
 
+## Maintainer posture
+
+Sub-agents help CodeWhale move faster, but the parent agent still owns the
+maintainer decision. Use children to gather evidence, review patches, and run
+verification while keeping the community posture in
+[`AGENT_ETHOS.md`](AGENT_ETHOS.md): issues are open intake, PR gates are
+review-load controls, and harvested work needs clear contributor credit.
+
+When a child reviews community work, the parent should still inspect the PR
+diff, linked issues, tests, and CI before merging, harvesting, closing, or
+deferring it. A sub-agent's result is a working set, not a substitute for
+stewardship.
+
 | Role          | Stance                                 | Writes? | Shell posture | Typical use                                  |
 |---------------|----------------------------------------|---------|---------------|----------------------------------------------|
 | `general`     | flexible; do whatever the parent says  | yes     | yes           | the default; multi-step tasks                |

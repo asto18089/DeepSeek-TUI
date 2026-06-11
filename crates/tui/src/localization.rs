@@ -228,6 +228,14 @@ pub enum MessageId {
     HistoryHintAccept,
     HistoryHintRestore,
     HistoryNoMatches,
+    // StatusPicker — `/statusline` multi-select footer-item picker.
+    StatusPickerTitle,
+    StatusPickerInstruction,
+    StatusPickerActionToggle,
+    StatusPickerActionAll,
+    StatusPickerActionNone,
+    StatusPickerActionSave,
+    StatusPickerActionCancel,
     ConfigTitle,
     ConfigModalTitle,
     ConfigSearchPlaceholder,
@@ -268,6 +276,7 @@ pub enum MessageId {
     CmdExitDescription,
     CmdExportDescription,
     CmdFeedbackDescription,
+    CmdHfDescription,
     CmdHelpDescription,
     CmdHomeDescription,
     CmdHooksDescription,
@@ -314,6 +323,7 @@ pub enum MessageId {
     CmdNewDescription,
     CmdSessionsDescription,
     CmdSettingsDescription,
+    CmdSidebarDescription,
     CmdSkillDescription,
     CmdSkillsDescription,
     CmdSlopDescription,
@@ -503,6 +513,31 @@ pub enum MessageId {
     // Agent fanout card.
     FanoutCounts,
 
+    // Approval dialog — risk badges, category labels, field labels, options.
+    ApprovalRiskReview,
+    ApprovalRiskDestructive,
+    ApprovalCategorySafe,
+    ApprovalCategoryFileWrite,
+    ApprovalCategoryShell,
+    ApprovalCategoryNetwork,
+    ApprovalCategoryMcpRead,
+    ApprovalCategoryMcpAction,
+    ApprovalCategoryUnknown,
+    ApprovalFieldType,
+    ApprovalFieldAbout,
+    ApprovalFieldImpact,
+    ApprovalFieldParams,
+    ApprovalOptionApproveOnce,
+    ApprovalOptionApproveAlways,
+    ApprovalOptionDeny,
+    ApprovalOptionAbortTurn,
+    ApprovalBlockTitle,
+    ApprovalControlsHint,
+    ApprovalChooseHint,
+    ApprovalChooseAction,
+    ApprovalIntentLabel,
+    ApprovalMoreLines,
+
     CtxInspTitle,
     CtxInspSessionContext,
     CtxInspSystemPrompt,
@@ -559,6 +594,13 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::HistoryHintAccept,
     MessageId::HistoryHintRestore,
     MessageId::HistoryNoMatches,
+    MessageId::StatusPickerTitle,
+    MessageId::StatusPickerInstruction,
+    MessageId::StatusPickerActionToggle,
+    MessageId::StatusPickerActionAll,
+    MessageId::StatusPickerActionNone,
+    MessageId::StatusPickerActionSave,
+    MessageId::StatusPickerActionCancel,
     MessageId::ConfigTitle,
     MessageId::ConfigModalTitle,
     MessageId::ConfigSearchPlaceholder,
@@ -594,6 +636,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdExitDescription,
     MessageId::CmdExportDescription,
     MessageId::CmdFeedbackDescription,
+    MessageId::CmdHfDescription,
     MessageId::CmdHelpDescription,
     MessageId::CmdHomeDescription,
     MessageId::CmdHooksDescription,
@@ -637,6 +680,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdNewDescription,
     MessageId::CmdSessionsDescription,
     MessageId::CmdSettingsDescription,
+    MessageId::CmdSidebarDescription,
     MessageId::CmdSkillDescription,
     MessageId::CmdSkillsDescription,
     MessageId::CmdSlopDescription,
@@ -825,6 +869,29 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CtxMenuHelp,
     MessageId::CtxMenuHelpDesc,
     MessageId::FanoutCounts,
+    MessageId::ApprovalRiskReview,
+    MessageId::ApprovalRiskDestructive,
+    MessageId::ApprovalCategorySafe,
+    MessageId::ApprovalCategoryFileWrite,
+    MessageId::ApprovalCategoryShell,
+    MessageId::ApprovalCategoryNetwork,
+    MessageId::ApprovalCategoryMcpRead,
+    MessageId::ApprovalCategoryMcpAction,
+    MessageId::ApprovalCategoryUnknown,
+    MessageId::ApprovalFieldType,
+    MessageId::ApprovalFieldAbout,
+    MessageId::ApprovalFieldImpact,
+    MessageId::ApprovalFieldParams,
+    MessageId::ApprovalOptionApproveOnce,
+    MessageId::ApprovalOptionApproveAlways,
+    MessageId::ApprovalOptionDeny,
+    MessageId::ApprovalOptionAbortTurn,
+    MessageId::ApprovalBlockTitle,
+    MessageId::ApprovalControlsHint,
+    MessageId::ApprovalChooseHint,
+    MessageId::ApprovalChooseAction,
+    MessageId::ApprovalIntentLabel,
+    MessageId::ApprovalMoreLines,
     MessageId::CtxInspTitle,
     MessageId::CtxInspSessionContext,
     MessageId::CtxInspSystemPrompt,
@@ -1061,6 +1128,13 @@ fn english(id: MessageId) -> &'static str {
         MessageId::HistoryHintAccept => "Enter accept",
         MessageId::HistoryHintRestore => "Esc restore",
         MessageId::HistoryNoMatches => "  No matches",
+        MessageId::StatusPickerTitle => " Status line ",
+        MessageId::StatusPickerInstruction => "Pick the chips you want in the footer:",
+        MessageId::StatusPickerActionToggle => "toggle ",
+        MessageId::StatusPickerActionAll => "all ",
+        MessageId::StatusPickerActionNone => "none ",
+        MessageId::StatusPickerActionSave => "save ",
+        MessageId::StatusPickerActionCancel => "cancel ",
         MessageId::ConfigTitle => "Session Configuration",
         MessageId::ConfigModalTitle => " Config ",
         MessageId::ConfigSearchPlaceholder => "type to filter",
@@ -1121,6 +1195,7 @@ fn english(id: MessageId) -> &'static str {
         MessageId::CmdExitDescription => "Exit the application",
         MessageId::CmdExportDescription => "Export conversation to markdown",
         MessageId::CmdFeedbackDescription => "Generate a GitHub feedback URL",
+        MessageId::CmdHfDescription => "Inspect Hugging Face MCP setup and concepts",
         MessageId::CmdHelpDescription => "Show help information",
         MessageId::CmdHomeDescription => "Show home dashboard with stats and quick actions",
         MessageId::CmdHooksDescription => "List configured lifecycle hooks (read-only)",
@@ -1181,6 +1256,7 @@ fn english(id: MessageId) -> &'static str {
         MessageId::CmdNewDescription => "Start a fresh saved session",
         MessageId::CmdSessionsDescription => "Open session history picker",
         MessageId::CmdSettingsDescription => "Show persistent settings",
+        MessageId::CmdSidebarDescription => "Toggle or focus the right sidebar",
         MessageId::CmdSkillDescription => {
             "Activate a skill, or install/update/uninstall/trust a community skill"
         }
@@ -1455,6 +1531,31 @@ fn english(id: MessageId) -> &'static str {
             "{done} done · {running} running · {failed} failed · {pending} pending"
         }
 
+        // Approval dialog.
+        MessageId::ApprovalRiskReview => "REVIEW",
+        MessageId::ApprovalRiskDestructive => "DESTRUCTIVE",
+        MessageId::ApprovalCategorySafe => "Safe",
+        MessageId::ApprovalCategoryFileWrite => "File Write",
+        MessageId::ApprovalCategoryShell => "Shell Command",
+        MessageId::ApprovalCategoryNetwork => "Network",
+        MessageId::ApprovalCategoryMcpRead => "MCP Read",
+        MessageId::ApprovalCategoryMcpAction => "MCP Action",
+        MessageId::ApprovalCategoryUnknown => "Unknown",
+        MessageId::ApprovalFieldType => "Type: ",
+        MessageId::ApprovalFieldAbout => "About:  ",
+        MessageId::ApprovalFieldImpact => "Impact: ",
+        MessageId::ApprovalFieldParams => "Params: ",
+        MessageId::ApprovalOptionApproveOnce => "Approve once",
+        MessageId::ApprovalOptionApproveAlways => "Approve always for this kind",
+        MessageId::ApprovalOptionDeny => "Deny this call",
+        MessageId::ApprovalOptionAbortTurn => "Abort the turn",
+        MessageId::ApprovalBlockTitle => "approval",
+        MessageId::ApprovalControlsHint => "  ·  v: full params  ·  Esc: abort",
+        MessageId::ApprovalChooseHint => "Choose: ",
+        MessageId::ApprovalChooseAction => "Enter selected option, or press y/a/d directly",
+        MessageId::ApprovalIntentLabel => "Intent: ",
+        MessageId::ApprovalMoreLines => "  … (+{count} lines)",
+
         MessageId::CtxInspTitle => "Context inspector",
         MessageId::CtxInspSessionContext => "Session Context",
         MessageId::CtxInspSystemPrompt => "System Prompt Structure",
@@ -1527,6 +1628,15 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
         MessageId::HistoryHintAccept => "Enter để chấp nhận",
         MessageId::HistoryHintRestore => "Esc để khôi phục",
         MessageId::HistoryNoMatches => "  Không tìm thấy kết quả",
+        MessageId::StatusPickerTitle => " Dòng trạng thái ",
+        MessageId::StatusPickerInstruction => {
+            "Chọn các thành phần bạn muốn hiển thị ở cuối màn hình:"
+        }
+        MessageId::StatusPickerActionToggle => "bật/tắt ",
+        MessageId::StatusPickerActionAll => "tất cả ",
+        MessageId::StatusPickerActionNone => "không ",
+        MessageId::StatusPickerActionSave => "lưu ",
+        MessageId::StatusPickerActionCancel => "huỷ ",
         MessageId::ConfigTitle => "Cấu hình phiên làm việc",
         MessageId::ConfigModalTitle => " Cấu hình ",
         MessageId::ConfigSearchPlaceholder => "Nhập để lọc kết quả",
@@ -1587,6 +1697,7 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
         MessageId::CmdExitDescription => "Thoát ứng dụng",
         MessageId::CmdExportDescription => "Xuất cuộc trò chuyện sang định dạng Markdown",
         MessageId::CmdFeedbackDescription => "Tạo một URL để gửi phản hồi trên GitHub",
+        MessageId::CmdHfDescription => "Kiểm tra thiết lập và khái niệm Hugging Face MCP",
         MessageId::CmdHelpDescription => "Hiển thị thông tin trợ giúp",
         MessageId::CmdHomeDescription => {
             "Hiển thị bảng điều khiển trang chủ với số liệu thống kê và hành động nhanh"
@@ -1661,6 +1772,7 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
         MessageId::CmdNewDescription => "Bắt đầu một phiên lưu mới",
         MessageId::CmdSessionsDescription => "Mở bảng chọn lịch sử phiên làm việc",
         MessageId::CmdSettingsDescription => "Hiển thị các cài đặt liên tục",
+        MessageId::CmdSidebarDescription => "Toggle or focus the right sidebar",
         MessageId::CmdSkillDescription => {
             "Kích hoạt một kỹ năng, hoặc cài đặt/cập nhật/gỡ bỏ/tin cậy một kỹ năng cộng đồng"
         }
@@ -1954,6 +2066,31 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
             "{done} hoàn thành · {running} đang chạy · {failed} thất bại · {pending} chờ"
         }
 
+        // Approval dialog.
+        MessageId::ApprovalRiskReview => "XEM XÉT",
+        MessageId::ApprovalRiskDestructive => "NGUY HẠI",
+        MessageId::ApprovalCategorySafe => "An toàn",
+        MessageId::ApprovalCategoryFileWrite => "Ghi Tệp",
+        MessageId::ApprovalCategoryShell => "Lệnh Shell",
+        MessageId::ApprovalCategoryNetwork => "Mạng",
+        MessageId::ApprovalCategoryMcpRead => "Đọc MCP",
+        MessageId::ApprovalCategoryMcpAction => "Hành động MCP",
+        MessageId::ApprovalCategoryUnknown => "Không xác định",
+        MessageId::ApprovalFieldType => "Loại:",
+        MessageId::ApprovalFieldAbout => "Mô tả:",
+        MessageId::ApprovalFieldImpact => "Tác động:",
+        MessageId::ApprovalFieldParams => "Tham số:",
+        MessageId::ApprovalOptionApproveOnce => "Phê duyệt một lần",
+        MessageId::ApprovalOptionApproveAlways => "Phê duyệt mọi lần cho loại này",
+        MessageId::ApprovalOptionDeny => "Từ chối lần gọi này",
+        MessageId::ApprovalOptionAbortTurn => "Hủy bỏ lượt",
+        MessageId::ApprovalBlockTitle => "phê duyệt",
+        MessageId::ApprovalControlsHint => "  ·  v: tham số  ·  Esc: hủy bỏ",
+        MessageId::ApprovalChooseHint => "Chọn: ",
+        MessageId::ApprovalChooseAction => "Enter để chọn, hoặc nhấn y/a/d trực tiếp",
+        MessageId::ApprovalIntentLabel => "Ý định: ",
+        MessageId::ApprovalMoreLines => "  … (+{count} dòng)",
+
         MessageId::CtxInspTitle => "Trình kiểm tra ngữ cảnh",
         MessageId::CtxInspSessionContext => "Ngữ cảnh phiên",
         MessageId::CtxInspSystemPrompt => "Cấu trúc lời nhắc hệ thống",
@@ -2018,6 +2155,31 @@ fn traditional_chinese(id: MessageId) -> Option<&'static str> {
             "{done} 已完成 · {running} 運行中 · {failed} 失敗 · {pending} 等待中"
         }
 
+        // Approval dialog.
+        MessageId::ApprovalRiskReview => "審查",
+        MessageId::ApprovalRiskDestructive => "破壞性",
+        MessageId::ApprovalCategorySafe => "安全",
+        MessageId::ApprovalCategoryFileWrite => "檔案寫入",
+        MessageId::ApprovalCategoryShell => "Shell 命令",
+        MessageId::ApprovalCategoryNetwork => "網路",
+        MessageId::ApprovalCategoryMcpRead => "MCP 讀取",
+        MessageId::ApprovalCategoryMcpAction => "MCP 操作",
+        MessageId::ApprovalCategoryUnknown => "未分類",
+        MessageId::ApprovalFieldType => "類型：",
+        MessageId::ApprovalFieldAbout => "說明：",
+        MessageId::ApprovalFieldImpact => "影響：",
+        MessageId::ApprovalFieldParams => "參數：",
+        MessageId::ApprovalOptionApproveOnce => "僅批准一次",
+        MessageId::ApprovalOptionApproveAlways => "本會話同類自動批准",
+        MessageId::ApprovalOptionDeny => "拒絕本次調用",
+        MessageId::ApprovalOptionAbortTurn => "終止本輪",
+        MessageId::ApprovalBlockTitle => "審批",
+        MessageId::ApprovalControlsHint => "  ·  v：完整參數  ·  Esc：終止",
+        MessageId::ApprovalChooseHint => "選擇：",
+        MessageId::ApprovalChooseAction => "Enter 執行選中項，或直接按 y/a/d",
+        MessageId::ApprovalIntentLabel => "意圖：",
+        MessageId::ApprovalMoreLines => "  … (還有 {count} 行)",
+
         MessageId::CtxInspTitle => "上下文檢查器",
         MessageId::CtxInspSessionContext => "會話上下文",
         MessageId::CtxInspSystemPrompt => "系統提示結構",
@@ -2065,6 +2227,13 @@ fn traditional_chinese(id: MessageId) -> Option<&'static str> {
         MessageId::CtxInspCacheTip => {
             "提示：穩定前綴區塊符合 DeepSeek V4 前綴快取條件。易變工作集的更改僅會破壞快取尾部。"
         }
+        MessageId::StatusPickerTitle => " 狀態列 ",
+        MessageId::StatusPickerInstruction => "選擇要在底部顯示的項目:",
+        MessageId::StatusPickerActionToggle => "切換 ",
+        MessageId::StatusPickerActionAll => "全部 ",
+        MessageId::StatusPickerActionNone => "無 ",
+        MessageId::StatusPickerActionSave => "儲存 ",
+        MessageId::StatusPickerActionCancel => "取消 ",
         other => chinese_simplified(other)?,
     })
 }
@@ -2078,6 +2247,13 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         MessageId::HistoryHintAccept => "Enter 確定",
         MessageId::HistoryHintRestore => "Esc 復元",
         MessageId::HistoryNoMatches => "  一致なし",
+        MessageId::StatusPickerTitle => " ステータス行 ",
+        MessageId::StatusPickerInstruction => "フッターに表示する項目を選択:",
+        MessageId::StatusPickerActionToggle => "切替 ",
+        MessageId::StatusPickerActionAll => "すべて ",
+        MessageId::StatusPickerActionNone => "なし ",
+        MessageId::StatusPickerActionSave => "保存 ",
+        MessageId::StatusPickerActionCancel => "キャンセル ",
         MessageId::ConfigTitle => "セッション設定",
         MessageId::ConfigModalTitle => " 設定 ",
         MessageId::ConfigSearchPlaceholder => "入力して絞り込み",
@@ -2138,6 +2314,7 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         MessageId::CmdExitDescription => "アプリを終了",
         MessageId::CmdExportDescription => "会話を Markdown にエクスポート",
         MessageId::CmdFeedbackDescription => "GitHub フィードバック URL を生成",
+        MessageId::CmdHfDescription => "Hugging Face MCP の設定と概念を確認",
         MessageId::CmdHelpDescription => "ヘルプを表示",
         MessageId::CmdHomeDescription => "統計とクイックアクション付きのホームダッシュボードを表示",
         MessageId::CmdHooksDescription => {
@@ -2204,6 +2381,7 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         MessageId::CmdNewDescription => "新しい保存済みセッションを開始",
         MessageId::CmdSessionsDescription => "セッション履歴ピッカーを開く",
         MessageId::CmdSettingsDescription => "永続化された設定を表示",
+        MessageId::CmdSidebarDescription => "Toggle or focus the right sidebar",
         MessageId::CmdSkillDescription => {
             "スキルを有効化、またはコミュニティスキルをインストール／更新／アンインストール／信頼"
         }
@@ -2474,8 +2652,33 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         MessageId::CtxMenuHelp => "ヘルプ",
         MessageId::CtxMenuHelpDesc => "キー操作とコマンド",
         MessageId::FanoutCounts => {
-            "{done} 完了 · {running} 実行中 · {failed} 失敗 · {pending} 待機"
+            "{done} 完了 · {running} 実行中 · {failed} 失敗 · {pending} 保留"
         }
+
+        // Approval dialog.
+        MessageId::ApprovalRiskReview => "確認",
+        MessageId::ApprovalRiskDestructive => "破壊的操作",
+        MessageId::ApprovalCategorySafe => "安全",
+        MessageId::ApprovalCategoryFileWrite => "ファイル書き込み",
+        MessageId::ApprovalCategoryShell => "シェルコマンド",
+        MessageId::ApprovalCategoryNetwork => "ネットワーク",
+        MessageId::ApprovalCategoryMcpRead => "MCP読み取り",
+        MessageId::ApprovalCategoryMcpAction => "MCPアクション",
+        MessageId::ApprovalCategoryUnknown => "未分類",
+        MessageId::ApprovalFieldType => "種類：",
+        MessageId::ApprovalFieldAbout => "詳細：",
+        MessageId::ApprovalFieldImpact => "影響：",
+        MessageId::ApprovalFieldParams => "パラメータ：",
+        MessageId::ApprovalOptionApproveOnce => "1回だけ承認",
+        MessageId::ApprovalOptionApproveAlways => "常に承認（この種類）",
+        MessageId::ApprovalOptionDeny => "拒否",
+        MessageId::ApprovalOptionAbortTurn => "中断",
+        MessageId::ApprovalBlockTitle => "承認",
+        MessageId::ApprovalControlsHint => "  ·  v: パラメータ表示  ·  Esc: 中止",
+        MessageId::ApprovalChooseHint => "選択：",
+        MessageId::ApprovalChooseAction => "Enterで選択、または y/a/d を直接入力",
+        MessageId::ApprovalIntentLabel => "意図：",
+        MessageId::ApprovalMoreLines => "  … (+{count} 行)",
 
         MessageId::CtxInspTitle => "コンテキストインスペクタ",
         MessageId::CtxInspSessionContext => "セッションコンテキスト",
@@ -2538,6 +2741,13 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
         MessageId::HistoryHintAccept => "Enter 接受",
         MessageId::HistoryHintRestore => "Esc 还原",
         MessageId::HistoryNoMatches => "  无匹配",
+        MessageId::StatusPickerTitle => " 状态行 ",
+        MessageId::StatusPickerInstruction => "选择要在底部显示的项目:",
+        MessageId::StatusPickerActionToggle => "切换 ",
+        MessageId::StatusPickerActionAll => "全部 ",
+        MessageId::StatusPickerActionNone => "无 ",
+        MessageId::StatusPickerActionSave => "保存 ",
+        MessageId::StatusPickerActionCancel => "取消 ",
         MessageId::ConfigTitle => "会话配置",
         MessageId::ConfigModalTitle => " 配置 ",
         MessageId::ConfigSearchPlaceholder => "输入以筛选",
@@ -2588,6 +2798,7 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
         MessageId::CmdExitDescription => "退出应用",
         MessageId::CmdExportDescription => "将对话导出为 Markdown",
         MessageId::CmdFeedbackDescription => "生成 GitHub 反馈链接",
+        MessageId::CmdHfDescription => "检查 Hugging Face MCP 设置和概念",
         MessageId::CmdHelpDescription => "显示帮助信息",
         MessageId::CmdHomeDescription => "显示主页面板，含统计与快捷操作",
         MessageId::CmdHooksDescription => "列出已配置的生命周期钩子（只读）",
@@ -2645,6 +2856,7 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
         MessageId::CmdSessionsDescription => "打开会话历史选择器",
         MessageId::CmdSettingsDescription => "显示持久化设置",
         MessageId::CmdSkillDescription => "激活技能，或安装/更新/卸载/信任社区技能",
+        MessageId::CmdSidebarDescription => "Toggle or focus the right sidebar",
         MessageId::CmdSkillsDescription => {
             "列出本地技能（用 `/skills <prefix>` 按名称前缀过滤，--remote 浏览精选注册表）"
         }
@@ -2881,6 +3093,31 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
             "{done} 已完成 · {running} 运行中 · {failed} 失败 · {pending} 等待中"
         }
 
+        // Approval dialog.
+        MessageId::ApprovalRiskReview => "审查",
+        MessageId::ApprovalRiskDestructive => "破坏性",
+        MessageId::ApprovalCategorySafe => "安全",
+        MessageId::ApprovalCategoryFileWrite => "文件写入",
+        MessageId::ApprovalCategoryShell => "Shell 命令",
+        MessageId::ApprovalCategoryNetwork => "网络",
+        MessageId::ApprovalCategoryMcpRead => "MCP 读取",
+        MessageId::ApprovalCategoryMcpAction => "MCP 操作",
+        MessageId::ApprovalCategoryUnknown => "未知",
+        MessageId::ApprovalFieldType => "类型：",
+        MessageId::ApprovalFieldAbout => "说明：",
+        MessageId::ApprovalFieldImpact => "影响：",
+        MessageId::ApprovalFieldParams => "参数：",
+        MessageId::ApprovalOptionApproveOnce => "仅本次批准",
+        MessageId::ApprovalOptionApproveAlways => "本会话同类自动批准",
+        MessageId::ApprovalOptionDeny => "拒绝本次调用",
+        MessageId::ApprovalOptionAbortTurn => "终止本轮",
+        MessageId::ApprovalBlockTitle => "审批",
+        MessageId::ApprovalControlsHint => "  ·  v：完整参数  ·  Esc：终止",
+        MessageId::ApprovalChooseHint => "选择：",
+        MessageId::ApprovalChooseAction => "Enter 执行选中项，或直接按 y/a/d",
+        MessageId::ApprovalIntentLabel => "意图：",
+        MessageId::ApprovalMoreLines => "  … (还有 {count} 行)",
+
         MessageId::CtxInspTitle => "上下文检查器",
         MessageId::CtxInspSessionContext => "会话上下文",
         MessageId::CtxInspSystemPrompt => "系统提示结构",
@@ -2940,6 +3177,13 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         MessageId::HistoryHintAccept => "Enter aceita",
         MessageId::HistoryHintRestore => "Esc restaura",
         MessageId::HistoryNoMatches => "  Sem resultados",
+        MessageId::StatusPickerTitle => " Linha de status ",
+        MessageId::StatusPickerInstruction => "Escolha os itens que deseja no rodapé:",
+        MessageId::StatusPickerActionToggle => "alternar ",
+        MessageId::StatusPickerActionAll => "todos ",
+        MessageId::StatusPickerActionNone => "nenhum ",
+        MessageId::StatusPickerActionSave => "salvar ",
+        MessageId::StatusPickerActionCancel => "cancelar ",
         MessageId::ConfigTitle => "Configuração da sessão",
         MessageId::ConfigModalTitle => " Config ",
         MessageId::ConfigSearchPlaceholder => "digite para filtrar",
@@ -3000,6 +3244,7 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         MessageId::CmdExitDescription => "Sair do aplicativo",
         MessageId::CmdExportDescription => "Exportar a conversa para markdown",
         MessageId::CmdFeedbackDescription => "Gerar uma URL de feedback no GitHub",
+        MessageId::CmdHfDescription => "Inspecionar configuracao e conceitos do Hugging Face MCP",
         MessageId::CmdHelpDescription => "Exibir informações de ajuda",
         MessageId::CmdHomeDescription => "Exibir o painel inicial com estatísticas e ações rápidas",
         MessageId::CmdHooksDescription => {
@@ -3072,6 +3317,7 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         MessageId::CmdNewDescription => "Iniciar uma nova sessão salva",
         MessageId::CmdSessionsDescription => "Abrir seletor de histórico de sessões",
         MessageId::CmdSettingsDescription => "Exibir as configurações persistidas",
+        MessageId::CmdSidebarDescription => "Toggle or focus the right sidebar",
         MessageId::CmdSkillDescription => {
             "Ativar uma skill, ou instalar/atualizar/desinstalar/confiar em uma skill da comunidade"
         }
@@ -3358,8 +3604,33 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         MessageId::CtxMenuHelp => "Ajuda",
         MessageId::CtxMenuHelpDesc => "atalhos de teclado e comandos",
         MessageId::FanoutCounts => {
-            "{done} concluído · {running} executando · {failed} falhou · {pending} pendente"
+            "{done} concluído · {running} em execução · {failed} falhou · {pending} pendente"
         }
+
+        // Approval dialog.
+        MessageId::ApprovalRiskReview => "REVISÃO",
+        MessageId::ApprovalRiskDestructive => "DESTRUTIVO",
+        MessageId::ApprovalCategorySafe => "Seguro",
+        MessageId::ApprovalCategoryFileWrite => "Escrita de Arquivo",
+        MessageId::ApprovalCategoryShell => "Comando Shell",
+        MessageId::ApprovalCategoryNetwork => "Rede",
+        MessageId::ApprovalCategoryMcpRead => "Leitura MCP",
+        MessageId::ApprovalCategoryMcpAction => "Ação MCP",
+        MessageId::ApprovalCategoryUnknown => "Desconhecido",
+        MessageId::ApprovalFieldType => "Tipo:",
+        MessageId::ApprovalFieldAbout => "Sobre:",
+        MessageId::ApprovalFieldImpact => "Impacto:",
+        MessageId::ApprovalFieldParams => "Parâmetros:",
+        MessageId::ApprovalOptionApproveOnce => "Aprovar uma vez",
+        MessageId::ApprovalOptionApproveAlways => "Aprovar sempre para este tipo",
+        MessageId::ApprovalOptionDeny => "Negar esta chamada",
+        MessageId::ApprovalOptionAbortTurn => "Abortar turno",
+        MessageId::ApprovalBlockTitle => "aprovação",
+        MessageId::ApprovalControlsHint => "  ·  v: parâmetros  ·  Esc: abortar",
+        MessageId::ApprovalChooseHint => "Escolha: ",
+        MessageId::ApprovalChooseAction => "Enter para selecionar, ou pressione y/a/d diretamente",
+        MessageId::ApprovalIntentLabel => "Intenção: ",
+        MessageId::ApprovalMoreLines => "  … (+{count} linhas)",
 
         MessageId::CtxInspTitle => "Inspetor de contexto",
         MessageId::CtxInspSessionContext => "Contexto da sessão",
@@ -3424,6 +3695,13 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
         MessageId::HistoryHintAccept => "Enter aceptar",
         MessageId::HistoryHintRestore => "Esc restaurar",
         MessageId::HistoryNoMatches => "  Sin resultados",
+        MessageId::StatusPickerTitle => " Línea de estado ",
+        MessageId::StatusPickerInstruction => "Elige los elementos que quieres en el pie:",
+        MessageId::StatusPickerActionToggle => "alternar ",
+        MessageId::StatusPickerActionAll => "todos ",
+        MessageId::StatusPickerActionNone => "ninguno ",
+        MessageId::StatusPickerActionSave => "guardar ",
+        MessageId::StatusPickerActionCancel => "cancelar ",
         MessageId::ConfigTitle => "Configuración de la sesión",
         MessageId::ConfigModalTitle => " Config ",
         MessageId::ConfigSearchPlaceholder => "escribe para filtrar",
@@ -3484,6 +3762,7 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
         MessageId::CmdExitDescription => "Salir de la aplicación",
         MessageId::CmdExportDescription => "Exportar la conversación a markdown",
         MessageId::CmdFeedbackDescription => "Generar una URL de feedback en GitHub",
+        MessageId::CmdHfDescription => "Inspeccionar configuracion y conceptos de Hugging Face MCP",
         MessageId::CmdHelpDescription => "Mostrar información de ayuda",
         MessageId::CmdHomeDescription => {
             "Mostrar el panel inicial con estadísticas y acciones rápidas"
@@ -3564,6 +3843,7 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
         MessageId::CmdNewDescription => "Iniciar una nueva sesión guardada",
         MessageId::CmdSessionsDescription => "Abrir el selector de sesiones",
         MessageId::CmdSettingsDescription => "Mostrar las configuraciones persistidas",
+        MessageId::CmdSidebarDescription => "Toggle or focus the right sidebar",
         MessageId::CmdSkillDescription => {
             "Activar una skill, o instalar/actualizar/desinstalar/confiar en una skill de la comunidad"
         }
@@ -3854,6 +4134,31 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
         MessageId::FanoutCounts => {
             "{done} completado · {running} ejecutando · {failed} falló · {pending} pendiente"
         }
+
+        // Approval dialog.
+        MessageId::ApprovalRiskReview => "REVISAR",
+        MessageId::ApprovalRiskDestructive => "DESTRUCTIVO",
+        MessageId::ApprovalCategorySafe => "Seguro",
+        MessageId::ApprovalCategoryFileWrite => "Escritura de Archivo",
+        MessageId::ApprovalCategoryShell => "Comando Shell",
+        MessageId::ApprovalCategoryNetwork => "Red",
+        MessageId::ApprovalCategoryMcpRead => "Lectura MCP",
+        MessageId::ApprovalCategoryMcpAction => "Acción MCP",
+        MessageId::ApprovalCategoryUnknown => "Desconocido",
+        MessageId::ApprovalFieldType => "Tipo:",
+        MessageId::ApprovalFieldAbout => "Acerca de:",
+        MessageId::ApprovalFieldImpact => "Impacto:",
+        MessageId::ApprovalFieldParams => "Parámetros:",
+        MessageId::ApprovalOptionApproveOnce => "Aprobar una vez",
+        MessageId::ApprovalOptionApproveAlways => "Aprobar siempre para este tipo",
+        MessageId::ApprovalOptionDeny => "Denegar esta llamada",
+        MessageId::ApprovalOptionAbortTurn => "Abortar turno",
+        MessageId::ApprovalBlockTitle => "aprobación",
+        MessageId::ApprovalControlsHint => "  ·  v: parámetros  ·  Esc: abortar",
+        MessageId::ApprovalChooseHint => "Elegir: ",
+        MessageId::ApprovalChooseAction => "Enter para seleccionar, o presione y/a/d directamente",
+        MessageId::ApprovalIntentLabel => "Intención: ",
+        MessageId::ApprovalMoreLines => "  … (+{count} líneas)",
 
         MessageId::CtxInspTitle => "Inspector de contexto",
         MessageId::CtxInspSessionContext => "Contexto de la sesión",

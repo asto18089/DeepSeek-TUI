@@ -7,6 +7,7 @@
 //! - Mode changes
 //! - Message submission
 //! - Error events
+//! - Turn completion
 //!
 //! Configuration is done via `[[hooks.hooks]]` in config.toml.
 
@@ -41,6 +42,8 @@ pub enum HookEvent {
     ModeChange,
     /// Triggered when an error occurs
     OnError,
+    /// Triggered after a turn completes and post-turn state has been updated
+    TurnEnd,
     /// Triggered when a sub-agent is spawned
     SubagentSpawn,
     /// Triggered when a sub-agent reaches a terminal state
@@ -66,6 +69,7 @@ impl HookEvent {
             HookEvent::ToolCallAfter => "tool_call_after",
             HookEvent::ModeChange => "mode_change",
             HookEvent::OnError => "on_error",
+            HookEvent::TurnEnd => "turn_end",
             HookEvent::SubagentSpawn => "subagent_spawn",
             HookEvent::SubagentComplete => "subagent_complete",
             HookEvent::ShellEnv => "shell_env",
@@ -478,6 +482,28 @@ enum MessageSubmitStdout {
     Unchanged,
     Replaced(String),
     Invalid(String),
+}
+
+/// Post-turn accumulated totals included in the `turn_end` observer payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnEndTotals {
+    pub session_tokens: u32,
+    pub conversation_tokens: u32,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+/// Input used to build the structured `turn_end` observer payload.
+pub struct TurnEndPayloadInput<'a> {
+    pub context: &'a HookContext,
+    pub turn_id: Option<&'a str>,
+    pub status: &'a str,
+    pub error: Option<&'a str>,
+    pub duration: Duration,
+    pub usage: &'a crate::models::Usage,
+    pub totals: TurnEndTotals,
+    pub tool_count: usize,
+    pub queued_message_count: usize,
 }
 
 /// Executor for running hooks
@@ -1051,7 +1077,7 @@ impl HookExecutor {
         let env = env_vars.clone();
         let wd = working_dir.clone();
 
-        // Spawn in a detached thread
+        // Spawn in a detached thread (fire-and-forget hook execution).
         std::thread::spawn(move || {
             let mut command = HookExecutor::build_shell_command(&cmd);
             command
@@ -1119,6 +1145,41 @@ fn message_submit_payload(context: &HookContext, text: &str) -> serde_json::Valu
         "model": context.model.as_deref(),
         "total_tokens": context.total_tokens,
     })
+}
+
+pub fn turn_end_payload(input: TurnEndPayloadInput<'_>) -> serde_json::Value {
+    json!({
+        "event": HookEvent::TurnEnd.as_str(),
+        "session_id": input.context.session_id.as_deref(),
+        "workspace": input.context.workspace.as_ref().map(|path| path.display().to_string()),
+        "mode": input.context.mode.as_deref(),
+        "model": input.context.model.as_deref(),
+        "turn_id": input.turn_id,
+        "status": input.status,
+        "error": input.error,
+        "duration_ms": duration_ms_saturating(input.duration),
+        "usage": {
+            "input_tokens": input.usage.input_tokens,
+            "output_tokens": input.usage.output_tokens,
+            "prompt_cache_hit_tokens": input.usage.prompt_cache_hit_tokens,
+            "prompt_cache_miss_tokens": input.usage.prompt_cache_miss_tokens,
+            "reasoning_tokens": input.usage.reasoning_tokens,
+            "reasoning_replay_tokens": input.usage.reasoning_replay_tokens,
+        },
+        "totals": {
+            "session_tokens": input.totals.session_tokens,
+            "conversation_tokens": input.totals.conversation_tokens,
+            "input_tokens": input.totals.input_tokens,
+            "output_tokens": input.totals.output_tokens,
+        },
+        "tool_count": input.tool_count,
+        "queued_message_count": input.queued_message_count,
+        "stop_hook_active": false,
+    })
+}
+
+fn duration_ms_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn parse_message_submit_stdout(stdout: &str) -> MessageSubmitStdout {
@@ -1343,8 +1404,68 @@ NOEQUAL line dropped
         assert_eq!(HookEvent::SessionStart.as_str(), "session_start");
         assert_eq!(HookEvent::ToolCallAfter.as_str(), "tool_call_after");
         assert_eq!(HookEvent::ModeChange.as_str(), "mode_change");
+        assert_eq!(HookEvent::TurnEnd.as_str(), "turn_end");
         assert_eq!(HookEvent::SubagentSpawn.as_str(), "subagent_spawn");
         assert_eq!(HookEvent::SubagentComplete.as_str(), "subagent_complete");
+    }
+
+    #[test]
+    fn turn_end_payload_contains_post_turn_observer_fields() {
+        let context = HookContext::new()
+            .with_session_id("sess_test")
+            .with_workspace(PathBuf::from("/tmp/codewhale"))
+            .with_mode("agent")
+            .with_model("deepseek-v4")
+            .with_tokens(125);
+        let usage = crate::models::Usage {
+            input_tokens: 40,
+            output_tokens: 9,
+            prompt_cache_hit_tokens: Some(10),
+            prompt_cache_miss_tokens: Some(30),
+            reasoning_tokens: Some(4),
+            reasoning_replay_tokens: Some(2),
+            server_tool_use: None,
+        };
+
+        let payload = super::turn_end_payload(TurnEndPayloadInput {
+            context: &context,
+            turn_id: Some("turn_123"),
+            status: "completed",
+            error: None,
+            duration: Duration::from_millis(321),
+            usage: &usage,
+            totals: TurnEndTotals {
+                session_tokens: 125,
+                conversation_tokens: 100,
+                input_tokens: 100,
+                output_tokens: 25,
+            },
+            tool_count: 2,
+            queued_message_count: 1,
+        });
+
+        assert_eq!(payload["event"], "turn_end");
+        assert_eq!(payload["session_id"], "sess_test");
+        assert_eq!(payload["workspace"], "/tmp/codewhale");
+        assert_eq!(payload["mode"], "agent");
+        assert_eq!(payload["model"], "deepseek-v4");
+        assert_eq!(payload["turn_id"], "turn_123");
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["error"], serde_json::Value::Null);
+        assert_eq!(payload["duration_ms"], 321);
+        assert_eq!(payload["usage"]["input_tokens"], 40);
+        assert_eq!(payload["usage"]["output_tokens"], 9);
+        assert_eq!(payload["usage"]["prompt_cache_hit_tokens"], 10);
+        assert_eq!(payload["usage"]["prompt_cache_miss_tokens"], 30);
+        assert_eq!(payload["usage"]["reasoning_tokens"], 4);
+        assert_eq!(payload["usage"]["reasoning_replay_tokens"], 2);
+        assert_eq!(payload["totals"]["session_tokens"], 125);
+        assert_eq!(payload["totals"]["conversation_tokens"], 100);
+        assert_eq!(payload["totals"]["input_tokens"], 100);
+        assert_eq!(payload["totals"]["output_tokens"], 25);
+        assert_eq!(payload["tool_count"], 2);
+        assert_eq!(payload["queued_message_count"], 1);
+        assert_eq!(payload["stop_hook_active"], false);
     }
 
     #[test]
@@ -1576,6 +1697,76 @@ cat > "{}"
         assert_eq!(captured["agent_id"], "agent_123");
         assert_eq!(captured["prompt_preview"], "inspect this");
         assert_eq!(captured["prompt_truncated"], false);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn turn_end_observer_hook_receives_stdin_json_and_ignores_stdout_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("turn_end.json");
+        let command = write_hook_script(
+            &dir,
+            "capture_turn_end.sh",
+            &format!(
+                r#"#!/bin/sh
+cat > "{}"
+printf '%s\n' '{{"text":"stdout is not a mutation contract"}}'
+"#,
+                out.display()
+            ),
+        );
+        let executor = HookExecutor::new(
+            HooksConfig {
+                enabled: true,
+                hooks: vec![Hook::new(HookEvent::TurnEnd, &command)],
+                ..Default::default()
+            },
+            dir.path().to_path_buf(),
+        );
+        let usage = crate::models::Usage {
+            input_tokens: 12,
+            output_tokens: 3,
+            prompt_cache_hit_tokens: None,
+            prompt_cache_miss_tokens: None,
+            reasoning_tokens: None,
+            reasoning_replay_tokens: None,
+            server_tool_use: None,
+        };
+        let context = submit_context(&dir).with_tokens(15);
+        let payload = super::turn_end_payload(TurnEndPayloadInput {
+            context: &context,
+            turn_id: Some("turn_observed"),
+            status: "completed",
+            error: None,
+            duration: Duration::from_millis(7),
+            usage: &usage,
+            totals: TurnEndTotals {
+                session_tokens: 15,
+                conversation_tokens: 15,
+                input_tokens: 12,
+                output_tokens: 3,
+            },
+            tool_count: 0,
+            queued_message_count: 0,
+        });
+
+        let results = executor.execute_json_observer(HookEvent::TurnEnd, &context, &payload);
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+        assert!(
+            results[0]
+                .stdout
+                .contains("stdout is not a mutation contract"),
+            "stdout is still captured for diagnostics"
+        );
+        let captured: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out).expect("payload written"))
+                .expect("valid JSON payload");
+        assert_eq!(captured["event"], "turn_end");
+        assert_eq!(captured["turn_id"], "turn_observed");
+        assert_eq!(captured["totals"]["input_tokens"], 12);
+        assert_eq!(captured["totals"]["output_tokens"], 3);
     }
 
     #[cfg(not(windows))]
@@ -1912,6 +2103,7 @@ exit 7
             HookEvent::ToolCallAfter,
             HookEvent::ModeChange,
             HookEvent::OnError,
+            HookEvent::TurnEnd,
             HookEvent::SubagentSpawn,
             HookEvent::SubagentComplete,
         ] {

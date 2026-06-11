@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Command safety analysis for shell execution
 //!
 //! This module provides pre-execution analysis of shell commands to detect
@@ -378,43 +376,38 @@ pub enum SafetyLevel {
 #[derive(Debug, Clone)]
 pub struct SafetyAnalysis {
     pub level: SafetyLevel,
-    pub command: String,
     pub reasons: Vec<String>,
     pub suggestions: Vec<String>,
 }
 
 impl SafetyAnalysis {
-    pub fn safe(command: &str) -> Self {
+    pub fn safe(_command: &str) -> Self {
         Self {
             level: SafetyLevel::Safe,
-            command: command.to_string(),
             reasons: vec!["Command is read-only".to_string()],
             suggestions: vec![],
         }
     }
 
-    pub fn workspace_safe(command: &str, reason: &str) -> Self {
+    pub fn workspace_safe(_command: &str, reason: &str) -> Self {
         Self {
             level: SafetyLevel::WorkspaceSafe,
-            command: command.to_string(),
             reasons: vec![reason.to_string()],
             suggestions: vec![],
         }
     }
 
-    pub fn requires_approval(command: &str, reasons: Vec<String>) -> Self {
+    pub fn requires_approval(_command: &str, reasons: Vec<String>) -> Self {
         Self {
             level: SafetyLevel::RequiresApproval,
-            command: command.to_string(),
             reasons,
             suggestions: vec![],
         }
     }
 
-    pub fn dangerous(command: &str, reasons: Vec<String>, suggestions: Vec<String>) -> Self {
+    pub fn dangerous(_command: &str, reasons: Vec<String>, suggestions: Vec<String>) -> Self {
         Self {
             level: SafetyLevel::Dangerous,
-            command: command.to_string(),
             reasons,
             suggestions,
         }
@@ -578,41 +571,11 @@ pub fn analyze_command(command: &str) -> SafetyAnalysis {
     let command_lower = command.to_lowercase();
     let command_trimmed = command.trim();
 
-    // pinvou3-fork: 多行命令不再一刀切 Dangerous。原硬规则误伤合理批量操作
-    // (例如 LLM 用 `\n` 串多个 `cp` / `mkdir`),业界 harness (Claude Code /
-    // Codex) 都不拦 newline。改成逐行 recurse 调用 analyze_command,取最严
-    // 级别 + 合并 reasons (附 line 号便于审计)。任一行 Dangerous → 整体 Dangerous,
-    // 否则取最严下限放行。null byte / heredoc 中的真危险 pattern 仍会被各行的
-    // analyze_destructive_patterns 抓到。
-    if command.contains('\n') || command.contains('\r') {
-        let lines: Vec<&str> = command
-            .split(|c| c == '\n' || c == '\r')
-            .filter(|l| !l.trim().is_empty())
-            .collect();
-        if lines.is_empty() {
-            // 全空白多行 — 当 noop,以前归 Dangerous 现在放行
-            return SafetyAnalysis::safe(command);
-        }
-        let mut worst_level = SafetyLevel::Safe;
-        let mut reasons = Vec::new();
-        let mut suggestions = Vec::new();
-        for (idx, line) in lines.iter().enumerate() {
-            let line_analysis = analyze_command(line);
-            worst_level = worst_level.max(line_analysis.level);
-            for r in line_analysis.reasons {
-                reasons.push(format!("line {}: {}", idx + 1, r));
-            }
-            for s in line_analysis.suggestions {
-                suggestions.push(format!("line {}: {}", idx + 1, s));
-            }
-        }
-        return SafetyAnalysis {
-            level: worst_level,
-            command: command.to_string(),
-            reasons,
-            suggestions,
-        };
-    }
+    // [pinvou3-fork] 原 C4-a「多行命令逐行取最严级别」块已删 —— v0.8.57 上游 refactor
+    // (18df8db0 "extract neutral command support")自带 split_command_segments(按
+    // \n / && / || / ; 分段)+ analyze_destructive_patterns 逐段判 rm/find,已覆盖
+    // 「LLM 用 \n 串多个 cp/mkdir 不被一刀切 Dangerous」的原意,故撤销本 fork 块取上游逻辑
+    // (上游 SafetyAnalysis 也去掉了 command 字段)。详见本次 sync §C4。
 
     if command.contains('\0') {
         return SafetyAnalysis::dangerous(
@@ -1044,72 +1007,6 @@ fn is_workspace_safe_command(command: &str) -> bool {
     false
 }
 
-/// Check if a path escapes the workspace
-pub fn path_escapes_workspace(path: &str, workspace: &str) -> bool {
-    let path_lower = normalize_safety_path(path);
-    let workspace_lower = normalize_safety_path(workspace);
-
-    // Check for obvious escape patterns
-    if path_lower.starts_with("~/") || path_lower.starts_with("$home") {
-        return true;
-    }
-
-    if is_absolute_safety_path(&path_lower) {
-        let path_components = lexical_components(&path_lower);
-        let workspace_components = lexical_components(&workspace_lower);
-        return !components_start_with(&path_components, &workspace_components);
-    }
-
-    // Walk the path components. Track depth relative to the workspace root:
-    // non-`..` components increment depth, `..` components decrement it.
-    // If depth ever goes negative, the path escapes the workspace boundary.
-    // This correctly distinguishes genuine traversal like `../outside` from
-    // names that happen to contain consecutive dots like `foo..bar`.
-    let mut depth: i32 = 0;
-    for component in path_lower.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => depth -= 1,
-            _ => depth += 1,
-        }
-        if depth < 0 {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn normalize_safety_path(path: &str) -> String {
-    path.trim().replace('\\', "/").to_lowercase()
-}
-
-fn is_absolute_safety_path(path: &str) -> bool {
-    path.starts_with('/')
-        || path
-            .as_bytes()
-            .get(1..3)
-            .is_some_and(|bytes| bytes[0] == b':' && bytes[1] == b'/')
-}
-
-fn lexical_components(path: &str) -> Vec<&str> {
-    let mut components = Vec::new();
-    for component in path.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                components.pop();
-            }
-            _ => components.push(component),
-        }
-    }
-    components
-}
-
-fn components_start_with(path: &[&str], prefix: &[&str]) -> bool {
-    path.len() >= prefix.len() && path.iter().zip(prefix.iter()).all(|(a, b)| a == b)
-}
-
 /// Parse a command and extract the primary command name
 pub fn extract_primary_command(command: &str) -> Option<&str> {
     let trimmed = command.trim();
@@ -1122,56 +1019,6 @@ pub fn extract_primary_command(command: &str) -> Option<&str> {
             .find(|s| !s.contains('=') && *s != "env")
     } else {
         trimmed.split_whitespace().next()
-    }
-}
-
-/// Categorize commands into groups
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandCategory {
-    FileSystem,
-    Network,
-    Process,
-    Package,
-    Git,
-    Build,
-    System,
-    Shell,
-    Other,
-}
-
-/// Get the category of a command
-pub fn categorize_command(command: &str) -> CommandCategory {
-    let primary = match extract_primary_command(command) {
-        Some(cmd) => cmd.to_lowercase(),
-        None => return CommandCategory::Other,
-    };
-
-    match primary.as_str() {
-        "ls" | "dir" | "cat" | "head" | "tail" | "less" | "more" | "cp" | "mv" | "rm" | "mkdir"
-        | "rmdir" | "touch" | "chmod" | "chown" | "ln" | "find" | "fd" | "locate" | "stat"
-        | "file" => CommandCategory::FileSystem,
-
-        "curl" | "wget" | "fetch" | "nc" | "netcat" | "ssh" | "scp" | "sftp" | "rsync" | "ftp"
-        | "ping" | "traceroute" | "nslookup" | "dig" | "host" | "nmap" => CommandCategory::Network,
-
-        "ps" | "top" | "htop" | "kill" | "killall" | "pkill" | "pgrep" | "nice" | "renice"
-        | "nohup" | "timeout" => CommandCategory::Process,
-
-        "npm" | "yarn" | "pnpm" | "pip" | "pip3" | "brew" | "apt" | "apt-get" | "yum" | "dnf"
-        | "pacman" => CommandCategory::Package,
-
-        "git" | "gh" | "hub" => CommandCategory::Git,
-
-        "make" | "cmake" | "ninja" | "meson" | "cargo" | "go" | "gcc" | "g++" | "clang"
-        | "rustc" | "javac" | "tsc" => CommandCategory::Build,
-
-        "sudo" | "su" | "systemctl" | "service" | "shutdown" | "reboot" | "mount" | "umount"
-        | "fdisk" | "parted" => CommandCategory::System,
-
-        "bash" | "sh" | "zsh" | "fish" | "csh" | "tcsh" | "dash" | "source" | "." | "exec"
-        | "eval" => CommandCategory::Shell,
-
-        _ => CommandCategory::Other,
     }
 }
 
@@ -1259,7 +1106,7 @@ mod tests {
             SafetyLevel::Dangerous
         );
         assert_ne!(
-            analyze_command("cargo run --bin deepseek -- eval").level,
+            analyze_command("cargo run --bin codewhale -- eval").level,
             SafetyLevel::Dangerous
         );
     }
@@ -1283,7 +1130,7 @@ mod tests {
         // contain the substring "eval" but are not eval invocations.
         // Guard against the naive `command.contains("eval")` regression
         // — these should stay safe / workspace-safe, never Dangerous.
-        let evaluate_safe = analyze_command("cargo run --bin deepseek -- eval").level;
+        let evaluate_safe = analyze_command("cargo run --bin codewhale -- eval").level;
         assert_ne!(
             evaluate_safe,
             SafetyLevel::Dangerous,
@@ -1354,62 +1201,6 @@ mod tests {
     }
 
     #[test]
-    fn test_path_escapes_workspace() {
-        assert!(path_escapes_workspace("/etc/passwd", "/home/user/project"));
-        assert!(path_escapes_workspace("~/secret", "/home/user/project"));
-        assert!(!path_escapes_workspace(
-            "./src/main.rs",
-            "/home/user/project"
-        ));
-    }
-
-    #[test]
-    fn test_path_escapes_workspace_doesnt_flag_double_dot_in_names() {
-        // Names like `foo..bar` should NOT be flagged as path traversal
-        assert!(!path_escapes_workspace(
-            "some..file.txt",
-            "/home/user/project"
-        ));
-        assert!(!path_escapes_workspace(
-            "./dir..name/file.txt",
-            "/home/user/project"
-        ));
-    }
-
-    #[test]
-    fn test_path_escapes_workspace_detects_genuine_traversal() {
-        assert!(path_escapes_workspace("../outside", "/home/user/project"));
-        assert!(path_escapes_workspace(
-            "..\\outside",
-            "C:\\Users\\me\\project"
-        ));
-        assert!(path_escapes_workspace(
-            "./subdir/../../etc/passwd",
-            "/home/user/project"
-        ));
-        assert!(path_escapes_workspace(
-            "/home/user/project/../secret",
-            "/home/user/project"
-        ));
-        assert!(path_escapes_workspace(
-            "C:\\Users\\me\\project\\..\\secret",
-            "C:\\Users\\me\\project"
-        ));
-    }
-
-    #[test]
-    fn test_path_escapes_workspace_allows_absolute_workspace_children() {
-        assert!(!path_escapes_workspace(
-            "/home/user/project/src/main.rs",
-            "/home/user/project"
-        ));
-        assert!(!path_escapes_workspace(
-            "C:\\Users\\me\\project\\src\\main.rs",
-            "C:\\Users\\me\\project"
-        ));
-    }
-
-    #[test]
     fn test_extract_primary_command() {
         assert_eq!(extract_primary_command("ls -la"), Some("ls"));
         assert_eq!(
@@ -1417,21 +1208,6 @@ mod tests {
             Some("cargo")
         );
         assert_eq!(extract_primary_command("  git status  "), Some("git"));
-    }
-
-    #[test]
-    fn test_categorize_command() {
-        assert_eq!(categorize_command("ls -la"), CommandCategory::FileSystem);
-        assert_eq!(
-            categorize_command("curl https://example.com"),
-            CommandCategory::Network
-        );
-        assert_eq!(categorize_command("git status"), CommandCategory::Git);
-        assert_eq!(categorize_command("npm install"), CommandCategory::Package);
-        assert_eq!(
-            categorize_command("sudo apt update"),
-            CommandCategory::System
-        );
     }
 
     // ── classify_command tests ────────────────────────────────────────────────
@@ -1711,17 +1487,15 @@ mod tests {
 
     #[test]
     fn multiline_with_rm_rf_root_is_blocked() {
+        // [pinvou3-fork] C4-a「line N 标签」断言已删(C4-a 撤除);保留「多行含 rm -rf /
+        // 必须 Dangerous」安全回归 —— 现由上游 split_command_segments(按 \n 分段)+
+        // analyze_destructive_patterns 逐段判 rm 提供。
         let cmd = "echo start\nrm -rf /\necho done";
         let analysis = analyze_command(cmd);
         assert_eq!(
             analysis.level,
             SafetyLevel::Dangerous,
             "multi-line containing `rm -rf /` must be Dangerous"
-        );
-        assert!(
-            analysis.reasons.iter().any(|r| r.contains("line 2")),
-            "must surface which line was dangerous, got {:?}",
-            analysis.reasons
         );
     }
 
@@ -1739,15 +1513,8 @@ mod tests {
         assert!(analyze_command(cmd).level < SafetyLevel::Dangerous);
     }
 
-    #[test]
-    fn whitespace_only_multiline_is_safe() {
-        // 全空行/纯空白多行 — 当 noop 放行 (历史上是 Dangerous)
-        assert_eq!(
-            analyze_command("\n\n  \n").level,
-            SafetyLevel::Safe,
-            "empty multi-line should not be Dangerous"
-        );
-    }
+    // [pinvou3-fork] `whitespace_only_multiline_is_safe` 已删:C4-a 的「纯空白多行→Safe
+    // noop」特判随 C4-a 撤除;上游对空命令归 RequiresApproval(生产 Yolo 下 auto 审批,无影响)。
 
     #[test]
     fn multiline_takes_worst_level_across_lines() {

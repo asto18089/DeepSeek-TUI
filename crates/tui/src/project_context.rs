@@ -371,6 +371,26 @@ struct ReadmePack {
 /// sorted entries, bounded README text, and sorted JSON object fields. It does
 /// not include timestamps, random ids, absolute temp paths, or live git state.
 pub fn generate_project_context_pack(workspace: &Path) -> Option<String> {
+    let pack = build_project_context_pack(workspace)?;
+    let json = serde_json::to_string_pretty(&pack).ok()?;
+    Some(format!(
+        "## Project Context Pack\n\n<project_context_pack>\n{json}\n</project_context_pack>"
+    ))
+}
+
+// [pinvou3-fork] 上游 0.8.54+ 新增,唯一调用者是 auto_generate_context 的 disk 写入路径,
+// pinvou3 已砍空该函数(走 Inline 注入)→ 此处无调用者。保留为 shell 防上游 sync 回退,
+// 标 allow(dead_code) 避免 unused 警告。
+#[allow(dead_code)]
+fn generate_bounded_project_overview(workspace: &Path) -> Option<String> {
+    let pack = build_project_context_pack(workspace)?;
+    let json = serde_json::to_string_pretty(&pack).ok()?;
+    Some(format!(
+        "## Bounded Project Overview\n\n```json\n{json}\n```"
+    ))
+}
+
+fn build_project_context_pack(workspace: &Path) -> Option<ProjectContextPack> {
     let mut entries = Vec::new();
     collect_pack_entries(workspace, workspace, 0, &mut entries);
     sort_pack_paths(&mut entries);
@@ -398,7 +418,7 @@ pub fn generate_project_context_pack(workspace: &Path) -> Option<String> {
     counts.insert("directory_entries".to_string(), entries.len());
     counts.insert("key_source_files".to_string(), key_source_files.len());
 
-    let pack = ProjectContextPack {
+    Some(ProjectContextPack {
         project_name: workspace
             .file_name()
             .and_then(|name| name.to_str())
@@ -409,12 +429,7 @@ pub fn generate_project_context_pack(workspace: &Path) -> Option<String> {
         config_files,
         key_source_files,
         counts,
-    };
-
-    let json = serde_json::to_string_pretty(&pack).ok()?;
-    Some(format!(
-        "## Project Context Pack\n\n<project_context_pack>\n{json}\n</project_context_pack>"
-    ))
+    })
 }
 
 fn collect_pack_entries(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
@@ -661,20 +676,45 @@ pub fn load_project_context(workspace: &Path) -> ProjectContext {
 ///
 /// This allows for monorepo setups where a root AGENTS.md applies to all subdirectories.
 pub fn load_project_context_with_parents(workspace: &Path) -> ProjectContext {
-    load_project_context_with_parents_and_home(workspace, dirs::home_dir().as_deref())
+    load_project_context_with_parents_cached_and_home(workspace, dirs::home_dir().as_deref())
+}
+
+fn load_project_context_with_parents_cached_and_home(
+    workspace: &Path,
+    home_dir: Option<&Path>,
+) -> ProjectContext {
+    let workspace = canonicalize_workspace_or_keep(workspace);
+    let pre_load_key = crate::project_context_cache::compute_cache_key(&workspace, home_dir);
+    if let Some(ctx) = crate::project_context_cache::lookup(&pre_load_key) {
+        return ctx;
+    }
+
+    let ctx = load_project_context_with_parents_and_home(&workspace, home_dir);
+    let post_load_key = crate::project_context_cache::compute_cache_key(&workspace, home_dir);
+    crate::project_context_cache::store(post_load_key, ctx.clone());
+    ctx
 }
 
 fn load_project_context_with_parents_and_home(
     workspace: &Path,
     home_dir: Option<&Path>,
 ) -> ProjectContext {
+    let workspace_canonical = canonicalize_workspace_or_keep(workspace);
     let mut ctx = load_project_context(workspace);
+    let parent_search_stop = project_context_parent_search_stop_dir();
 
     // If no context found in workspace, check parent directories
     if !ctx.has_instructions() {
-        let mut current = workspace.parent();
+        let mut current = workspace_canonical.parent();
 
         while let Some(parent) = current {
+            if parent_search_stop
+                .as_deref()
+                .is_some_and(|stop| parent == stop)
+            {
+                break;
+            }
+
             let parent_ctx = load_project_context(parent);
             ctx.warnings.extend(parent_ctx.warnings.iter().cloned());
             if parent_ctx.has_instructions() {
@@ -716,7 +756,7 @@ fn load_project_context_with_parents_and_home(
         }
     }
 
-    // Auto-generate .deepseek/instructions.md when no context file exists anywhere.
+    // Auto-generate .codewhale/instructions.md when no context file exists anywhere.
     // This avoids the per-turn filesystem scan fallback in prompts.rs that
     // breaks KV prefix cache stability.
     if !ctx.has_instructions()
@@ -747,6 +787,92 @@ fn load_project_context_with_parents_and_home(
     ctx
 }
 
+pub(crate) fn project_context_cache_candidate_paths(
+    workspace: &Path,
+    home_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let workspace = canonicalize_workspace_or_keep(workspace);
+    let mut paths = Vec::new();
+    let parent_search_stop = project_context_parent_search_stop_dir();
+
+    let mut current = Some(workspace.as_path());
+    while let Some(dir) = current {
+        if parent_search_stop
+            .as_deref()
+            .is_some_and(|stop| dir == stop)
+        {
+            break;
+        }
+
+        for filename in PROJECT_CONTEXT_FILES {
+            paths.push(dir.join(filename));
+        }
+        current = dir.parent();
+    }
+
+    if let Some(home) = home_dir {
+        for candidate in global_context_relative_paths() {
+            paths.push(join_relative_components(home, candidate));
+        }
+    }
+
+    paths.extend(repo_constitution_candidate_paths(&workspace));
+    paths.push(workspace.join(".deepseek").join("trusted"));
+    paths.push(workspace.join(".deepseek").join("trust.json"));
+    paths.extend(crate::config::workspace_trust_config_candidate_paths());
+
+    paths
+}
+
+fn repo_constitution_candidate_paths(workspace: &Path) -> Vec<PathBuf> {
+    let git_root = crate::project_doc::find_git_root(workspace);
+    let mut current = workspace.to_path_buf();
+    let mut paths = Vec::new();
+    loop {
+        paths.push(join_relative_components(
+            &current,
+            REPO_CONSTITUTION_RELATIVE_PATH,
+        ));
+        if let Some(ref root) = git_root
+            && current == *root
+        {
+            break;
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    paths
+}
+
+fn global_context_relative_paths() -> [&'static [&'static str]; 6] {
+    [
+        GLOBAL_AGENTS_RELATIVE_PATH,
+        GLOBAL_AGENTS_VENDOR_NEUTRAL_PATH,
+        GLOBAL_AGENTS_LEGACY_PATH,
+        GLOBAL_WHALE_RELATIVE_PATH,
+        GLOBAL_WHALE_VENDOR_NEUTRAL_PATH,
+        GLOBAL_WHALE_LEGACY_PATH,
+    ]
+}
+
+fn join_relative_components(base: &Path, relative: &[&str]) -> PathBuf {
+    let mut path = base.to_path_buf();
+    for component in relative {
+        path.push(component);
+    }
+    path
+}
+
+fn canonicalize_workspace_or_keep(workspace: &Path) -> PathBuf {
+    fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf())
+}
+
+fn project_context_parent_search_stop_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| canonicalize_workspace_or_keep(&home))
+}
+
 /// Combine global user-wide preferences with a project-local
 /// AGENTS.md/CLAUDE.md/instructions.md. Global comes first so
 /// workspace-specific rules can override it — the model reads in declared
@@ -770,10 +896,11 @@ fn merge_global_and_project_instructions(
 fn load_global_agents_context(workspace: &Path, home_dir: Option<&Path>) -> Option<ProjectContext> {
     let home = home_dir?;
 
-    // pinvou3 fork (P-brand cleanup): GLOBAL_PATHS 已砍空,
-    // pinvou3 不识别其他 AI 工具的 ~/.codewhale/AGENTS.md / ~/.agents/WHALE.md /
-    // ~/.deepseek/WHALE.md 等全局 fallback。这里早返回 None,留函数 shell 防上游
-    // sync 时回退;真正的 pinvou3 workspace context 通过 inline 注入。
+    // [pinvou3-fork] GLOBAL_PATHS 已砍空,pinvou3 不识别其他 AI 工具的
+    // ~/.codewhale/AGENTS.md / ~/.agents/WHALE.md / ~/.deepseek/WHALE.md 等全局
+    // fallback。这里早返回 None,留函数 shell 防上游 sync 时回退;真正的 pinvou3
+    // workspace context 通过 inline 注入(InstructionSource::Inline)。
+    // v0.8.57:上游把全局优先级扩到 AGENTS.md+WHALE.md 六路,pinvou3 仍一律短路。
     let candidates: &[&[&str]] = GLOBAL_PATHS;
     if candidates.is_empty() {
         let _ = home;
@@ -782,11 +909,8 @@ fn load_global_agents_context(workspace: &Path, home_dir: Option<&Path>) -> Opti
 
     let mut warnings = Vec::new();
 
-    for candidate in candidates {
-        let mut path = home.to_path_buf();
-        for component in *candidate {
-            path.push(component);
-        }
+    for candidate in global_context_relative_paths() {
+        let path = join_relative_components(home, candidate);
 
         if path.exists() && path.is_file() {
             match load_context_file(&path) {
@@ -820,11 +944,10 @@ fn load_global_agents_context(workspace: &Path, home_dir: Option<&Path>) -> Opti
 /// `.codewhale/instructions.md` (or `.deepseek/instructions.md` as legacy
 /// fallback). Returns the generated content on success.
 fn auto_generate_context(_workspace: &Path) -> Option<String> {
-    // pinvou3 fork (C 方案 P-no-disk 最终态): PROJECT_CONTEXT_FILES 砍空后
-    // workspace 上下文走 INSTRUCTIONS_MD §0 内嵌(Inline),不再有任何 disk 文件,
-    // 也不需要 auto-gen 任何 disk 内容。函数保留 shell 防上游 sync 时直接回退;
-    // 永不触发(因为 load_project_context 先扫 PROJECT_CONTEXT_FILES 砍空 → 无入口
-    // 调到这里)。
+    // [pinvou3-fork] PROJECT_CONTEXT_FILES 砍空后 workspace 上下文走 INSTRUCTIONS_MD §0
+    // 内嵌(InstructionSource::Inline),不再有任何 disk 文件,也不需要 auto-gen 任何
+    // disk 内容(且 §5 禁写 ~/.codewhale)。函数保留 shell 防上游 sync 时直接回退;
+    // 永不触发(load_project_context 先扫砍空的 PROJECT_CONTEXT_FILES → 无入口调到这里)。
     None
 }
 
@@ -1366,6 +1489,184 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "pinvou3 fork(C5): auto_generate_context 砍空(workspace context 走 Inline 注入,不落 disk)"]
+    fn auto_generated_context_is_bounded_for_many_file_workspace() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let home = tempdir().expect("home tempdir");
+        let noisy = workspace.path().join("aaa-many-files");
+        fs::create_dir_all(&noisy).expect("mkdir noisy");
+        for i in 0..1000 {
+            fs::write(noisy.join(format!("file-{i:04}.rs")), "fn noisy() {}").expect("write noisy");
+        }
+        fs::create_dir_all(workspace.path().join("zzz-important")).expect("mkdir important");
+        fs::write(
+            workspace.path().join("zzz-important").join("main.rs"),
+            "fn important() {}",
+        )
+        .expect("write important");
+
+        let start = std::time::Instant::now();
+        let ctx = load_project_context_with_parents_and_home(workspace.path(), Some(home.path()));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "auto-generated context should stay bounded, took {elapsed:?}"
+        );
+        assert!(ctx.has_instructions());
+
+        let generated_path = workspace.path().join(".codewhale").join("instructions.md");
+        assert_eq!(ctx.source_path.as_deref(), Some(generated_path.as_path()));
+        let generated = fs::read_to_string(&generated_path).expect("read generated");
+        assert!(generated.contains("Project Context (Auto-generated)"));
+        assert!(generated.contains("Bounded Project Overview"));
+        assert!(!generated.contains("<project_context_pack>"));
+        assert!(
+            generated.contains("\"zzz-important/\""),
+            "later top-level project areas should remain visible:\n{generated}"
+        );
+        let noisy_count = generated.matches("aaa-many-files/file-").count();
+        assert!(
+            noisy_count < 300,
+            "generated context should not list the whole noisy directory; saw {noisy_count}"
+        );
+        assert!(
+            !generated.contains("file-0999.rs"),
+            "bounded context should omit the tail of the noisy directory"
+        );
+    }
+
+    #[test]
+    #[ignore = "pinvou3 fork(C5): PROJECT_CONTEXT_FILES 砍空,不读 workspace AGENTS.md"]
+    fn cached_context_reflects_overwritten_agents_md() {
+        crate::project_context_cache::clear();
+        let workspace = tempdir().expect("workspace tempdir");
+        let home = tempdir().expect("home tempdir");
+        let agents = workspace.path().join("AGENTS.md");
+        fs::write(&agents, "alpha").expect("write alpha");
+
+        let first =
+            load_project_context_with_parents_cached_and_home(workspace.path(), Some(home.path()));
+        assert!(
+            first
+                .instructions
+                .as_deref()
+                .is_some_and(|s| s.contains("alpha")),
+            "expected alpha instructions: {:?}",
+            first.instructions
+        );
+
+        fs::write(&agents, "bravo").expect("write bravo");
+        let second =
+            load_project_context_with_parents_cached_and_home(workspace.path(), Some(home.path()));
+
+        assert!(
+            second
+                .instructions
+                .as_deref()
+                .is_some_and(|s| s.contains("bravo")),
+            "cache must invalidate on same-length content overwrite: {:?}",
+            second.instructions
+        );
+    }
+
+    #[test]
+    #[ignore = "pinvou3 fork(C5): load_repo_constitution_block 短路,constitution_block 恒 None"]
+    fn cached_context_reflects_constitution_json_change() {
+        crate::project_context_cache::clear();
+        let workspace = tempdir().expect("workspace tempdir");
+        let home = tempdir().expect("home tempdir");
+        fs::create_dir(workspace.path().join(".git")).expect("mkdir git");
+        fs::create_dir(workspace.path().join(".codewhale")).expect("mkdir codewhale");
+        let constitution = workspace
+            .path()
+            .join(".codewhale")
+            .join("constitution.json");
+        fs::write(
+            &constitution,
+            r#"{"schema_version":1,"authority":["alpha authority"]}"#,
+        )
+        .expect("write alpha constitution");
+
+        let first =
+            load_project_context_with_parents_cached_and_home(workspace.path(), Some(home.path()));
+        assert!(
+            first
+                .constitution_block
+                .as_deref()
+                .is_some_and(|s| s.contains("alpha authority")),
+            "expected alpha constitution block: {:?}",
+            first.constitution_block
+        );
+
+        fs::write(
+            &constitution,
+            r#"{"schema_version":1,"authority":["bravo authority"]}"#,
+        )
+        .expect("write bravo constitution");
+        let second =
+            load_project_context_with_parents_cached_and_home(workspace.path(), Some(home.path()));
+
+        assert!(
+            second
+                .constitution_block
+                .as_deref()
+                .is_some_and(|s| s.contains("bravo authority")),
+            "cache must invalidate when constitution changes: {:?}",
+            second.constitution_block
+        );
+    }
+
+    #[test]
+    #[ignore = "pinvou3 fork(C5): auto_generate_context 砍空,无 disk instructions 再生路径"]
+    fn cached_context_regenerates_after_auto_generated_context_is_deleted() {
+        crate::project_context_cache::clear();
+        let workspace = tempdir().expect("workspace tempdir");
+        let home = tempdir().expect("home tempdir");
+
+        let first =
+            load_project_context_with_parents_cached_and_home(workspace.path(), Some(home.path()));
+        assert!(first.has_instructions());
+        let generated_path = workspace.path().join(".codewhale").join("instructions.md");
+        assert!(generated_path.is_file(), "expected generated instructions");
+
+        fs::remove_file(&generated_path).expect("remove generated instructions");
+        assert!(!generated_path.exists());
+
+        let second =
+            load_project_context_with_parents_cached_and_home(workspace.path(), Some(home.path()));
+        assert!(second.has_instructions());
+        assert!(
+            generated_path.is_file(),
+            "cache hit under the missing-file signature would skip regeneration"
+        );
+    }
+
+    #[test]
+    #[ignore = "pinvou3 fork(C5): 依赖 workspace AGENTS.md 作指令源,PROJECT_CONTEXT_FILES 砍空"]
+    fn cached_context_reflects_trust_marker_created() {
+        crate::project_context_cache::clear();
+        let workspace = tempdir().expect("workspace tempdir");
+        let home = tempdir().expect("home tempdir");
+        fs::write(workspace.path().join("AGENTS.md"), "instructions").expect("write agents");
+
+        let first =
+            load_project_context_with_parents_cached_and_home(workspace.path(), Some(home.path()));
+        assert!(!first.is_trusted);
+
+        let trust_dir = workspace.path().join(".deepseek");
+        fs::create_dir(&trust_dir).expect("mkdir trust dir");
+        fs::write(trust_dir.join("trusted"), "").expect("write trust marker");
+
+        let second =
+            load_project_context_with_parents_cached_and_home(workspace.path(), Some(home.path()));
+        assert!(
+            second.is_trusted,
+            "cache must invalidate when trust marker appears"
+        );
+    }
+
+    #[test]
     fn project_context_pack_sort_is_cross_platform_and_priority_aware() {
         let mut unix_paths = vec![
             "src/z.rs".to_string(),
@@ -1651,7 +1952,7 @@ mod tests {
             ctx.instructions
                 .as_ref()
                 .unwrap()
-                .contains("Project Structure (Auto-generated)")
+                .contains("Project Context (Auto-generated)")
         );
     }
 }

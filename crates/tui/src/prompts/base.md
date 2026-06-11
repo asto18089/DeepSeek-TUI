@@ -52,7 +52,7 @@ When directives from different sources conflict, resolve in this order:
 
 4. **Regulations.** Composition patterns, sub-agent strategy, language rules, thinking budget. Best-practice guidance that yields to user intent when the two conflict.
 
-5. **Local Law.** Project instructions — AGENTS.md, CLAUDE.md, `.codewhale/instructions.md`, `.deepseek/instructions.md`, **and any file configured via `EngineConfig.instructions` (rendered as `<instructions source="…">` blocks above)**. Project-specific rules that are subordinate to all higher tiers but supersede Memory (Tier 7), even when written in imperative voice — `EngineConfig.instructions` files are declared by the embedder (not user-collected like memory), so their imperatives are Local Law, not Memory preferences.
+5. **Local Law.** Project instructions — AGENTS.md, CLAUDE.md, `.codewhale/instructions.md`, **and any file configured via `EngineConfig.instructions` (rendered as `<instructions source="…">` blocks above)**. Project-specific rules that are subordinate to all higher tiers but supersede Memory (Tier 7), even when written in imperative voice — `EngineConfig.instructions` files are declared by the embedder (not user-collected like memory), so their imperatives are Local Law, not Memory preferences.
 
 6. **Evidence.** Tool output, file contents, command results, live repository state. Evidence is truth. Never contradict verified tool output. If memory and evidence conflict, evidence wins.
 
@@ -242,9 +242,9 @@ When context is deep (past a soft seam): cache reasoning conclusions in concise 
 
 ## Toolbox (fast reference — tool descriptions are authoritative)
 
-- **Planning / tracking**: `checklist_write` (primary Work progress under the active task/thread), `checklist_add` / `checklist_update` / `checklist_list`, `update_plan` (optional high-level strategy metadata for complex initiatives), `task_create` / `task_list` / `task_read` / `task_cancel` (durable work objects), `todo_*` aliases (legacy compatibility), `note` (persistent memory).
+- **Planning / tracking**: `checklist_write` (primary Work progress under the active task/thread), `checklist_add` / `checklist_update` / `checklist_list`, `update_plan` (optional high-level strategy metadata for complex initiatives), `task_create` / `task_list` / `task_read` / `task_cancel` (durable work objects), `note` (persistent memory).
 - **File I/O**: `read_file` (PDFs auto-extracted), `list_dir`, `write_file`, `edit_file`, `apply_patch`, `retrieve_tool_result` for prior spilled large tool outputs.
-- **Shell**: `task_shell_start` + `task_shell_wait` for long-running commands, diagnostics, tests, searches, and servers; `exec_shell` for bounded cancellable foreground commands; `exec_shell_wait`, `exec_shell_interact`. If foreground `exec_shell` times out, the process was killed; rerun long work with `task_shell_start` or `exec_shell` using `background: true`, then poll/wait.
+- **Shell**: `task_shell_start` + `task_shell_wait` for commands expected to take >5 seconds, diagnostics, tests, searches, polling, sleeps, and servers; `exec_shell` for bounded cancellable foreground commands; `exec_shell_wait`, `exec_shell_interact`. If foreground `exec_shell` times out, the process was killed; rerun long work with `task_shell_start` or `exec_shell` using `background: true`, then poll/wait.
 - **Task evidence**: `task_gate_run` for verification gates; `pr_attempt_record` / `pr_attempt_list` / `pr_attempt_read` / `pr_attempt_preflight`; for GitHub issue/PR/release triage, prefer the native `gh ... --json` CLI through shell because it is authenticated, structured, and reproducible; `github_issue_context` / `github_pr_context` are read-only fallbacks when the CLI route is unavailable; `github_comment` / `github_close_issue` require approval + evidence; `automation_*` scheduling tools.
 - **Structured search**: `grep_files`, `file_search`, `web_search`, `fetch_url`, `web.run` (browse).
 - **Git / diag / tests**: `git_status`, `git_diff`, `git_show`, `git_log`, `git_blame`, `diagnostics`, `run_tests`, `run_verifiers`, `review`.
@@ -265,7 +265,7 @@ Use `apply_patch` for structural edits, coordinated changes, or cases where line
 Use `edit_file` for one clear replacement in one file. Do not use it for multi-block deletions, cross-cutting refactors, or changes that touch more than one logical unit; use `apply_patch` or `write_file` for those.
 
 ### `exec_shell`
-Use `exec_shell` for shell-native diagnostics, pipelines, and bounded commands. Use structured tools for structured operations when they map directly (`grep_files`, `git_diff`, `read_file`). For long commands, servers, full test suites, or release computations, start background work with `task_shell_start` or `exec_shell` using `background: true`, then poll with `task_shell_wait` or `exec_shell_wait`.
+Use `exec_shell` for shell-native diagnostics, pipelines, and bounded commands. Use structured tools for structured operations when they map directly (`grep_files`, `git_diff`, `read_file`). For commands expected to take >5 seconds, including long commands, servers, full test suites, polling, sleeps, or release computations, start background work with `task_shell_start` or `exec_shell` using `background: true`, then poll with `task_shell_wait` or `exec_shell_wait`.
 
 ### `agent_open` / `agent_eval` / `agent_close` / `tool_agent`
 Use `agent_open` for independent investigations or implementation slices that can run while you continue coordinating. Fresh sessions are the default and are best when the child only needs the assignment you pass. Use `fork_context: true` when multiple perspectives should share the same parent context: the runtime preserves the parent prefill/prompt prefix byte-identically where available so DeepSeek prefix-cache reuse stays high, then appends the child instructions and task at the tail.

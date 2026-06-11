@@ -27,6 +27,7 @@ mod compaction;
 mod composer_history;
 mod composer_stash;
 mod config;
+mod config_persistence;
 mod config_ui;
 mod core;
 mod cost_status;
@@ -39,19 +40,24 @@ mod features;
 mod handoff;
 mod hooks;
 mod llm_client;
+mod llm_response_cache;
 mod localization;
 mod logging;
 mod lsp;
 mod mcp;
 mod mcp_server;
 mod memory;
+mod model_routing;
 mod models;
 mod network_policy;
+mod oauth;
 mod palette;
 mod prefix_cache;
 mod pricing;
 mod project_context;
+mod project_context_cache;
 mod project_doc;
+mod prompt_persist;
 mod prompt_zones;
 mod prompts;
 mod purge;
@@ -77,6 +83,7 @@ mod task_manager;
 #[cfg(test)]
 mod test_support;
 mod theme_qa_audit;
+mod tls;
 mod tool_output_receipts;
 mod tools;
 mod tui;
@@ -108,6 +115,10 @@ fn configure_windows_console_utf8() {
 
 #[cfg(not(windows))]
 fn configure_windows_console_utf8() {}
+
+fn install_rustls_crypto_provider() {
+    crate::tls::ensure_rustls_crypto_provider();
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -846,6 +857,7 @@ enum SandboxCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     configure_windows_console_utf8();
+    install_rustls_crypto_provider();
 
     // ── Process hardening (#2183) ─────────────────────────────────────────
     // MUST run before Tokio is booted and before any threads are spawned.
@@ -1020,7 +1032,8 @@ async fn main() -> Result<()> {
             Commands::Eval(args) => run_eval(args),
             Commands::Mcp { command } => {
                 let config = load_config_from_cli(&cli)?;
-                run_mcp_command(&config, command).await
+                let workspace = resolve_workspace(&cli);
+                run_mcp_command(&config, &workspace, command).await
             }
             Commands::Execpolicy(command) => {
                 let config = load_config_from_cli(&cli)?;
@@ -1533,6 +1546,7 @@ fn mcp_template_json() -> Result<String> {
             command: Some("node".to_string()),
             args: vec!["./path/to/your-mcp-server.js".to_string()],
             env: std::collections::HashMap::new(),
+            cwd: None,
             url: None,
             transport: None,
             connect_timeout: None,
@@ -2032,6 +2046,14 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                     "HUGGINGFACE_API_KEY/HF_TOKEN",
                     "codewhale auth set --provider huggingface",
                 ),
+                crate::config::ApiProvider::Together => (
+                    "TOGETHER_API_KEY",
+                    "codewhale auth set --provider together --api-key \"...\"",
+                ),
+                crate::config::ApiProvider::OpenaiCodex => (
+                    "OPENAI_CODEX_ACCESS_TOKEN/CODEX_ACCESS_TOKEN",
+                    "see docs/PROVIDERS.md for ChatGPT/Codex OAuth setup",
+                ),
                 crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN => {
                     ("DEEPSEEK_API_KEY", "codewhale auth set --provider deepseek")
                 }
@@ -2057,6 +2079,8 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                     crate::config::ApiProvider::Vllm => "vllm",
                     crate::config::ApiProvider::Ollama => "ollama",
                     crate::config::ApiProvider::Huggingface => "huggingface",
+                    crate::config::ApiProvider::Together => "together",
+                    crate::config::ApiProvider::OpenaiCodex => "openai_codex",
                     crate::config::ApiProvider::Deepseek
                     | crate::config::ApiProvider::DeepseekCN => "deepseek",
                 }
@@ -2071,14 +2095,21 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
     println!("  · default_text_model: {model}");
 
     let mcp_path = config.mcp_config_path();
-    let mcp_count = match load_mcp_config(&mcp_path) {
+    let project_mcp_path = crate::mcp::workspace_mcp_config_path(workspace);
+    let mcp_count = match crate::mcp::load_config_with_workspace(&mcp_path, workspace) {
         Ok(cfg) => cfg.servers.len(),
         Err(_) => 0,
     };
     let mcp_present = if mcp_path.exists() { "" } else { "  (missing)" };
+    let project_mcp_present = if project_mcp_path.exists() {
+        ""
+    } else {
+        "  (missing)"
+    };
     println!(
-        "  · mcp servers: {mcp_count} at {}{mcp_present}",
-        mcp_path.display()
+        "  · mcp servers: {mcp_count} from {}{mcp_present} + {}{project_mcp_present}",
+        mcp_path.display(),
+        project_mcp_path.display()
     );
 
     let skills_dir = config.skills_dir();
@@ -2473,6 +2504,11 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
     println!("  · provider: {}", api_target.provider);
     println!("  · base_url: {}", api_target.base_url);
     println!("  · model: {}", api_target.model);
+    let tls_status = doctor_tls_status(config);
+    if !tls_status.certificate_verification {
+        println!("  ! {}", tls_status.message);
+        println!("    Prefer SSL_CERT_FILE with a trusted custom CA bundle when possible.");
+    }
     let strict_tool_mode = doctor_strict_tool_mode_status(config);
     let strict_icon = match strict_tool_mode.status {
         "ready" => "✓".truecolor(aqua_r, aqua_g, aqua_b),
@@ -2568,68 +2604,85 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
     }
 
     let mcp_config_path = config.mcp_config_path();
+    let project_mcp_config_path = crate::mcp::workspace_mcp_config_path(workspace);
     if mcp_config_path.exists() {
         println!(
             "  {} MCP config found at {}",
             "✓".truecolor(aqua_r, aqua_g, aqua_b),
             crate::utils::display_path(&mcp_config_path)
         );
-        match load_mcp_config(&mcp_config_path) {
-            Ok(cfg) if cfg.servers.is_empty() => {
-                println!("  {} 0 server(s) configured", "·".dimmed());
-            }
-            Ok(cfg) => {
-                println!(
-                    "  {} {} server(s) configured",
-                    "·".dimmed(),
-                    cfg.servers.len()
-                );
-                for (name, server) in &cfg.servers {
-                    let status = doctor_check_mcp_server(server);
-                    let icon = match status {
-                        McpServerDoctorStatus::Ok(ref detail) => {
-                            format!(
-                                "  {} {name}: {}",
-                                "✓".truecolor(aqua_r, aqua_g, aqua_b),
-                                detail
-                            )
-                        }
-                        McpServerDoctorStatus::Warning(ref detail) => {
-                            format!(
-                                "  {} {name}: {}",
-                                "!".truecolor(sky_r, sky_g, sky_b),
-                                detail
-                            )
-                        }
-                        McpServerDoctorStatus::Error(ref detail) => {
-                            format!(
-                                "  {} {name}: {}",
-                                "✗".truecolor(red_r, red_g, red_b),
-                                detail
-                            )
-                        }
-                    };
-                    println!("{icon}");
-                    if !server.enabled {
-                        println!("      (disabled)");
-                    }
-                }
-            }
-            Err(err) => {
-                println!(
-                    "  {} MCP config parse error: {}",
-                    "✗".truecolor(red_r, red_g, red_b),
-                    err
-                );
-            }
-        }
     } else {
         println!(
             "  {} MCP config not found at {}",
             "·".dimmed(),
             crate::utils::display_path(&mcp_config_path)
         );
-        println!("    Run `codewhale mcp init` or `codewhale setup --mcp`.");
+    }
+    if project_mcp_config_path.exists() {
+        println!(
+            "  {} Project MCP config found at {}",
+            "✓".truecolor(aqua_r, aqua_g, aqua_b),
+            crate::utils::display_path(&project_mcp_config_path)
+        );
+    } else {
+        println!(
+            "  {} Project MCP config not found at {}",
+            "·".dimmed(),
+            crate::utils::display_path(&project_mcp_config_path)
+        );
+    }
+
+    match crate::mcp::load_config_with_workspace(&mcp_config_path, workspace) {
+        Ok(cfg) if cfg.servers.is_empty() => {
+            println!("  {} 0 merged server(s) configured", "·".dimmed());
+            if !mcp_config_path.exists() && !project_mcp_config_path.exists() {
+                println!("    Run `codewhale mcp init` or add `.codewhale/mcp.json`.");
+            }
+        }
+        Ok(cfg) => {
+            println!(
+                "  {} {} merged server(s) configured",
+                "·".dimmed(),
+                cfg.servers.len()
+            );
+            for (name, server) in &cfg.servers {
+                let status = doctor_check_mcp_server(server);
+                let icon = match status {
+                    McpServerDoctorStatus::Ok(ref detail) => {
+                        format!(
+                            "  {} {name}: {}",
+                            "✓".truecolor(aqua_r, aqua_g, aqua_b),
+                            detail
+                        )
+                    }
+                    McpServerDoctorStatus::Warning(ref detail) => {
+                        format!(
+                            "  {} {name}: {}",
+                            "!".truecolor(sky_r, sky_g, sky_b),
+                            detail
+                        )
+                    }
+                    McpServerDoctorStatus::Error(ref detail) => {
+                        format!(
+                            "  {} {name}: {}",
+                            "✗".truecolor(red_r, red_g, red_b),
+                            detail
+                        )
+                    }
+                };
+                println!("{icon}");
+                if !server.enabled {
+                    println!("      (disabled)");
+                }
+            }
+        }
+        Err(err) => {
+            println!(
+                "  {} MCP config parse error: {}",
+                "✗".truecolor(red_r, red_g, red_b),
+                err
+            );
+        }
     }
 
     // Skills configuration
@@ -3137,8 +3190,10 @@ fn run_doctor_json(
     };
 
     let mcp_config_path = config.mcp_config_path();
+    let project_mcp_config_path = crate::mcp::workspace_mcp_config_path(workspace);
     let mcp_present = mcp_config_path.exists();
-    let mcp_summary = match load_mcp_config(&mcp_config_path) {
+    let project_mcp_present = project_mcp_config_path.exists();
+    let mcp_summary = match crate::mcp::load_config_with_workspace(&mcp_config_path, workspace) {
         Ok(cfg) => {
             let servers: Vec<serde_json::Value> = cfg
                 .servers
@@ -3161,12 +3216,16 @@ fn run_doctor_json(
             json!({
                 "config_path": mcp_config_path.display().to_string(),
                 "present": mcp_present,
+                "project_config_path": project_mcp_config_path.display().to_string(),
+                "project_present": project_mcp_present,
                 "servers": servers,
             })
         }
         Err(err) => json!({
             "config_path": mcp_config_path.display().to_string(),
             "present": mcp_present,
+            "project_config_path": project_mcp_config_path.display().to_string(),
+            "project_present": project_mcp_present,
             "servers": [],
             "error": err.to_string(),
         }),
@@ -3241,6 +3300,7 @@ fn run_doctor_json(
     });
     let api_target = doctor_api_target(config);
     let strict_tool_mode = doctor_strict_tool_mode_status(config);
+    let tls_status = doctor_tls_status(config);
 
     let report = json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -3258,6 +3318,12 @@ fn run_doctor_json(
             "function_strict_sent": strict_tool_mode.function_strict_sent,
             "message": strict_tool_mode.message,
             "recommended_base_url": strict_tool_mode.recommended_base_url,
+        },
+        "tls": {
+            "certificate_verification": tls_status.certificate_verification,
+            "insecure_skip_tls_verify": tls_status.insecure_skip_tls_verify,
+            "provider": tls_status.provider,
+            "message": tls_status.message,
         },
         "search_provider": doctor_search_provider_json(config),
         "memory": memory_summary,
@@ -3464,6 +3530,29 @@ fn doctor_strict_tool_mode_status(config: &Config) -> DoctorStrictToolModeStatus
             function_strict_sent: true,
             message: "enabled; function.strict will be sent to this custom endpoint".to_string(),
             recommended_base_url: None,
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorTlsStatus {
+    certificate_verification: bool,
+    insecure_skip_tls_verify: bool,
+    provider: &'static str,
+    message: String,
+}
+
+fn doctor_tls_status(config: &Config) -> DoctorTlsStatus {
+    let provider = config.api_provider().as_str();
+    let insecure_skip_tls_verify = config.insecure_skip_tls_verify();
+    DoctorTlsStatus {
+        certificate_verification: !insecure_skip_tls_verify,
+        insecure_skip_tls_verify,
+        provider,
+        message: if insecure_skip_tls_verify {
+            format!("TLS certificate verification disabled for provider {provider}")
+        } else {
+            "TLS certificate verification enabled".to_string()
         },
     }
 }
@@ -3820,6 +3909,10 @@ fn rustc_version() -> String {
 }
 
 /// List saved sessions
+fn sessions_resume_command() -> &'static str {
+    "codewhale resume"
+}
+
 fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
     use crate::palette;
     use colored::Colorize;
@@ -3874,7 +3967,7 @@ fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
     println!();
     println!(
         "Resume with: {} {}",
-        "codewhale --resume".truecolor(blue_r, blue_g, blue_b),
+        sessions_resume_command().truecolor(blue_r, blue_g, blue_b),
         "<session-id>".dimmed()
     );
     println!(
@@ -4429,7 +4522,7 @@ fn read_patch_from_stdin() -> Result<String> {
     Ok(buffer)
 }
 
-async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
+async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand) -> Result<()> {
     let config_path = config.mcp_config_path();
     match command {
         McpCommand::Init { force } => {
@@ -4452,9 +4545,13 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
             Ok(())
         }
         McpCommand::List => {
-            let cfg = load_mcp_config(&config_path)?;
+            let cfg = crate::mcp::load_config_with_workspace(&config_path, workspace)?;
             if cfg.servers.is_empty() {
-                println!("No MCP servers configured in {}", config_path.display());
+                println!(
+                    "No MCP servers configured in {} or {}",
+                    config_path.display(),
+                    crate::mcp::workspace_mcp_config_path(workspace).display()
+                );
                 return Ok(());
             }
             println!("MCP servers ({}):", cfg.servers.len());
@@ -4482,7 +4579,7 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
             Ok(())
         }
         McpCommand::Connect { server } => {
-            let mut pool = McpPool::from_config_path(&config_path)?;
+            let mut pool = McpPool::from_config_path_with_workspace(&config_path, workspace)?;
             if let Some(name) = server {
                 pool.get_or_connect(&name).await?;
                 println!("Connected to MCP server: {name}");
@@ -4499,7 +4596,7 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
             Ok(())
         }
         McpCommand::Tools { server } => {
-            let mut pool = McpPool::from_config_path(&config_path)?;
+            let mut pool = McpPool::from_config_path_with_workspace(&config_path, workspace)?;
             if let Some(name) = server {
                 let conn = pool.get_or_connect(&name).await?;
                 if conn.tools().is_empty() {
@@ -4558,6 +4655,7 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
                     command,
                     args,
                     env: std::collections::HashMap::new(),
+                    cwd: None,
                     url,
                     transport,
                     connect_timeout: None,
@@ -4609,7 +4707,7 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
             Ok(())
         }
         McpCommand::Validate => {
-            let mut pool = McpPool::from_config_path(&config_path)?;
+            let mut pool = McpPool::from_config_path_with_workspace(&config_path, workspace)?;
             let errors = pool.connect_all().await;
             if errors.is_empty() {
                 println!("MCP config is valid. All enabled servers connected.");
@@ -4645,6 +4743,7 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
                     command: Some(exe_str.clone()),
                     args,
                     env: std::collections::HashMap::new(),
+                    cwd: None,
                     url: None,
                     transport: None,
                     connect_timeout: None,
@@ -5420,7 +5519,7 @@ struct CliAutoRoute {
 async fn resolve_cli_auto_route(config: &Config, model: &str, prompt: &str) -> CliAutoRoute {
     if model.trim().eq_ignore_ascii_case("auto") {
         let selection =
-            commands::resolve_auto_route_with_flash(config, prompt, "", "auto", "auto").await;
+            model_routing::resolve_auto_route_with_flash(config, prompt, "", "auto", "auto").await;
         CliAutoRoute {
             model: selection.model,
             reasoning_effort: selection.reasoning_effort,
@@ -5543,6 +5642,9 @@ struct ExecStreamMeta {
     input_tokens: u32,
     output_tokens: u32,
     session_id: String,
+    resume_command: String,
+    workspace: String,
+    message_count: usize,
     status: Option<String>,
 }
 
@@ -5576,6 +5678,14 @@ enum ExecStreamEvent {
 fn emit_exec_stream_event(event: &ExecStreamEvent) -> Result<()> {
     println!("{}", serde_json::to_string(event)?);
     Ok(())
+}
+
+fn exec_resume_command(session_id: &str) -> String {
+    if session_id.trim().is_empty() {
+        String::new()
+    } else {
+        format!("codewhale exec --resume {session_id}")
+    }
 }
 
 fn persist_exec_session(
@@ -5716,6 +5826,7 @@ async fn run_exec_agent(
         runtime_services: crate::tools::spec::RuntimeToolServices::default(),
         subagent_model_overrides: config.subagent_model_overrides(),
         subagent_api_timeout: std::time::Duration::from_secs(config.subagent_api_timeout_secs()),
+        stream_chunk_timeout: std::time::Duration::from_secs(config.stream_chunk_timeout_secs()),
         subagent_heartbeat_timeout: std::time::Duration::from_secs(
             config.subagent_heartbeat_timeout_secs(),
         ),
@@ -5734,6 +5845,7 @@ async fn run_exec_agent(
         workshop: config.workshop.clone(),
         search_provider: config.search_provider(),
         search_api_key: config.search.as_ref().and_then(|s| s.api_key.clone()),
+        search_base_url: config.search.as_ref().and_then(|s| s.base_url.clone()),
         tools_always_load: config.tools_always_load(),
         tools: config.tools.clone(),
     };
@@ -6044,7 +6156,13 @@ async fn run_exec_agent(
                             model: latest_model.clone(),
                             input_tokens: usage.input_tokens,
                             output_tokens: usage.output_tokens,
+                            resume_command: saved_session_id
+                                .as_deref()
+                                .map(exec_resume_command)
+                                .unwrap_or_default(),
                             session_id: saved_session_id.unwrap_or_default(),
+                            workspace: latest_workspace.display().to_string(),
+                            message_count: latest_messages.len(),
                             status: summary.status.clone(),
                         },
                     })?;
@@ -6246,6 +6364,34 @@ mod doctor_endpoint_tests {
     }
 
     #[test]
+    fn doctor_tls_status_reports_verification_enabled_by_default() {
+        let status = doctor_tls_status(&Config::default());
+
+        assert!(status.certificate_verification);
+        assert!(!status.insecure_skip_tls_verify);
+        assert_eq!(status.provider, "deepseek");
+        assert!(status.message.contains("enabled"));
+    }
+
+    #[test]
+    fn doctor_tls_status_warns_when_active_provider_skips_verification() {
+        let mut providers = crate::config::ProvidersConfig::default();
+        providers.openai.insecure_skip_tls_verify = Some(true);
+        let config = Config {
+            provider: Some("openai".to_string()),
+            providers: Some(providers),
+            ..Default::default()
+        };
+
+        let status = doctor_tls_status(&config);
+
+        assert!(!status.certificate_verification);
+        assert!(status.insecure_skip_tls_verify);
+        assert_eq!(status.provider, "openai");
+        assert!(status.message.contains("disabled"));
+    }
+
+    #[test]
     fn provider_capability_report_exposes_alias_deprecation_for_deepseek_chat() {
         let config = Config {
             default_text_model: Some("deepseek-chat".to_string()),
@@ -6306,6 +6452,7 @@ mod doctor_endpoint_tests {
         let config = Config {
             search: Some(crate::config::SearchConfig {
                 provider: Some(crate::config::SearchProvider::DuckDuckGo),
+                base_url: None,
                 api_key: None,
             }),
             ..Default::default()
@@ -6345,6 +6492,7 @@ mod doctor_endpoint_tests {
         let config = Config {
             search: Some(crate::config::SearchConfig {
                 provider: Some(crate::config::SearchProvider::Bing),
+                base_url: None,
                 api_key: None,
             }),
             ..Default::default()
@@ -6507,6 +6655,19 @@ mod terminal_mode_tests {
     }
 
     #[test]
+    fn sessions_footer_points_to_resume_subcommand() {
+        let cli = parse_cli(&["codewhale", "resume", "abc123"]);
+        let Some(Commands::Resume { session_id, last }) = cli.command else {
+            panic!("expected resume command");
+        };
+
+        assert_eq!(session_id.as_deref(), Some("abc123"));
+        assert!(!last);
+        assert_eq!(sessions_resume_command(), "codewhale resume");
+        assert!(!sessions_resume_command().contains("--resume"));
+    }
+
+    #[test]
     fn swebench_run_accepts_instance_issue_and_prediction_path() {
         let cli = parse_cli(&[
             "codewhale",
@@ -6579,6 +6740,12 @@ mod terminal_mode_tests {
             .args(["config", "user.email", "codewhale@example.invalid"])
             .status()
             .expect("git config user.email");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "core.autocrlf", "false"])
+            .status()
+            .expect("git config core.autocrlf");
         std::fs::write(
             repo.join("math_utils.py"),
             "def add(a, b):\n    return a - b\n",
@@ -6655,6 +6822,34 @@ mod terminal_mode_tests {
     }
 
     #[test]
+    fn exec_stream_metadata_includes_resume_breadcrumbs() {
+        let event = ExecStreamEvent::Metadata {
+            meta: ExecStreamMeta {
+                model: "deepseek-v4-flash".to_string(),
+                input_tokens: 123,
+                output_tokens: 45,
+                session_id: "abc123".to_string(),
+                resume_command: exec_resume_command("abc123"),
+                workspace: "/tmp/work".to_string(),
+                message_count: 4,
+                status: Some("completed".to_string()),
+            },
+        };
+
+        let json = serde_json::to_string(&event).expect("serializes");
+        assert!(!json.contains('\n'));
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["type"], "metadata");
+        assert_eq!(parsed["meta"]["session_id"], "abc123");
+        assert_eq!(
+            parsed["meta"]["resume_command"],
+            "codewhale exec --resume abc123"
+        );
+        assert_eq!(parsed["meta"]["workspace"], "/tmp/work");
+        assert_eq!(parsed["meta"]["message_count"], 4);
+    }
+
+    #[test]
     fn alternate_screen_defaults_on_in_auto_mode() {
         let cli = parse_cli(&["codewhale"]);
         let config = Config::default();
@@ -6678,6 +6873,7 @@ mod terminal_mode_tests {
                 alternate_screen: Some("never".to_string()),
                 mouse_capture: None,
                 terminal_probe_timeout_ms: None,
+                stream_chunk_timeout_secs: None,
                 status_items: None,
                 osc8_links: None,
                 composer_arrows_scroll: None,
@@ -6771,6 +6967,7 @@ mod terminal_mode_tests {
                 alternate_screen: None,
                 mouse_capture: Some(false),
                 terminal_probe_timeout_ms: None,
+                stream_chunk_timeout_secs: None,
                 status_items: None,
                 osc8_links: None,
                 composer_arrows_scroll: None,
@@ -6802,6 +6999,7 @@ mod terminal_mode_tests {
                 alternate_screen: None,
                 mouse_capture: Some(true),
                 terminal_probe_timeout_ms: None,
+                stream_chunk_timeout_secs: None,
                 status_items: None,
                 osc8_links: None,
                 composer_arrows_scroll: None,
@@ -6887,6 +7085,7 @@ mod terminal_mode_tests {
                 alternate_screen: None,
                 mouse_capture: Some(true),
                 terminal_probe_timeout_ms: None,
+                stream_chunk_timeout_secs: None,
                 status_items: None,
                 osc8_links: None,
                 composer_arrows_scroll: None,
@@ -7445,6 +7644,7 @@ mod doctor_mcp_tests {
             command: command.map(String::from),
             args: args.iter().map(|s| s.to_string()).collect(),
             env: std::collections::HashMap::new(),
+            cwd: None,
             url: url.map(String::from),
             transport: None,
             connect_timeout: None,

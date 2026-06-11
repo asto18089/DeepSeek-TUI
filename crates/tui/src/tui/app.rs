@@ -37,6 +37,7 @@ use crate::tui::approval::ApprovalMode;
 use crate::tui::clipboard::{ClipboardContent, ClipboardHandler};
 use crate::tui::file_mention::ContextReference;
 use crate::tui::history::{HistoryCell, TranscriptRenderOptions};
+use crate::tui::hotbar::HotbarActionRegistry;
 use crate::tui::paste_burst::{FlushResult, PasteBurst};
 use crate::tui::scrolling::{MouseScrollState, TranscriptLineMeta, TranscriptScroll};
 use crate::tui::selection::{SelectionAutoscroll, TranscriptSelection};
@@ -323,6 +324,46 @@ impl SidebarFocus {
             Self::Agents => "agents",
             Self::Context => "context",
             Self::Hidden => "hidden",
+        }
+    }
+}
+
+/// Controls how dense tool-call runs are collapsed in the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCollapseMode {
+    /// Collapse qualifying tool runs by default.
+    Compact,
+    /// Never collapse tool runs automatically.
+    Expanded,
+    /// Collapse only when calm mode is active.
+    Calm,
+}
+
+impl ToolCollapseMode {
+    #[must_use]
+    pub fn from_setting(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "expanded" | "off" | "none" => Self::Expanded,
+            "calm" | "calm-mode" | "calm_only" | "calm-only" => Self::Calm,
+            _ => Self::Compact,
+        }
+    }
+
+    #[must_use]
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Expanded => "expanded",
+            Self::Calm => "calm",
+        }
+    }
+
+    #[must_use]
+    pub fn is_active(self, calm_mode: bool) -> bool {
+        match self {
+            Self::Compact => true,
+            Self::Expanded => false,
+            Self::Calm => calm_mode,
         }
     }
 }
@@ -1103,6 +1144,21 @@ pub struct SidebarHoverState {
     pub sections: Vec<SidebarHoverSection>,
 }
 
+/// Per-row metadata for sidebar detail popovers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarHoverRow {
+    /// Absolute row position in the terminal.
+    pub row_y: u16,
+    /// Text shown in the compact sidebar row.
+    pub display_text: String,
+    /// Full untruncated text for the popover.
+    pub full_text: String,
+    /// Optional additional detail line.
+    pub detail: Option<String>,
+    /// Whether the compact row lost information.
+    pub is_truncated: bool,
+}
+
 /// Per-section metadata for sidebar hover detection.
 #[derive(Debug, Clone)]
 pub struct SidebarHoverSection {
@@ -1110,6 +1166,8 @@ pub struct SidebarHoverSection {
     pub content_area: Rect,
     /// Full original text for each content line rendered.
     pub lines: Vec<String>,
+    /// Per-row metadata for rich hover popovers.
+    pub rows: Vec<SidebarHoverRow>,
 }
 
 impl Default for SessionState {
@@ -1159,10 +1217,24 @@ pub struct ToolEvidence {
     pub summary: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PendingProviderSwitch {
+    pub previous_provider: ApiProvider,
+    pub previous_model: String,
+    pub previous_model_ids_passthrough: bool,
+    pub previous_config: Config,
+    pub previous_onboarding: OnboardingState,
+    pub previous_onboarding_needs_api_key: bool,
+    pub previous_api_key_env_only: bool,
+}
+
 /// Global UI state for the TUI.
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub mode: AppMode,
+    /// Registered hotbar actions available for future slot config/render layers.
+    #[allow(dead_code)]
+    pub hotbar_actions: HotbarActionRegistry,
     /// Composer sub-state (input, cursor, history, menus).
     pub composer: ComposerState,
     /// Viewport sub-state (scroll, cache, selection).
@@ -1174,6 +1246,12 @@ pub struct App {
     /// Active tool restriction from custom slash command frontmatter.
     /// `None` means the current turn may use the normal tool set.
     pub active_allowed_tools: Option<Vec<String>>,
+    /// True when the active custom slash command opted into pause/resume.
+    pub pausable: bool,
+    /// True after Esc paused a pausable command and before it is resumed or cancelled.
+    pub paused: bool,
+    /// Saved custom-command objective while the command is paused.
+    pub paused_quarry: Option<String>,
     pub history: Vec<HistoryCell>,
     pub history_version: u64,
     /// Per-cell revision counter, kept in lockstep with `history`.
@@ -1182,6 +1260,13 @@ pub struct App {
     pub next_history_revision: u64,
     pub api_messages: Vec<Message>,
     pub is_loading: bool,
+    /// Ghost-text follow-up suggestion shown in the composer when empty.
+    /// Generated asynchronously after each completed turn; cleared on new input.
+    pub prompt_suggestion: Option<String>,
+    /// Monotonic turn counter for stale-suggestion protection. Incremented on
+    /// each TurnStarted; background suggestion tasks capture the token and
+    /// discard their result if the token no longer matches.
+    pub prompt_suggestion_gen: std::sync::atomic::AtomicU64,
     /// Degraded connectivity mode; new user inputs are queued for later retry.
     pub offline_mode: bool,
     /// Whether an `EngineEvent::Error` has already been posted for the
@@ -1215,6 +1300,9 @@ pub struct App {
     /// True when the active provider/base URL accepts arbitrary model IDs
     /// verbatim rather than DeepSeek-only aliases.
     pub model_ids_passthrough: bool,
+    /// Pending provider transition for transactional rollback when the next
+    /// auth failure indicates the new provider cannot be used.
+    pub pending_provider_switch: Option<PendingProviderSwitch>,
     /// Current reasoning-effort tier for DeepSeek thinking mode.
     /// Cycled via Shift+Tab; initialized from config at startup.
     pub reasoning_effort: ReasoningEffort,
@@ -1320,6 +1408,12 @@ pub struct App {
     pub sidebar_width_dirty: bool,
     /// Whether the session-context panel is enabled (#504).
     pub context_panel: bool,
+    /// Minimum number of consecutive safe tool cells needed for auto-collapse.
+    pub tool_collapse_threshold: usize,
+    /// Tool runs the user explicitly expanded. Stores original history indices.
+    pub expanded_tool_runs: HashSet<usize>,
+    /// Current dense tool-run collapse behavior.
+    pub tool_collapse_mode: ToolCollapseMode,
     /// File-tree pane state. `None` when hidden; `Some` when visible.
     pub file_tree: Option<crate::tui::file_tree::FileTreeState>,
     /// Whether the file-tree pane was actually rendered in the last frame.
@@ -1330,6 +1424,8 @@ pub struct App {
     pub max_input_history: usize,
     pub allow_shell: bool,
     pub max_subagents: usize,
+    /// Per-SSE-chunk idle timeout for streamed turns, in seconds.
+    pub stream_chunk_timeout_secs: u64,
     /// Cached sub-agent snapshots for UI views.
     pub subagent_cache: Vec<SubAgentResult>,
     /// Last known per-agent progress text for running sub-agents.
@@ -1502,7 +1598,8 @@ pub struct App {
     /// cancelled cleanly). Surfaced in the pending-input preview so the user
     /// knows the steer was deferred to end-of-turn. Today no engine path
     /// produces these; the field is scaffolding for a future signalling
-    /// channel and the bucket renders identically when populated.
+    /// channel and the bucket renders with a rejected-steer label when
+    /// populated.
     pub rejected_steers: VecDeque<String>,
     /// Legacy resend flag for pending steer recovery.
     pub submit_pending_steers_after_interrupt: bool,
@@ -1521,6 +1618,8 @@ pub struct App {
     /// DeepSeek account balance, refreshed once per turn completion.
     /// Shared cell updated by background fetch tasks; read lock in the UI thread.
     pub balance_cell: std::sync::Arc<std::sync::Mutex<Option<crate::pricing::BalanceInfo>>>,
+    /// Shared cell for async prompt suggestion delivery from background task.
+    pub prompt_suggestion_cell: std::sync::Arc<std::sync::Mutex<Option<(u64, String)>>>,
     /// Tracks whether the initial balance fetch has been attempted for this session.
     pub balance_initiated: bool,
     /// Timestamp of the last balance fetch, used to debounce rapid requests.
@@ -1957,8 +2056,13 @@ impl App {
                 }
                 _ => (String::new(), 0, false),
             };
+        let mcp_configured_count =
+            crate::mcp::load_config_with_workspace(&mcp_config_path, &workspace)
+                .map(|cfg| cfg.servers.len())
+                .unwrap_or(0);
         Self {
             mode: initial_mode,
+            hotbar_actions: HotbarActionRegistry::with_builtins(),
             composer: ComposerState {
                 input: initial_input_text,
                 cursor_position: initial_input_cursor,
@@ -1985,12 +2089,17 @@ impl App {
             hunt: HuntState::default(),
             session: SessionState::default(),
             active_allowed_tools: None,
+            pausable: false,
+            paused: false,
+            paused_quarry: None,
             history: Vec::new(),
             history_version: 0,
             history_revisions: Vec::new(),
             next_history_revision: 1,
             api_messages: Vec::new(),
             is_loading: false,
+            prompt_suggestion: None,
+            prompt_suggestion_gen: std::sync::atomic::AtomicU64::new(0),
             offline_mode: false,
             turn_error_posted: false,
             status_message: None,
@@ -2003,6 +2112,7 @@ impl App {
             last_effective_model: None,
             api_provider: provider,
             model_ids_passthrough,
+            pending_provider_switch: None,
             reasoning_effort,
             last_effective_reasoning_effort: None,
             workspace,
@@ -2048,12 +2158,16 @@ impl App {
             sidebar_resize_total_width: 0,
             sidebar_width_dirty: false,
             context_panel: settings.context_panel,
+            tool_collapse_threshold: 3,
+            expanded_tool_runs: HashSet::new(),
+            tool_collapse_mode: ToolCollapseMode::from_setting(&settings.tool_collapse_mode),
             file_tree: None,
             file_tree_visible: false,
             compact_threshold,
             max_input_history,
             allow_shell,
             max_subagents,
+            stream_chunk_timeout_secs: config.stream_chunk_timeout_secs(),
             subagent_cache: Vec::new(),
             agent_progress: HashMap::new(),
             subagent_card_index: HashMap::new(),
@@ -2107,11 +2221,9 @@ impl App {
             // Read the MCP config once at boot to know how many servers
             // the user has declared. The footer chip uses this even when
             // no live snapshot is available (#502). Cheap (just reads
-            // the JSON file); errors fall through to zero so a missing
+            // the JSON files); errors fall through to zero so a missing
             // or malformed config simply hides the chip.
-            mcp_configured_count: crate::mcp::load_config(&mcp_config_path)
-                .map(|cfg| cfg.servers.len())
-                .unwrap_or(0),
+            mcp_configured_count,
             mcp_restart_required: false,
             tool_log: Vec::new(),
             active_skill: None,
@@ -2145,6 +2257,7 @@ impl App {
             turn_last_activity_at: None,
             cumulative_turn_duration: std::time::Duration::ZERO,
             balance_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            prompt_suggestion_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             balance_initiated: false,
             last_balance_fetch: None,
             runtime_turn_id: None,
@@ -2607,6 +2720,10 @@ impl App {
             .into_iter()
             .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
             .collect();
+        self.expanded_tool_runs = std::mem::take(&mut self.expanded_tool_runs)
+            .into_iter()
+            .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
+            .collect();
         self.collapsed_cell_map.clear();
     }
 
@@ -2701,6 +2818,7 @@ impl App {
         self.session_context_references.clear();
         self.session_artifacts.clear();
         self.collapsed_cells.clear();
+        self.expanded_tool_runs.clear();
         self.collapsed_cell_map.clear();
         self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;
@@ -2713,6 +2831,8 @@ impl App {
             self.history_revisions.pop();
             self.context_references_by_cell.remove(&self.history.len());
             self.rebuild_session_context_references();
+            self.expanded_tool_runs
+                .retain(|idx| *idx < self.history.len());
             self.history_version = self.history_version.wrapping_add(1);
             self.needs_redraw = true;
         }
@@ -2750,9 +2870,40 @@ impl App {
         }
         // Drop collapsed cells that reference indices past the new tail.
         self.collapsed_cells.retain(|idx| *idx < new_len);
+        self.expanded_tool_runs.retain(|idx| *idx < new_len);
         self.collapsed_cell_map.clear();
         self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;
+    }
+
+    #[must_use]
+    pub fn tool_collapse_active(&self) -> bool {
+        self.tool_collapse_threshold > 0 && self.tool_collapse_mode.is_active(self.calm_mode)
+    }
+
+    #[must_use]
+    pub fn tool_run_start_for_history_index(&self, index: usize) -> Option<usize> {
+        if !self.tool_collapse_active() || index >= self.history.len() {
+            return None;
+        }
+        crate::tui::history::detect_tool_runs(&self.history, self.tool_collapse_threshold)
+            .into_iter()
+            .find(|run| index >= run.start && index < run.start.saturating_add(run.count))
+            .map(|run| run.start)
+    }
+
+    pub fn toggle_tool_run_expansion_at(&mut self, index: usize) -> bool {
+        let Some(start) = self.tool_run_start_for_history_index(index) else {
+            return false;
+        };
+        if self.expanded_tool_runs.remove(&start) {
+            self.status_message = Some("Tool group collapsed".to_string());
+        } else {
+            self.expanded_tool_runs.insert(start);
+            self.status_message = Some("Tool group expanded".to_string());
+        }
+        self.mark_history_updated();
+        true
     }
 
     /// Bump the active-cell revision counter and request a redraw.
@@ -2785,6 +2936,14 @@ impl App {
     #[allow(dead_code)] // Reserved for the eventual merged push helper.
     pub fn next_virtual_cell_index(&self) -> usize {
         self.virtual_cell_count()
+    }
+
+    #[must_use]
+    pub fn original_cell_index_for_rendered(&self, rendered_index: usize) -> usize {
+        self.collapsed_cell_map
+            .get(rendered_index)
+            .copied()
+            .unwrap_or(rendered_index)
     }
 
     /// Resolve a virtual cell index to either a committed history cell or an
@@ -2842,7 +3001,7 @@ impl App {
             .ordered_endpoints()
             .and_then(|(start, _)| line_meta.get(start.line_index))
             .and_then(TranscriptLineMeta::cell_line)
-            .map(|(cell_index, _)| cell_index)
+            .map(|(cell_index, _)| self.original_cell_index_for_rendered(cell_index))
             .filter(|&idx| self.cell_has_detail_target(idx));
         if selected_cell.is_some() {
             return selected_cell;
@@ -2854,6 +3013,7 @@ impl App {
             let Some((cell_index, _)) = meta.cell_line() else {
                 continue;
             };
+            let cell_index = self.original_cell_index_for_rendered(cell_index);
             if self.cell_has_detail_target(cell_index) {
                 return Some(cell_index);
             }
@@ -4506,7 +4666,7 @@ impl App {
 
     /// When the composer input exceeds [`MAX_SUBMITTED_INPUT_CHARS`], write
     /// the full content to a timestamped paste file under
-    /// `.deepseek/pastes/` and replace `self.input` with an `@`-mention
+    /// `.codewhale/pastes/` and replace `self.input` with an `@`-mention
     /// pointing at it so the model can read the full content via the
     /// normal file-mention resolution path (#553).
     fn consolidate_large_input(&mut self) {
@@ -4516,9 +4676,9 @@ impl App {
         let now = chrono::Local::now();
         let suffix = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let filename = format!("paste-{}-{}.md", now.format("%Y-%m-%d-%H%M%S"), suffix);
-        let rel_path = format!(".deepseek/pastes/{filename}");
+        let rel_path = format!(".codewhale/pastes/{filename}");
 
-        let pastes_dir = self.workspace.join(".deepseek/pastes");
+        let pastes_dir = self.workspace.join(".codewhale/pastes");
         if let Err(e) = std::fs::create_dir_all(&pastes_dir) {
             // Fallback: keep a truncated version so we don't lose the
             // user's input entirely when the filesystem is unhappy.
@@ -4588,6 +4748,18 @@ impl App {
         self.cursor_position = char_count(&self.input);
         self.selected_attachment_index = None;
         self.queued_draft = Some(msg);
+        self.needs_redraw = true;
+        true
+    }
+
+    /// Stop editing a queued follow-up and put the original queued message back
+    /// at the tail where [`Self::pop_last_queued_into_draft`] took it from.
+    pub fn cancel_queued_draft_edit(&mut self) -> bool {
+        let Some(draft) = self.queued_draft.take() else {
+            return false;
+        };
+        self.queued_messages.push_back(draft);
+        self.clear_input_recoverable();
         self.needs_redraw = true;
         true
     }
@@ -4906,6 +5078,7 @@ pub enum AppAction {
         model: Option<String>,
     },
     UpdateCompaction(CompactionConfig),
+    UpdateStreamChunkTimeout(u64),
     OpenContextInspector,
     CompactContext,
     PurgeContext,
@@ -4996,6 +5169,7 @@ mod tests {
     use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
     use crate::tools::todo::TodoStatus;
     use crate::tui::clipboard::PastedImage;
+    use crate::tui::history::{GenericToolCell, ToolCell, ToolStatus};
 
     fn test_options(yolo: bool) -> TuiOptions {
         TuiOptions {
@@ -5781,7 +5955,7 @@ mod tests {
 
         assert_eq!(app.input, full_content);
         assert_eq!(app.cursor_position, app.input.chars().count());
-        let pastes_dir = tmp.path().join(".deepseek/pastes");
+        let pastes_dir = tmp.path().join(".codewhale/pastes");
         assert!(
             !pastes_dir.exists() || std::fs::read_dir(&pastes_dir).unwrap().next().is_none(),
             "paste file should not be written before submit"
@@ -5795,7 +5969,7 @@ mod tests {
 
         let submitted = app.submit_input().expect("expected submitted input");
         assert!(
-            submitted.starts_with("@.deepseek/pastes/paste-") && submitted.ends_with(".md"),
+            submitted.starts_with("@.codewhale/pastes/paste-") && submitted.ends_with(".md"),
             "expected @mention after submit, got: {submitted}"
         );
         let rel_path = &submitted[1..];
@@ -5824,9 +5998,9 @@ mod tests {
         app.insert_paste_text(&small);
 
         assert_eq!(app.input, small);
-        assert!(!app.input.starts_with("@.deepseek/pastes/"));
+        assert!(!app.input.starts_with("@.codewhale/pastes/"));
         // No paste file gets written for under-cap pastes.
-        let pastes_dir = tmp.path().join(".deepseek/pastes");
+        let pastes_dir = tmp.path().join(".codewhale/pastes");
         assert!(
             !pastes_dir.exists() || std::fs::read_dir(&pastes_dir).unwrap().next().is_none(),
             "no paste file should be written for under-cap content"
@@ -5848,7 +6022,7 @@ mod tests {
         // The submitted text should be the @mention, not the truncated
         // original (#553).
         assert!(
-            submitted.starts_with("@.deepseek/pastes/paste-"),
+            submitted.starts_with("@.codewhale/pastes/paste-"),
             "expected @mention, got: {submitted}"
         );
         assert!(
@@ -5919,6 +6093,7 @@ mod tests {
                     step: "step 1".to_string(),
                     status: StepStatus::InProgress,
                 }],
+                ..UpdatePlanArgs::default()
             });
             assert!(!plan.is_empty());
         }
@@ -6153,6 +6328,56 @@ mod tests {
         let initial_version = app.history_version;
         app.mark_history_updated();
         assert!(app.history_version > initial_version);
+    }
+
+    #[test]
+    fn expanded_tool_runs_rebase_when_history_prefix_shifts() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.expanded_tool_runs = std::collections::HashSet::from([2usize, 6usize]);
+
+        app.shift_history_maps_down(3);
+
+        assert_eq!(app.expanded_tool_runs, std::collections::HashSet::from([3]));
+    }
+
+    #[test]
+    fn expanded_tool_runs_prune_when_history_is_truncated() {
+        let mut app = App::new(test_options(false), &Config::default());
+        for idx in 0..5 {
+            app.add_message(HistoryCell::System {
+                content: format!("cell {idx}"),
+            });
+        }
+        app.expanded_tool_runs = std::collections::HashSet::from([1usize, 4usize]);
+
+        app.truncate_history_to(3);
+
+        assert_eq!(app.expanded_tool_runs, std::collections::HashSet::from([1]));
+    }
+
+    #[test]
+    fn tool_run_expansion_toggle_opens_and_closes_run() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.tool_collapse_mode = ToolCollapseMode::Compact;
+        app.tool_collapse_threshold = 3;
+        for name in ["read_file", "list_dir", "web_search"] {
+            app.add_message(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                name: name.to_string(),
+                status: ToolStatus::Success,
+                input_summary: None,
+                output: Some("ok".to_string()),
+                prompts: None,
+                spillover_path: None,
+                output_summary: None,
+                is_diff: false,
+            })));
+        }
+
+        assert!(app.toggle_tool_run_expansion_at(0));
+        assert!(app.expanded_tool_runs.contains(&0));
+        assert!(app.toggle_tool_run_expansion_at(2));
+        assert!(!app.expanded_tool_runs.contains(&0));
+        assert!(!app.toggle_tool_run_expansion_at(99));
     }
 
     #[test]
@@ -7007,6 +7232,33 @@ mod tests {
         assert!(!app.pop_last_queued_into_draft());
         assert!(app.input.is_empty());
         assert!(app.queued_draft.is_none());
+    }
+
+    #[test]
+    fn cancel_queued_draft_edit_restores_original_message() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.queue_message(QueuedMessage::new("first".to_string(), None));
+        app.queue_message(QueuedMessage::new(
+            "original follow-up".to_string(),
+            Some("skill".to_string()),
+        ));
+        assert!(app.pop_last_queued_into_draft());
+        app.input = "edited but not submitted".to_string();
+        app.cursor_position = char_count(&app.input);
+
+        assert!(app.cancel_queued_draft_edit());
+
+        assert!(app.input.is_empty());
+        assert!(app.queued_draft.is_none());
+        assert_eq!(app.queued_messages.len(), 2);
+        let restored = app.queued_messages.back().expect("restored message");
+        assert_eq!(restored.display, "original follow-up");
+        assert_eq!(restored.skill_instruction.as_deref(), Some("skill"));
+        assert_eq!(
+            app.clear_undo_buffer.as_deref(),
+            Some("edited but not submitted"),
+            "the interrupted edit remains recoverable via normal draft recovery"
+        );
     }
 
     #[test]

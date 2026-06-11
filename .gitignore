@@ -119,3 +119,7 @@ docs/*_PLAN.md
 .envrc
 .direnv
 scripts/run_deep_swe.py
+
+# Benchmark artifacts and caches re-included by !scripts/**
+results/
+scripts/**/__pycache__/

@@ -67,11 +67,7 @@ pub(super) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
     "write_file",
 ];
 
-pub(super) fn should_default_defer_tool(
-    name: &str,
-    _mode: AppMode,
-    always_load: &HashSet<String>,
-) -> bool {
+pub(super) fn should_default_defer_tool(name: &str, always_load: &HashSet<String>) -> bool {
     if always_load.contains(name) {
         return false;
     }
@@ -85,12 +81,16 @@ pub(super) fn should_default_defer_tool(
         .any(|core_tool| core_tool == &name)
 }
 
-/// [pinvou3-fork] pinvou3 用 **blocklist 模型**(显示全部、隐藏黑名单),而上游 v0.8.47
+/// [pinvou3-fork] pinvou3 用 **blocklist 模型**(显示全部、隐藏黑名单),而上游
 /// `should_default_defer_tool` 是 **allowlist**(只显示 `DEFAULT_ACTIVE_NATIVE_TOOLS`)。
-/// 两者 philosophy 相反:上游 allowlist 会 defer 掉 `request_user_input` / `append_file` 等
-/// 不在白名单但 pinvou3 必需的工具(symptom: GUI 里 request_user_input 不出气泡)。
-/// 故 Yolo(GUI 单 session)下只 defer 黑名单、其余全显示;非 Yolo 才叠加上游 allowlist。
+/// 两者 philosophy 相反:上游 allowlist 会 defer 掉 `request_user_input` / `append_file`
+/// 等不在白名单但 pinvou3 必需的工具(symptom: GUI 里 request_user_input 不出气泡)。
+/// 故 Yolo(GUI 生产单 session)下只 defer 黑名单、其余全显示;非 Yolo 才叠加上游 allowlist。
 /// 单独成函数(而非塞进 should_default_defer_tool)保上游单测纯净。详见 docs/工具表精简方案.md
+///
+/// v0.8.57:上游把 `should_default_defer_tool` 改成 2 参(去掉 mode)并主张 native deferral
+/// mode 无关(catalog-head 字节稳定)。pinvou3 仍按原设计保持 **mode-aware**:上游 build_model_
+/// tool_catalog 持有 `mode`,透传进来即可。生产单 Yolo、catalog 不跨 mode 切换,不变量实践中仍成立。
 pub(super) fn pinvou3_should_defer_native_tool(
     name: &str,
     mode: AppMode,
@@ -99,18 +99,14 @@ pub(super) fn pinvou3_should_defer_native_tool(
     if crate::tools::pinvou3_blocklist::is_pinvou3_hidden(name) {
         return true;
     }
-    // pinvou3 引导 AI 用 `request_user_input` 处理歧义(instructions §1.4 + Plan
-    // per-turn reminder),工具表里必须永远在。上游 allowlist 没把它加进
-    // `DEFAULT_ACTIVE_NATIVE_TOOLS`,非 Yolo 模式下会被 defer → GUI 不出气泡 →
-    // AI fallback 在 text 里列 A/B/C 选项(实测 case: Plan 模式问 "我要做俄罗斯方块"
-    // 时 AI 用 text 而非气泡)。硬保留,跨所有 mode。
+    // request_user_input 跨所有 mode 硬保留(GUI 选择气泡来源,instructions §1.4 引导)。
     if name == REQUEST_USER_INPUT_NAME {
         return false;
     }
     if mode == AppMode::Yolo {
-        return false;
+        return false; // Yolo:显示全部非黑名单
     }
-    should_default_defer_tool(name, mode, always_load)
+    should_default_defer_tool(name, always_load) // 非 Yolo:叠加上游 allowlist
 }
 
 pub(super) fn apply_native_tool_deferral(
@@ -119,11 +115,7 @@ pub(super) fn apply_native_tool_deferral(
     always_load: &HashSet<String>,
 ) {
     for tool in &mut *catalog {
-        tool.defer_loading = Some(pinvou3_should_defer_native_tool(
-            &tool.name,
-            mode,
-            always_load,
-        ));
+        tool.defer_loading = Some(pinvou3_should_defer_native_tool(&tool.name, mode, always_load));
     }
     let active: Vec<&str> = catalog
         .iter()
@@ -232,7 +224,7 @@ pub(super) fn build_model_tool_catalog(
     mode: AppMode,
     always_load: &HashSet<String>,
 ) -> Vec<Tool> {
-    apply_native_tool_deferral(&mut native_tools, mode, always_load);
+    apply_native_tool_deferral(&mut native_tools, mode, always_load); // [pinvou3-fork] 透传 mode(blocklist mode-aware)
     apply_mcp_tool_deferral(&mut mcp_tools, mode);
     // Sort each partition by name for prefix-cache stability (#263). The
     // upstream `to_api_tools()` already sorts the registry's HashMap output;
@@ -276,7 +268,6 @@ pub(super) fn ensure_advanced_tooling(
             allowed_callers: Some(vec!["direct".to_string()]),
             defer_loading: Some(should_default_defer_tool(
                 CODE_EXECUTION_TOOL_NAME,
-                mode,
                 always_load,
             )),
             input_examples: None,
@@ -295,7 +286,7 @@ pub(super) fn ensure_advanced_tooling(
         && crate::dependencies::resolve_node().is_some()
     {
         let mut tool = crate::tools::js_execution::js_execution_tool_definition();
-        tool.defer_loading = Some(should_default_defer_tool(&tool.name, mode, always_load));
+        tool.defer_loading = Some(should_default_defer_tool(&tool.name, always_load));
         catalog.push(tool);
     }
 
@@ -591,7 +582,8 @@ pub(super) fn missing_tool_error_message(tool_name: &str, catalog: &[Tool]) -> S
 }
 
 fn shell_tool_allow_shell_hint() -> &'static str {
-    "Shell tools require top-level `allow_shell = true`. \
+    "Shell tools are disabled because top-level `allow_shell = false`; \
+     they require `allow_shell = true`. \
      In Agent mode, run `/config allow_shell true` for this session or add `--save` \
      for future sessions; the next turn will expose shell with approval gating"
 }

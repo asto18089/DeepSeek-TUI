@@ -49,7 +49,7 @@ use crate::config_ui::{self, ConfigUiMode, WebConfigSession, WebConfigSessionEve
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
 use crate::core::events::Event as EngineEvent;
 use crate::core::ops::{Op, USER_SHELL_TOOL_ID_PREFIX};
-use crate::hooks::{HookEvent, HookExecutor};
+use crate::hooks::{HookEvent, HookExecutor, TurnEndPayloadInput, TurnEndTotals};
 use crate::llm_client::LlmClient;
 use crate::localization::{MessageId, tr};
 use crate::models::{
@@ -65,6 +65,7 @@ use crate::settings::Settings;
 use crate::task_manager::{
     NewTaskRequest, SharedTaskManager, TaskManager, TaskManagerConfig, TaskStatus, TaskSummary,
 };
+use crate::tools::shell::{ShellJobSnapshot, ShellStatus};
 use crate::tools::spec::{RuntimeToolServices, ToolResult};
 use crate::tools::subagent::SubAgentStatus;
 use crate::tui::app::HuntVerdict;
@@ -99,14 +100,17 @@ use crate::tui::shell_job_routing::{
 use crate::tui::streaming_thinking;
 use crate::tui::subagent_routing::{
     format_task_list, handle_subagent_mailbox, open_task_pager, reconcile_subagent_activity_state,
-    running_agent_count, sort_subagents_in_place, task_mode_label, task_summary_to_panel_entry,
+    running_agent_count, sort_subagents_in_place, subagent_message_refreshes_workspace_context,
+    task_mode_label, task_summary_to_panel_entry,
 };
 #[cfg(test)]
 use crate::tui::tool_routing::exploring_label;
 use crate::tui::tool_routing::{
     handle_tool_call_complete, handle_tool_call_started, maybe_add_patch_preview,
 };
-use crate::tui::ui_text::{history_cell_to_text, line_to_plain, truncate_line_to_width};
+use crate::tui::ui_text::{
+    history_cell_to_text, line_to_plain, text_display_width, truncate_line_to_width,
+};
 use crate::tui::user_input::UserInputView;
 use crate::tui::views::subagent_view_agents;
 use crate::tui::vim_mode;
@@ -115,8 +119,8 @@ use crate::tui::workspace_context;
 use super::key_actions;
 
 use super::app::{
-    App, AppAction, AppMode, OnboardingState, QueuedMessage, ReasoningEffort, SidebarFocus,
-    StatusToastLevel, SubmitDisposition, TaskPanelEntry, TuiOptions,
+    App, AppAction, AppMode, OnboardingState, PendingProviderSwitch, QueuedMessage,
+    ReasoningEffort, SidebarFocus, StatusToastLevel, SubmitDisposition, TaskPanelEntry, TuiOptions,
     looks_like_slash_command_input, shell_command_from_bang_input,
 };
 use super::approval::{
@@ -697,6 +701,41 @@ fn execute_subagent_observer_hook(
         });
 }
 
+fn execute_turn_end_observer_hook(
+    app: &App,
+    usage: &Usage,
+    duration: Duration,
+    error: Option<&str>,
+) {
+    if !app.hooks.has_hooks_for_event(HookEvent::TurnEnd) {
+        return;
+    }
+
+    let context = app.base_hook_context();
+    let payload = crate::hooks::turn_end_payload(TurnEndPayloadInput {
+        context: &context,
+        turn_id: app.runtime_turn_id.as_deref(),
+        status: app.runtime_turn_status.as_deref().unwrap_or("unknown"),
+        error,
+        duration,
+        usage,
+        totals: TurnEndTotals {
+            session_tokens: app.session.total_tokens,
+            conversation_tokens: app.session.total_conversation_tokens,
+            input_tokens: app.session.total_input_tokens,
+            output_tokens: app.session.total_output_tokens,
+        },
+        tool_count: app.tool_evidence.len(),
+        queued_message_count: app.queued_message_count(),
+    });
+    let hooks = app.hooks.clone();
+    let _ = std::thread::Builder::new()
+        .name("turn_end-observer-hook".to_string())
+        .spawn(move || {
+            let _ = hooks.execute_json_observer(HookEvent::TurnEnd, &context, &payload);
+        });
+}
+
 fn bounded_subagent_hook_preview(text: &str) -> (String, bool) {
     if text.len() <= SUBAGENT_HOOK_PREVIEW_LIMIT {
         return (text.to_string(), false);
@@ -871,6 +910,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         runtime_services: app.runtime_services.clone(),
         subagent_model_overrides: config.subagent_model_overrides(),
         subagent_api_timeout: Duration::from_secs(config.subagent_api_timeout_secs()),
+        stream_chunk_timeout: Duration::from_secs(app.stream_chunk_timeout_secs),
         subagent_heartbeat_timeout: Duration::from_secs(config.subagent_heartbeat_timeout_secs()),
         prefer_bwrap: config.prefer_bwrap.unwrap_or(false),
         memory_enabled: config.memory_enabled(),
@@ -883,6 +923,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         workshop: config.workshop.clone(),
         search_provider: config.search_provider(),
         search_api_key: config.search.as_ref().and_then(|s| s.api_key.clone()),
+        search_base_url: config.search.as_ref().and_then(|s| s.base_url.clone()),
         tools_always_load: config.tools_always_load(),
         tools: config.tools.clone(),
     }
@@ -974,6 +1015,89 @@ async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManag
     app.task_panel = entries;
 }
 
+fn refresh_shell_exec_live_output(app: &mut App) -> bool {
+    let Some(shell_mgr) = app.runtime_services.shell_manager.as_ref().cloned() else {
+        return false;
+    };
+    let jobs = {
+        let Ok(mut mgr) = shell_mgr.lock() else {
+            return false;
+        };
+        mgr.list_jobs()
+            .into_iter()
+            .map(|job| (job.id.clone(), job))
+            .collect::<std::collections::HashMap<_, _>>()
+    };
+    if jobs.is_empty() {
+        return false;
+    }
+
+    let mut changed = false;
+    for index in 0..app.virtual_cell_count() {
+        let Some((task_id, next_status, next_live, next_duration)) =
+            shell_exec_live_update(app, index, &jobs)
+        else {
+            continue;
+        };
+        let Some(HistoryCell::Tool(ToolCell::Exec(exec))) = app.cell_at_virtual_index_mut(index)
+        else {
+            continue;
+        };
+        if exec.output.is_some() || exec.shell_task_id.as_deref() != Some(task_id.as_str()) {
+            continue;
+        }
+        exec.status = next_status;
+        exec.live_output = next_live;
+        exec.duration_ms = Some(next_duration);
+        changed = true;
+    }
+    changed
+}
+
+fn shell_exec_live_update(
+    app: &App,
+    index: usize,
+    jobs: &std::collections::HashMap<String, ShellJobSnapshot>,
+) -> Option<(String, ToolStatus, Option<String>, u64)> {
+    let HistoryCell::Tool(ToolCell::Exec(exec)) = app.cell_at_virtual_index(index)? else {
+        return None;
+    };
+    if exec.output.is_some() {
+        return None;
+    }
+    let task_id = exec.shell_task_id.as_deref()?;
+    let job = jobs.get(task_id)?;
+    let next_status = shell_job_tool_status(&job.status);
+    let next_live = shell_job_live_output(job).or_else(|| exec.live_output.clone());
+    if exec.status == next_status
+        && exec.live_output == next_live
+        && exec.duration_ms == Some(job.elapsed_ms)
+    {
+        return None;
+    }
+    Some((task_id.to_string(), next_status, next_live, job.elapsed_ms))
+}
+
+fn shell_job_tool_status(status: &ShellStatus) -> ToolStatus {
+    match status {
+        ShellStatus::Running => ToolStatus::Running,
+        ShellStatus::Completed => ToolStatus::Success,
+        ShellStatus::Failed | ShellStatus::Killed | ShellStatus::TimedOut => ToolStatus::Failed,
+    }
+}
+
+fn shell_job_live_output(job: &ShellJobSnapshot) -> Option<String> {
+    match (job.stdout_tail.is_empty(), job.stderr_tail.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(job.stdout_tail.clone()),
+        (true, false) => Some(format!("STDERR:\n{}", job.stderr_tail)),
+        (false, false) => Some(format!(
+            "{}\n\nSTDERR:\n{}",
+            job.stdout_tail, job.stderr_tail
+        )),
+    }
+}
+
 fn active_reasoning_task_entries(app: &App) -> Vec<TaskPanelEntry> {
     let Some(active) = app.active_cell.as_ref() else {
         return Vec::new();
@@ -1043,7 +1167,7 @@ const BALANCE_FETCH_COOLDOWN: Duration = Duration::from_secs(60);
 /// Shared `reqwest::Client` for balance fetches so connection pools are
 /// reused across successive background polls.
 static BALANCE_CLIENT: LazyLock<::reqwest::Client> = LazyLock::new(|| {
-    ::reqwest::Client::builder()
+    crate::tls::reqwest_client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap_or_default()
@@ -1115,6 +1239,7 @@ async fn run_event_loop(
     // codex's frame coalescing that maps cleanly onto our poll-based loop.
     let mut frame_rate_limiter = crate::tui::frame_rate_limiter::FrameRateLimiter::default();
     let mut web_config_session: Option<WebConfigSession> = None;
+    let mut prev_input_snapshot = String::new();
     let mut terminal_paused_at: Option<Instant> = None;
     let mut force_terminal_repaint = false;
     let mut draws_since_last_full_repaint: u64 = 0;
@@ -1261,14 +1386,36 @@ async fn run_event_loop(
 
         if last_task_refresh.elapsed() >= Duration::from_millis(2500) {
             refresh_active_task_panel(app, &task_manager).await;
+            if refresh_shell_exec_live_output(app) {
+                app.needs_redraw = true;
+            }
             last_task_refresh = Instant::now();
             app.needs_redraw = true;
+        }
+
+        // Clear suggestion when the user modifies the input.
+        if app.input != prev_input_snapshot {
+            app.prompt_suggestion = None;
+            prev_input_snapshot = app.input.clone();
+        }
+
+        // Poll prompt suggestion cell from background generation task.
+        // Discard stale results whose generation token no longer matches.
+        if let Ok(mut guard) = app.prompt_suggestion_cell.try_lock()
+            && let Some((gen_token, suggestion)) = guard.take()
+            && gen_token
+                == app
+                    .prompt_suggestion_gen
+                    .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            app.prompt_suggestion = Some(suggestion);
         }
 
         // First, poll for engine events (non-blocking)
         let mut received_engine_event = false;
         let mut transcript_batch_updated = false;
         let mut queued_to_send: Option<QueuedMessage> = None;
+        let mut respawn_after_provider_rollback: Option<String> = None;
         {
             let mut rx = engine_handle.rx_event.write().await;
             loop {
@@ -1596,6 +1743,9 @@ async fn run_event_loop(
                                 | "update_plan"
                                 | "task_shell_start"
                                 | "exec_shell"
+                                | "exec_shell_cancel"
+                                | "exec_shell_wait"
+                                | "task_cancel"
                         ) {
                             refresh_active_task_panel(app, &task_manager).await;
                             last_task_refresh = Instant::now();
@@ -1618,6 +1768,9 @@ async fn run_event_loop(
                         app.is_loading = true;
                         app.offline_mode = false;
                         app.turn_error_posted = false;
+                        app.prompt_suggestion = None;
+                        app.prompt_suggestion_gen
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         app.dispatch_started_at = None;
                         current_streaming_text.clear();
                         app.streaming_state.reset();
@@ -1657,6 +1810,10 @@ async fn run_event_loop(
                         let was_locally_cancelled = app.suppress_stream_events_until_turn_complete;
                         app.suppress_stream_events_until_turn_complete = false;
                         app.active_allowed_tools = None;
+                        if app.paused_quarry.is_none() {
+                            app.pausable = false;
+                            app.paused = false;
+                        }
                         if !matches!(status, crate::core::events::TurnOutcomeStatus::Completed)
                             || draws_since_last_full_repaint >= PERIODIC_FULL_REPAINT_EVERY_N
                         {
@@ -1682,6 +1839,7 @@ async fn run_event_loop(
                         }
                         app.is_loading = false;
                         app.dispatch_started_at = None;
+                        app.pending_provider_switch = None;
                         app.offline_mode = false;
                         app.streaming_state.reset();
                         if was_locally_cancelled {
@@ -1767,7 +1925,7 @@ async fn run_event_loop(
                             reasoning_replay_tokens: usage.reasoning_replay_tokens,
                             recorded_at: Instant::now(),
                         });
-                        if let Some(error) = error {
+                        if let Some(error) = error.as_deref() {
                             // Only show "Turn failed:" in the composer status
                             // area when an EngineEvent::Error has NOT already
                             // posted the same message into the transcript.
@@ -1816,6 +1974,38 @@ async fn run_event_loop(
                                 crate::tui::notifications::stop_title_animation();
                             } else {
                                 crate::tui::notifications::stop_title_animation_quietly();
+                            }
+                        }
+
+                        // Generate ghost-text follow-up suggestion asynchronously.
+                        if status == crate::core::events::TurnOutcomeStatus::Completed
+                            && config.prompt_suggestion_enabled()
+                            && app.api_messages.len() >= 2
+                        {
+                            let suggestion_cell = app.prompt_suggestion_cell.clone();
+                            let api_key = config.deepseek_api_key().unwrap_or_default();
+                            let base_url = config.deepseek_base_url();
+                            let model = config.default_model();
+                            let messages: Vec<crate::models::Message> = app.api_messages.clone();
+                            let gen_token = app
+                                .prompt_suggestion_gen
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            if !api_key.is_empty() {
+                                tokio::spawn(async move {
+                                    let summary =
+                                        crate::tui::prompt_suggestion::summarize_recent_messages(
+                                            &messages, 8,
+                                        );
+                                    if let Some(suggestion) =
+                                        crate::tui::prompt_suggestion::generate_suggestion(
+                                            &api_key, &base_url, &model, &summary,
+                                        )
+                                        .await
+                                        && let Ok(mut guard) = suggestion_cell.lock()
+                                    {
+                                        *guard = Some((gen_token, suggestion));
+                                    }
+                                });
                             }
                         }
 
@@ -1938,6 +2128,8 @@ async fn run_event_loop(
                             }
                         }
 
+                        execute_turn_end_observer_hook(app, &usage, turn_elapsed, error.as_deref());
+
                         if queued_to_send.is_none() {
                             queued_to_send = app.pop_queued_message();
                         }
@@ -1946,7 +2138,18 @@ async fn run_event_loop(
                         envelope,
                         recoverable: _,
                     } => {
+                        let rollback_after_auth_failure =
+                            matches!(
+                                envelope.category,
+                                crate::error_taxonomy::ErrorCategory::Authentication
+                            ) && app.pending_provider_switch.is_some();
                         apply_engine_error_to_app(app, envelope);
+                        if rollback_after_auth_failure
+                            && let Some(rollback_warning) =
+                                rollback_provider_after_auth_failure(app, config)
+                        {
+                            respawn_after_provider_rollback = Some(rollback_warning);
+                        }
                     }
                     EngineEvent::Status { message } => {
                         app.status_message = Some(message);
@@ -2161,7 +2364,7 @@ async fn run_event_loop(
                                 subagent_elapsed,
                             );
                         }
-                        if should_recapture_terminal {
+                        if should_recapture_terminal && event_broker.is_paused() {
                             resume_terminal(
                                 terminal,
                                 app.use_alt_screen,
@@ -2190,7 +2393,12 @@ async fn run_event_loop(
                         // full list available via /agents command.
                     }
                     EngineEvent::SubAgentMailbox { seq, message } => {
+                        let should_refresh_subagents =
+                            subagent_message_refreshes_workspace_context(&message);
                         handle_subagent_mailbox(app, seq, &message);
+                        if should_refresh_subagents {
+                            let _ = engine_handle.send(Op::ListSubAgents).await;
+                        }
                         transcript_batch_updated = true;
                     }
                     EngineEvent::ApprovalRequired {
@@ -2365,6 +2573,29 @@ async fn run_event_loop(
                     }
                 }
             }
+        }
+        if let Some(rollback_warning) = respawn_after_provider_rollback {
+            let _ = engine_handle.send(Op::Shutdown).await;
+            let engine_config = build_engine_config(app, config);
+            engine_handle = spawn_engine(engine_config, config);
+            if !app.api_messages.is_empty() {
+                let _ = engine_handle
+                    .send(Op::SyncSession {
+                        session_id: app.current_session_id.clone(),
+                        messages: app.api_messages.clone(),
+                        system_prompt: app.system_prompt.clone(),
+                        system_prompt_override: false,
+                        model: app.model.clone(),
+                        workspace: app.workspace.clone(),
+                    })
+                    .await;
+            }
+            let _ = engine_handle
+                .send(Op::SetCompaction {
+                    config: app.compaction_config(),
+                })
+                .await;
+            app.status_message = Some(rollback_warning);
         }
         if let Some(index) = app.streaming_message_index {
             let committed = app.streaming_state.commit_text(0);
@@ -2694,7 +2925,9 @@ async fn run_event_loop(
                 // this single draw so the buffer matches the real viewport.
                 {
                     let backend = terminal.backend_mut();
-                    backend.force_size(Size::new(final_w, final_h));
+                    let new_size = Size::new(final_w, final_h);
+                    backend.force_size(new_size);
+                    backend.set_terminal_size(new_size);
                 }
                 draw_app_frame_inner(terminal, app, true)?;
                 draws_since_last_full_repaint = 0;
@@ -3230,6 +3463,14 @@ async fn run_event_loop(
                 {
                     continue;
                 }
+                KeyCode::Enter
+                    if key.modifiers == KeyModifiers::NONE
+                        && app.input.is_empty()
+                        && detail_target_cell_index(app)
+                            .is_some_and(|idx| app.toggle_tool_run_expansion_at(idx)) =>
+                {
+                    continue;
+                }
                 KeyCode::Char('l')
                     if key_shortcuts::alt_nav_modifiers(key.modifiers)
                         && app.input.is_empty()
@@ -3257,6 +3498,9 @@ async fn run_event_loop(
                     if key.modifiers == KeyModifiers::NONE && app.input.is_empty() =>
                 {
                     if let Some(idx) = detail_target_cell_index(app) {
+                        if app.toggle_tool_run_expansion_at(idx) {
+                            continue;
+                        }
                         let is_thinking = app
                             .history
                             .get(idx)
@@ -3318,29 +3562,48 @@ async fn run_event_loop(
                     apply_alt_4_shortcut(app, key.modifiers);
                     continue;
                 }
-                KeyCode::Char('!') if key.modifiers.contains(KeyModifiers::ALT) => {
+                // Sidebar focus via Alt+! / Alt+@ / Alt+# / Alt+$ / Alt+%)
+                // AltGr on European keyboards emits Ctrl+Alt on Windows, so
+                // exclude Ctrl to avoid swallowing AltGr-typed characters
+                // like @ (AltGr+0 on French AZERTY) and # (AltGr+3). This
+                // matches the has_ctrl_or_alt / is_altgr philosophy in
+                // key_hint.rs: treat Ctrl+Alt as AltGr, not a shortcut.
+                KeyCode::Char('!')
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     app.set_sidebar_focus(SidebarFocus::Work);
                     app.status_message = Some("Sidebar focus: work".to_string());
                     continue;
                 }
-                KeyCode::Char('@') if key.modifiers.contains(KeyModifiers::ALT) => {
+                KeyCode::Char('@')
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     app.set_sidebar_focus(SidebarFocus::Tasks);
                     app.status_message = Some("Sidebar focus: tasks".to_string());
                     continue;
                 }
-                KeyCode::Char('#') if key.modifiers.contains(KeyModifiers::ALT) => {
+                KeyCode::Char('#')
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     app.set_sidebar_focus(SidebarFocus::Agents);
                     app.status_message = Some("Sidebar focus: agents".to_string());
                     continue;
                 }
                 KeyCode::Char('$') | KeyCode::Char('%')
-                    if key.modifiers.contains(KeyModifiers::ALT) =>
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     app.set_sidebar_focus(SidebarFocus::Context);
                     app.status_message = Some("Sidebar focus: context".to_string());
                     continue;
                 }
-                KeyCode::Char(')') if key.modifiers.contains(KeyModifiers::ALT) => {
+                KeyCode::Char(')')
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     app.set_sidebar_focus(SidebarFocus::Auto);
                     app.status_message = Some("Sidebar focus: auto".to_string());
                     continue;
@@ -3434,6 +3697,10 @@ async fn run_event_loop(
                     app.mention_menu_hidden = true;
                     app.mention_menu_selected = 0;
                 }
+                KeyCode::Esc if app.sidebar_hover_tooltip.is_some() => {
+                    app.sidebar_hover_tooltip = None;
+                    app.needs_redraw = true;
+                }
                 KeyCode::Esc => {
                     match next_escape_action(app, slash_menu_open) {
                         EscapeAction::CloseSlashMenu => {
@@ -3445,15 +3712,38 @@ async fn run_event_loop(
                         }
                         EscapeAction::CancelRequest => {
                             app.backtrack.reset();
-                            engine_handle.cancel();
-                            mark_active_turn_cancelled_locally(app);
-                            current_streaming_text.clear();
-                            app.status_message = Some("Request cancelled".to_string());
+                            if app.paused || app.paused_quarry.is_some() {
+                                clear_paused_command_state(app, &engine_handle);
+                                if app.is_loading
+                                    || matches!(
+                                        app.runtime_turn_status.as_deref(),
+                                        Some("in_progress")
+                                    )
+                                {
+                                    engine_handle.cancel();
+                                    mark_active_turn_cancelled_locally(app);
+                                    current_streaming_text.clear();
+                                }
+                                app.active_allowed_tools = None;
+                                app.hunt.quarry = None;
+                                app.status_message = Some("Paused command cancelled".to_string());
+                            } else {
+                                engine_handle.cancel();
+                                mark_active_turn_cancelled_locally(app);
+                                current_streaming_text.clear();
+                                app.status_message = Some("Request cancelled".to_string());
+                            }
+                        }
+                        EscapeAction::PauseCommand => {
+                            app.backtrack.reset();
+                            pause_pausable_command(app, &engine_handle);
                         }
                         EscapeAction::DiscardQueuedDraft => {
                             app.backtrack.reset();
-                            app.queued_draft = None;
-                            app.status_message = Some("Stopped editing queued message".to_string());
+                            if app.cancel_queued_draft_edit() {
+                                app.status_message =
+                                    Some("Queued edit canceled; follow-up restored".to_string());
+                            }
                         }
                         EscapeAction::ClearInput => {
                             app.backtrack.reset();
@@ -3589,6 +3879,14 @@ async fn run_event_loop(
                         continue;
                     }
                     if app.is_loading && queue_current_draft_for_next_turn(app) {
+                        continue;
+                    }
+                    if app.input.is_empty()
+                        && let Some(suggestion) = app.prompt_suggestion.take()
+                    {
+                        app.input = suggestion;
+                        app.cursor_position = app.input.chars().count();
+                        app.needs_redraw = true;
                         continue;
                     }
                     let prior_model = app.model.clone();
@@ -4510,6 +4808,68 @@ pub(crate) fn apply_engine_error_to_app(
     // toast in the footer — that duplicates the transcript entry.
 }
 
+fn rollback_provider_after_auth_failure(app: &mut App, config: &mut Config) -> Option<String> {
+    let pending = app.pending_provider_switch.take()?;
+    let PendingProviderSwitch {
+        previous_provider,
+        previous_model,
+        previous_model_ids_passthrough,
+        previous_config,
+        previous_onboarding,
+        previous_onboarding_needs_api_key,
+        previous_api_key_env_only,
+    } = pending;
+
+    *config = previous_config;
+    app.api_provider = previous_provider;
+    app.set_model_selection(previous_model.clone());
+    app.provider_models
+        .insert(previous_provider.as_str().to_string(), previous_model);
+    app.model_ids_passthrough = previous_model_ids_passthrough;
+    app.update_model_compaction_budget();
+    app.clear_model_scoped_telemetry();
+    app.offline_mode = false;
+    app.onboarding = previous_onboarding;
+    app.onboarding_needs_api_key = previous_onboarding_needs_api_key;
+    app.api_key_env_only = previous_api_key_env_only;
+
+    let persistence_error = (|| -> anyhow::Result<()> {
+        crate::config_persistence::persist_root_string_key(
+            app.config_path.as_deref(),
+            "provider",
+            previous_provider.as_str(),
+        )?;
+        let mut settings = crate::settings::Settings::load()?;
+        settings.default_provider = Some(previous_provider.as_str().to_string());
+        settings.set_model_for_provider(
+            previous_provider.as_str(),
+            &app.model_selection_for_persistence(),
+        );
+        if matches!(
+            previous_provider,
+            ApiProvider::Deepseek | ApiProvider::DeepseekCN
+        ) {
+            settings.set("default_model", &app.model_selection_for_persistence())?;
+        }
+        settings.save()?;
+        Ok(())
+    })()
+    .err()
+    .map(|err| format!("provider rollback not fully persisted: {err}"));
+
+    Some(match persistence_error {
+        Some(warning) => format!(
+            "Provider switch failed and has been rolled back to {}. {}",
+            previous_provider.as_str(),
+            warning
+        ),
+        None => format!(
+            "Provider switch failed and has been rolled back to {}.",
+            previous_provider.as_str()
+        ),
+    })
+}
+
 fn persist_offline_queue_state(app: &App) {
     if app.queued_messages.is_empty() && app.queued_draft.is_none() {
         persistence_actor::persist(PersistRequest::ClearOfflineQueue);
@@ -4790,6 +5150,149 @@ fn queued_message_content_for_app(
     }
 }
 
+fn paused_quarry_title(quarry: &str) -> &str {
+    quarry
+        .split(['\n', '\r'])
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .unwrap_or("the paused command")
+}
+
+fn is_resume_message(message: &str) -> bool {
+    let words: Vec<String> = message
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect();
+    if words.is_empty() {
+        return false;
+    }
+    let text = words.join(" ");
+    let has_resume_verb = words
+        .iter()
+        .any(|word| matches!(word.as_str(), "continue" | "resume"));
+    if !has_resume_verb {
+        return false;
+    }
+
+    let blockers = [
+        "do not continue",
+        "do not resume",
+        "don t continue",
+        "don t resume",
+        "dont continue",
+        "dont resume",
+        "not continue",
+        "not resume",
+        "continue yet",
+        "resume yet",
+        "will continue",
+        "will resume",
+        "continue tomorrow",
+        "resume tomorrow",
+        "continue later",
+        "resume later",
+    ];
+    if blockers.iter().any(|blocker| text.contains(blocker)) {
+        return false;
+    }
+    if matches!(
+        words.first().map(String::as_str),
+        Some("how" | "what" | "when" | "where" | "why")
+    ) {
+        return false;
+    }
+
+    if words.len() == 1 {
+        return true;
+    }
+
+    let context_words = [
+        "please", "now", "paused", "pause", "command", "task", "work", "request", "goal",
+        "previous", "last", "same", "it", "that", "this", "go", "ahead",
+    ];
+    if words
+        .iter()
+        .any(|word| context_words.contains(&word.as_str()))
+    {
+        return true;
+    }
+
+    text.starts_with("can you continue")
+        || text.starts_with("can you resume")
+        || text.starts_with("could you continue")
+        || text.starts_with("could you resume")
+}
+
+fn paused_command_note(title: &str, resume: bool) -> String {
+    let instruction = if resume {
+        "The user is resuming that paused command. Continue the paused command."
+    } else {
+        "The user is not resuming that paused command. Answer only the new message and do not continue the paused command."
+    };
+    format!(
+        "\n\n<runtime_prompt visibility=\"internal\">\n\
+Paused custom slash command: {title}\n\
+{instruction}\n\
+</runtime_prompt>"
+    )
+}
+
+fn prepare_paused_command_message(
+    app: &mut App,
+    engine_handle: &EngineHandle,
+    user_message: &str,
+) -> Option<String> {
+    if !app.paused && app.paused_quarry.is_none() {
+        engine_handle.set_paused(false);
+        return None;
+    }
+
+    engine_handle.set_paused(false);
+    app.paused = false;
+
+    let Some(quarry) = app
+        .paused_quarry
+        .clone()
+        .or_else(|| app.hunt.quarry.clone())
+    else {
+        app.pausable = false;
+        return None;
+    };
+    let title = paused_quarry_title(&quarry).to_string();
+    if is_resume_message(user_message) {
+        app.hunt.quarry = Some(app.paused_quarry.take().unwrap_or(quarry));
+        app.pausable = true;
+        Some(paused_command_note(&title, true))
+    } else {
+        app.hunt.quarry = None;
+        Some(paused_command_note(&title, false))
+    }
+}
+
+fn pause_pausable_command(app: &mut App, engine_handle: &EngineHandle) {
+    app.paused_quarry = app
+        .paused_quarry
+        .clone()
+        .or_else(|| app.hunt.quarry.clone());
+    app.hunt.quarry = None;
+    app.paused = true;
+    app.pausable = true;
+    engine_handle.set_paused(true);
+    app.status_message = Some(
+        "Request paused. Send `continue` or `resume` to continue, or Esc to cancel.".to_string(),
+    );
+}
+
+fn clear_paused_command_state(app: &mut App, engine_handle: &EngineHandle) {
+    app.pausable = false;
+    app.paused = false;
+    app.paused_quarry = None;
+    engine_handle.set_paused(false);
+}
+
 async fn dispatch_user_message(
     app: &mut App,
     config: &Config,
@@ -4826,6 +5329,8 @@ async fn dispatch_user_message(
         }
     }
 
+    let paused_note = prepare_paused_command_message(app, engine_handle, &message.display);
+
     // Set immediately to prevent double-dispatch before TurnStarted event arrives.
     let dispatch_started_at = Instant::now();
     app.is_loading = true;
@@ -4843,11 +5348,13 @@ async fn dispatch_user_message(
         &app.workspace,
         cwd.clone(),
     );
-    let content = queued_message_content_for_app(app, &message, cwd);
+    let mut content = queued_message_content_for_app(app, &message, cwd);
+    if let Some(note) = paused_note.as_deref() {
+        content.push_str(note);
+    }
     let message_index = app.api_messages.len();
     app.system_prompt = Some(
         prompts::system_prompt_for_mode_with_context_skills_and_session(
-            app.mode,
             &app.workspace,
             None,
             None,
@@ -4860,7 +5367,6 @@ async fn dispatch_user_message(
                 translation_enabled: app.translation_enabled,
                 model_id: &app.model,
                 show_thinking: app.show_thinking,
-                allow_shell: app.allow_shell,
             },
         ),
     );
@@ -4905,7 +5411,9 @@ async fn dispatch_user_message(
         auto_selection
             .as_ref()
             .map(|selection| selection.model.clone())
-            .unwrap_or_else(|| commands::auto_model_heuristic(&message.display, &app.model))
+            .unwrap_or_else(|| {
+                crate::model_routing::auto_model_heuristic(&message.display, &app.model)
+            })
     } else {
         app.model.clone()
     };
@@ -5280,10 +5788,17 @@ async fn switch_provider(
 ) {
     let previous_provider = app.api_provider;
     let previous_model = app.model.clone();
-    let previous_provider_str = config.provider.clone();
-    let previous_base_url = config.base_url.clone();
-    let previous_default_text_model = config.default_text_model.clone();
-    let previous_providers = config.providers.clone();
+    let previous_model_ids_passthrough = app.model_ids_passthrough;
+    let previous_config = config.clone();
+    app.pending_provider_switch = Some(PendingProviderSwitch {
+        previous_provider,
+        previous_model: previous_model.clone(),
+        previous_model_ids_passthrough,
+        previous_config: previous_config.clone(),
+        previous_onboarding: app.onboarding,
+        previous_onboarding_needs_api_key: app.onboarding_needs_api_key,
+        previous_api_key_env_only: app.api_key_env_only,
+    });
 
     config.provider = Some(target.as_str().to_string());
     if matches!(target, ApiProvider::NvidiaNim)
@@ -5309,10 +5824,8 @@ async fn switch_provider(
     }
 
     if let Err(err) = DeepSeekClient::new(config) {
-        config.provider = previous_provider_str;
-        config.base_url = previous_base_url;
-        config.default_text_model = previous_default_text_model;
-        config.providers = previous_providers;
+        app.pending_provider_switch = None;
+        *config = previous_config;
         app.add_message(HistoryCell::System {
             content: format!(
                 "Failed to switch provider to {}: {err}\nProvider unchanged ({}).",
@@ -5365,7 +5878,11 @@ async fn switch_provider(
         .await;
 
     let persist_warning = (|| -> anyhow::Result<()> {
-        commands::persist_root_string_key(app.config_path.as_deref(), "provider", target.as_str())?;
+        crate::config_persistence::persist_root_string_key(
+            app.config_path.as_deref(),
+            "provider",
+            target.as_str(),
+        )?;
 
         let mut settings = crate::settings::Settings::load()?;
         settings.default_provider = Some(target.as_str().to_string());
@@ -5642,6 +6159,11 @@ async fn apply_command_result(
             AppAction::UpdateCompaction(compaction) => {
                 apply_model_and_compaction_update(engine_handle, compaction, app.mode).await;
             }
+            AppAction::UpdateStreamChunkTimeout(timeout_secs) => {
+                let _ = engine_handle
+                    .send(Op::SetStreamChunkTimeout { timeout_secs })
+                    .await;
+            }
             AppAction::OpenConfigEditor(mode) => match mode {
                 ConfigUiMode::Native => {
                     if app.view_stack.top_kind() != Some(ModalKind::Config) {
@@ -5742,6 +6264,7 @@ async fn apply_command_result(
                         .push(crate::tui::views::status_picker::StatusPickerView::new(
                             &app.status_items,
                             app.api_provider,
+                            app.ui_locale,
                         ));
                 }
             }
@@ -5846,6 +6369,10 @@ async fn apply_command_result(
             }
             AppAction::ShellJob(action) => {
                 handle_shell_job_action(app, action);
+                // Immediately sync the task panel after cancel/poll so the
+                // Tasks sidebar stays accurate without waiting for the
+                // next 2.5 s periodic refresh (#2937).
+                refresh_active_task_panel(app, task_manager).await;
             }
             AppAction::Mcp(action) => {
                 handle_mcp_ui_action(app, config, action).await;
@@ -5925,7 +6452,6 @@ async fn apply_command_result(
 #[cfg(test)]
 use std::process::{Command, Stdio};
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn open_external_url(url: &str) -> Result<()> {
     crate::utils::open_url(url)
 }
@@ -6096,9 +6622,19 @@ async fn handle_mcp_ui_action(
         let network_policy = config.network.clone().map(|toml_cfg| {
             crate::network_policy::NetworkPolicyDecider::with_default_audit(toml_cfg.into_runtime())
         });
-        mcp::discover_manager_snapshot(&path, network_policy, app.mcp_restart_required).await
+        mcp::discover_manager_snapshot_with_workspace(
+            &path,
+            &app.workspace,
+            network_policy,
+            app.mcp_restart_required,
+        )
+        .await
     } else {
-        mcp::manager_snapshot_from_config(&path, app.mcp_restart_required)
+        mcp::manager_snapshot_from_config_with_workspace(
+            &path,
+            &app.workspace,
+            app.mcp_restart_required,
+        )
     };
 
     match snapshot_result {
@@ -6238,13 +6774,17 @@ async fn steer_user_message(
     engine_handle: &EngineHandle,
     message: QueuedMessage,
 ) -> Result<()> {
+    let paused_note = prepare_paused_command_message(app, engine_handle, &message.display);
     let cwd = std::env::current_dir().ok();
     let references = crate::tui::file_mention::context_references_from_input(
         &message.display,
         &app.workspace,
         cwd.clone(),
     );
-    let content = queued_message_content_for_app(app, &message, cwd);
+    let mut content = queued_message_content_for_app(app, &message, cwd);
+    if let Some(note) = paused_note.as_deref() {
+        content.push_str(note);
+    }
     let message_index = app.api_messages.len();
 
     engine_handle.steer(content.clone()).await?;
@@ -6478,7 +7018,8 @@ async fn handle_plan_choice(
 /// - `pending_steers` — typed during a running turn + Esc; held until the
 ///   abort lands and gets resubmitted as a fresh merged turn.
 /// - `rejected_steers` — engine declined a mid-turn steer (scaffolding;
-///   no engine path produces these yet but the bucket renders identically).
+///   no engine path produces these yet but the bucket renders with a distinct
+///   rejected-steer label).
 /// - `queued_messages` — Enter while busy (offline-mode FIFO); drained at
 ///   end-of-turn.
 fn build_pending_input_preview(app: &App) -> PendingInputPreview {
@@ -6520,6 +7061,13 @@ fn build_pending_input_preview(app: &App) -> PendingInputPreview {
         .iter()
         .map(|m| m.display.clone())
         .collect();
+    preview.editing_queued_message = app.queued_draft.as_ref().map(|draft| {
+        if app.input.trim().is_empty() {
+            draft.display.clone()
+        } else {
+            app.input.clone()
+        }
+    });
     preview
 }
 
@@ -6631,6 +7179,8 @@ fn render(f: &mut Frame, app: &mut App) {
             crate::config::ApiProvider::Vllm => Some("vLLM"),
             crate::config::ApiProvider::Ollama => Some("Ollama"),
             crate::config::ApiProvider::Huggingface => Some("HF"),
+            crate::config::ApiProvider::Together => Some("Together"),
+            crate::config::ApiProvider::OpenaiCodex => Some("Codex"),
         };
         let status_indicator_started_at = if app.low_motion {
             None
@@ -6764,34 +7314,55 @@ fn render(f: &mut Frame, app: &mut App) {
                 }
             }
 
-            // Render sidebar hover tooltip if active.
+            // Render sidebar hover popover if active.
             if let Some(ref tooltip_text) = app.sidebar_hover_tooltip
                 && let Some((mouse_col, mouse_row)) = app.last_mouse_pos
             {
-                let text_width = (tooltip_text.len() as u16).clamp(10, 60);
-                let tooltip_height = 1u16;
-                let x = mouse_col
-                    .saturating_add(2)
-                    .min(size.width.saturating_sub(text_width));
-                // Sit one row BELOW the cursor so the tooltip never paints over
-                // the row above the hovered line (which read as corruption).
-                let y = mouse_row
-                    .saturating_add(1)
-                    .min(size.height.saturating_sub(tooltip_height));
-                if text_width > 0 && tooltip_height > 0 {
+                let max_popup_width = 72u16.min(size.width.saturating_sub(4));
+                if max_popup_width >= 10 && size.height >= 3 {
+                    let popup_width = tooltip_text
+                        .lines()
+                        .map(text_display_width)
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_add(2)
+                        .clamp(12, max_popup_width as usize)
+                        as u16;
+                    let inner_width = popup_width.saturating_sub(2).max(1) as usize;
+                    let wrapped_rows = tooltip_text.lines().fold(0u16, |rows, line| {
+                        let width = text_display_width(line);
+                        rows.saturating_add(((width.max(1) - 1) / inner_width + 1) as u16)
+                    });
+                    let popup_content_height = wrapped_rows.clamp(1, 10);
+                    let popup_height = popup_content_height.saturating_add(2);
+                    let x = mouse_col
+                        .saturating_add(2)
+                        .min(size.width.saturating_sub(popup_width));
+                    // Sit one row BELOW the cursor so the tooltip never paints over
+                    // the row above the hovered line (which read as corruption).
+                    let y = mouse_row
+                        .saturating_add(1)
+                        .min(size.height.saturating_sub(popup_height));
                     let tooltip_area = Rect {
                         x,
                         y,
-                        width: text_width,
-                        height: tooltip_height,
+                        width: popup_width,
+                        height: popup_height,
                     };
-                    // Neutral elevated-surface styling so the tooltip reads as a
-                    // tooltip, not a warning highlight (was STATUS_WARNING).
-                    let tooltip = ratatui::widgets::Paragraph::new(tooltip_text.as_str()).style(
-                        Style::default()
-                            .bg(palette::SURFACE_ELEVATED)
-                            .fg(palette::TEXT_PRIMARY),
-                    );
+                    // Neutral elevated-surface styling so the popover reads as a
+                    // detail surface, not a warning highlight.
+                    let tooltip = ratatui::widgets::Paragraph::new(tooltip_text.as_str())
+                        .wrap(ratatui::widgets::Wrap { trim: false })
+                        .block(
+                            Block::default()
+                                .borders(ratatui::widgets::Borders::ALL)
+                                .border_style(Style::default().fg(palette::DEEPSEEK_BLUE))
+                                .style(
+                                    Style::default()
+                                        .bg(palette::SURFACE_ELEVATED)
+                                        .fg(palette::TEXT_PRIMARY),
+                                ),
+                        );
                     f.render_widget(tooltip, tooltip_area);
                 }
             }
@@ -7216,6 +7787,11 @@ async fn handle_view_events(
                             apply_model_and_compaction_update(engine_handle, compaction, app.mode)
                                 .await;
                         }
+                        AppAction::UpdateStreamChunkTimeout(timeout_secs) => {
+                            let _ = engine_handle
+                                .send(Op::SetStreamChunkTimeout { timeout_secs })
+                                .await;
+                        }
                         AppAction::OpenConfigView => {}
                         _ => {}
                     }
@@ -7232,7 +7808,7 @@ async fn handle_view_events(
                 app.status_items = items.clone();
                 app.needs_redraw = true;
                 if final_save {
-                    match commands::persist_status_items(&items) {
+                    match crate::config_persistence::persist_status_items(&items) {
                         Ok(path) => {
                             app.status_message =
                                 Some(format!("Status line saved to {}", path.display()));
@@ -7645,6 +8221,8 @@ async fn apply_provider_picker_api_key(
             ApiProvider::Vllm => &mut providers.vllm,
             ApiProvider::Ollama => &mut providers.ollama,
             ApiProvider::Huggingface => &mut providers.huggingface,
+            ApiProvider::Together => &mut providers.together,
+            ApiProvider::OpenaiCodex => &mut providers.openai_codex,
         };
         entry.api_key = Some(api_key);
     }
@@ -7702,6 +8280,8 @@ fn set_provider_auth_mode_in_memory(config: &mut Config, provider: ApiProvider, 
         ApiProvider::Vllm => &mut providers.vllm,
         ApiProvider::Ollama => &mut providers.ollama,
         ApiProvider::Huggingface => &mut providers.huggingface,
+        ApiProvider::Together => &mut providers.together,
+        ApiProvider::OpenaiCodex => &mut providers.openai_codex,
     };
     entry.auth_mode = Some(auth_mode);
 }
@@ -7935,6 +8515,16 @@ fn resume_terminal(
         use_mouse_capture,
         use_bracketed_paste,
     );
+    // Cache the real terminal size *before* resetting the viewport, so that
+    // reset_terminal_viewport → terminal.clear() → autoresize() → backend.size()
+    // picks up the cached size instead of falling through to
+    // crossterm::terminal::size() which may return stale buffer metadata
+    // (especially on Windows after a secondary EnterAlternateScreen).
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        terminal
+            .backend_mut()
+            .set_terminal_size(Size::new(cols, rows));
+    }
     reset_terminal_viewport(terminal, sync_output_enabled)?;
     Ok(())
 }
@@ -8274,7 +8864,7 @@ fn jump_to_adjacent_tool_cell(app: &mut App, direction: SearchDirection) -> bool
     let current_cell = line_meta
         .get(top)
         .and_then(crate::tui::scrolling::TranscriptLineMeta::cell_line)
-        .map(|(cell_index, _)| cell_index);
+        .map(|(cell_index, _)| app.original_cell_index_for_rendered(cell_index));
 
     let mut scan_indices = Vec::new();
     match direction {
@@ -8290,6 +8880,7 @@ fn jump_to_adjacent_tool_cell(app: &mut App, direction: SearchDirection) -> bool
         let Some((cell_index, _)) = line_meta[idx].cell_line() else {
             continue;
         };
+        let cell_index = app.original_cell_index_for_rendered(cell_index);
         if current_cell.is_some_and(|current| current == cell_index) {
             continue;
         }
@@ -8567,7 +9158,7 @@ fn selected_transcript_cell_index(app: &App) -> Option<usize> {
                 .line_meta()
                 .get(start.line_index)
                 .and_then(|meta| meta.cell_line())
-                .map(|(cell_index, _)| cell_index)
+                .map(|(cell_index, _)| app.original_cell_index_for_rendered(cell_index))
         })
 }
 
@@ -8600,6 +9191,7 @@ fn activity_cell_rank(cell: &HistoryCell) -> Option<u8> {
         HistoryCell::Tool(tool) => match tool_status_for_activity(tool) {
             Some(ToolStatus::Running) => Some(0),
             Some(ToolStatus::Failed) => Some(1),
+            Some(ToolStatus::Hydrated) => Some(2),
             Some(ToolStatus::Success) => Some(2),
             None => Some(2),
         },
@@ -8831,6 +9423,12 @@ fn tool_status_for_activity(tool: &ToolCell) -> Option<ToolStatus> {
                 .any(|entry| entry.status == ToolStatus::Failed)
             {
                 Some(ToolStatus::Failed)
+            } else if cell
+                .entries
+                .iter()
+                .any(|entry| entry.status == ToolStatus::Hydrated)
+            {
+                Some(ToolStatus::Hydrated)
             } else {
                 Some(ToolStatus::Success)
             }
@@ -8866,6 +9464,7 @@ fn activity_status_label(status: ToolStatus) -> &'static str {
     match status {
         ToolStatus::Running => "running",
         ToolStatus::Success => "done",
+        ToolStatus::Hydrated => "tool loaded - retry required",
         ToolStatus::Failed => "failed",
     }
 }
@@ -9112,7 +9711,7 @@ fn detail_target_cell_index(app: &App) -> Option<usize> {
             .line_meta()
             .get(start.line_index)
             .and_then(|meta| meta.cell_line())
-            .map(|(cell_index, _)| cell_index);
+            .map(|(cell_index, _)| app.original_cell_index_for_rendered(cell_index));
     }
 
     app.detail_cell_index_for_viewport(
@@ -9159,6 +9758,7 @@ fn activity_footer_target_cell_index(app: &App) -> Option<usize> {
         let Some((cell_index, _)) = meta.cell_line() else {
             continue;
         };
+        let cell_index = app.original_cell_index_for_rendered(cell_index);
         if app
             .cell_at_virtual_index(cell_index)
             .is_some_and(is_meaningful_activity_cell)

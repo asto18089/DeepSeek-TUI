@@ -16,11 +16,6 @@ use tokio::time::timeout as tokio_timeout;
 
 use crate::config::wire_model_for_provider;
 
-/// Default idle timeout for SSE stream reads (300 seconds = 5 minutes).
-/// After this period with no data, the stream is considered stalled and
-/// yields a recoverable error so the caller can retry.
-const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-
 /// Default timeout for the initial streaming response headers.
 ///
 /// `doctor` uses a bounded non-streaming request, but normal TUI turns first
@@ -45,17 +40,6 @@ fn stream_open_timeout_from_env(value: Option<&str>) -> Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_STREAM_OPEN_TIMEOUT.as_secs())
         .clamp(5, 300);
-    Duration::from_secs(secs)
-}
-
-/// Reads the `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` env var, falling back to
-/// the default 300s. The parsed value is clamped to [1, 3600] seconds.
-fn stream_idle_timeout() -> Duration {
-    let secs = std::env::var("DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT.as_secs())
-        .clamp(1, 3600);
     Duration::from_secs(secs)
 }
 
@@ -91,6 +75,7 @@ impl DeepSeekClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse> {
+        let cacheable = crate::llm_response_cache::request_is_cacheable(request);
         let messages = build_chat_messages_for_request_and_provider(request, self.api_provider);
         let model = wire_model_for_provider(self.api_provider, &request.model);
         let mut body = json!({
@@ -137,6 +122,24 @@ impl DeepSeekClient {
             self.api_provider,
         );
 
+        let response_cache_key = if cacheable {
+            let wire_body =
+                serde_json::to_vec(&body).context("Failed to serialize Chat API cache key")?;
+            let key = crate::llm_response_cache::ResponseCache::make_key(
+                self.api_provider.as_str(),
+                &self.base_url,
+                self.path_suffix.as_deref(),
+                &self.api_key,
+                &wire_body,
+            );
+            if let Some(cached) = crate::llm_response_cache::response_cache().get(&key) {
+                return Ok(cached);
+            }
+            Some(key)
+        } else {
+            None
+        };
+
         let url = api_url_with_suffix(
             &self.base_url,
             "chat/completions",
@@ -171,10 +174,17 @@ impl DeepSeekClient {
             anyhow::bail!("Failed to call DeepSeek Chat API: HTTP {status}: {error_text}");
         }
 
-        let response_text = response.text().await.unwrap_or_default();
+        let response_text = response
+            .text()
+            .await
+            .context("Failed to read Chat API response body")?;
         let value: Value =
             serde_json::from_str(&response_text).context("Failed to parse Chat API JSON")?;
-        parse_chat_message(&value)
+        let parsed = parse_chat_message(&value)?;
+        if let Some(key) = response_cache_key {
+            crate::llm_response_cache::response_cache().put(key, parsed.clone());
+        }
+        Ok(parsed)
     }
 }
 
@@ -283,6 +293,7 @@ impl DeepSeekClient {
         // gzip-compressor failure when investigating #103.
         let response_headers = format_stream_headers(response.headers());
         let byte_stream = response.bytes_stream();
+        let stream_idle_timeout = self.stream_idle_timeout;
 
         let stream = async_stream::stream! {
             use futures_util::StreamExt;
@@ -315,7 +326,7 @@ impl DeepSeekClient {
             let is_reasoning_model = is_reasoning_model_for_stream(api_provider, &model);
 
             let mut byte_stream = std::pin::pin!(byte_stream);
-            let idle = stream_idle_timeout();
+            let idle = stream_idle_timeout;
 
             // Telemetry for #103 stream-decode diagnostics: bytes received
             // since the start of this stream and last successful event time.
@@ -449,12 +460,11 @@ impl DeepSeekClient {
                 }
             }
 
-            // Close any open blocks
-            if thinking_started {
-                yield Ok(StreamEvent::ContentBlockStop { index: content_index.saturating_sub(1) });
-            }
-            if text_started {
-                yield Ok(StreamEvent::ContentBlockStop { index: content_index.saturating_sub(1) });
+            // Close any open blocks — content_index points to the
+            // currently active open block (it is only incremented
+            // *after* a block is closed, not when opened).
+            if thinking_started || text_started {
+                yield Ok(StreamEvent::ContentBlockStop { index: content_index });
             }
 
             release_stream_buffer(byte_buf);
@@ -1992,6 +2002,8 @@ fn provider_accepts_reasoning_content(provider: ApiProvider) -> bool {
             | ApiProvider::Novita
             | ApiProvider::Fireworks
             | ApiProvider::Siliconflow
+            | ApiProvider::SiliconflowCn
+            | ApiProvider::Volcengine
             | ApiProvider::Arcee
             | ApiProvider::Sglang
     )
@@ -3072,6 +3084,22 @@ mod stream_decoder_tests {
         }
     }
 
+    fn user_message_with_tail_turn_meta(task: &str, turn_meta: &str) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: vec![
+                ContentBlock::Text {
+                    text: task.to_string(),
+                    cache_control: None,
+                },
+                ContentBlock::Text {
+                    text: turn_meta.to_string(),
+                    cache_control: None,
+                },
+            ],
+        }
+    }
+
     fn tool_message_content(messages: &[Value], index: usize) -> &str {
         messages
             .iter()
@@ -3136,6 +3164,30 @@ mod stream_decoder_tests {
             format!("{expected_ref}\nsecond task"),
             "ref text must stay stable"
         );
+    }
+
+    #[test]
+    fn request_builder_keeps_tail_turn_meta_after_user_text_for_wire() {
+        let turn_meta = "<turn_meta>\nCurrent local date: 2026-05-09\n</turn_meta>";
+        let messages = vec![
+            user_message_with_tail_turn_meta("first task", turn_meta),
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "first answer".to_string(),
+                    cache_control: None,
+                }],
+            },
+            user_message_with_tail_turn_meta("second task", turn_meta),
+        ];
+
+        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+        let first = user_message_content(&built, 0);
+        let second = user_message_content(&built, 1);
+        let expected_ref = "<turn_meta_unchanged />";
+
+        assert_eq!(first, format!("first task\n{turn_meta}"));
+        assert_eq!(second, format!("second task\n{expected_ref}"));
     }
 
     #[test]

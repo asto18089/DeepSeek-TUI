@@ -69,14 +69,11 @@ impl Engine {
         let mut loop_guard = LoopGuard::default();
         let mut goal_continuations_this_turn = 0u32;
 
-        // Transparent stream-retry counter: when the chunked-transfer
-        // connection dies mid-stream and we got nothing useful out of it
-        // (no tool calls, no completed text), we silently re-issue the
-        // SAME request up to MAX_STREAM_RETRIES times before surfacing
-        // the failure to the user. This is the #103 Phase 3 retry that
-        // keeps long V4 thinking turns from being killed by transient
-        // proxy disconnects.
-        const MAX_STREAM_RETRIES: u32 = 3;
+        // Outer stream-retry counter: when the chunked-transfer connection
+        // dies mid-stream and either nothing useful was streamed (#103
+        // Phase 3) or the host slept mid-turn (#2990), we silently re-issue
+        // the SAME request up to MAX_STREAM_RETRIES times before surfacing
+        // the failure to the user.
         let mut stream_retry_attempts: u32 = 0;
 
         'turn_loop: loop {
@@ -105,7 +102,7 @@ impl Engine {
             }
 
             // Ensure system prompt is up to date with latest session states
-            self.refresh_system_prompt(mode);
+            self.refresh_system_prompt();
 
             if turn.at_max_steps() {
                 let _ = self
@@ -468,9 +465,15 @@ impl Engine {
             // `stream_start` is reset on a transparent retry so the wall-clock
             // budget restarts with the fresh stream.
             let mut stream_start = Instant::now();
+            // #2990 sleep-resume bookkeeping: monotonic and wall-clock stamps
+            // of the last stream progress. `Instant` pauses across a host
+            // suspend while `SystemTime` does not, so a large divergence on
+            // the next error tells "machine slept" apart from "network died".
+            let mut last_progress_mono = Instant::now();
+            let mut last_progress_wall = std::time::SystemTime::now();
+            let mut sleep_resume_pending = false;
             let mut stream_content_bytes: usize = 0;
-            let chunk_timeout_secs = stream_chunk_timeout_secs();
-            let chunk_timeout = Duration::from_secs(chunk_timeout_secs);
+            let (chunk_timeout_secs, chunk_timeout) = stream_chunk_timeout_budget(&self.config);
             let max_duration = Duration::from_secs(STREAM_MAX_DURATION_SECS);
 
             // Process stream events
@@ -542,6 +545,8 @@ impl Engine {
 
                 let event = match event_result {
                     Ok(e) => {
+                        last_progress_mono = Instant::now();
+                        last_progress_wall = std::time::SystemTime::now();
                         // Flip on the first non-MessageStart event — that's
                         // the moment we cross from "stream not yet productive"
                         // (eligible for transparent retry) into "DeepSeek has
@@ -554,8 +559,8 @@ impl Engine {
                     Err(e) => {
                         stream_errors = stream_errors.saturating_add(1);
                         let message = self.decorate_auth_error_message(e.to_string());
-                        // Diagnostic for the SSE-idle-timeout-mid-tool-call bug:
-                        // when the stream dies with tool_use blocks still open,
+                        // [pinvou3-fork] Diagnostic for the SSE-idle-timeout-mid-tool-call
+                        // bug: when the stream dies with tool_use blocks still open,
                         // dump each one's buffer state. An empty buffer means the
                         // timeout fired BEFORE any argument delta arrived (the
                         // half-born call later dispatches missing required fields,
@@ -580,6 +585,27 @@ impl Engine {
                                 tool_uses.len(),
                                 inflight.join(", "),
                             ));
+                        }
+                        // #2990: wall-clock far ahead of the monotonic clock
+                        // since the last chunk means the host slept mid-stream.
+                        // The partial output predates the sleep and the user
+                        // was not watching — schedule a full request retry in
+                        // the post-loop block instead of failing the turn.
+                        let wall_elapsed = last_progress_wall
+                            .elapsed()
+                            .unwrap_or_else(|_| last_progress_mono.elapsed());
+                        if should_resume_after_sleep(
+                            sleep_gap_detected(last_progress_mono.elapsed(), wall_elapsed),
+                            stream_retry_attempts,
+                            self.cancel_token.is_cancelled(),
+                        ) {
+                            crate::logging::warn(format!(
+                                "Stream error after suspected system sleep ({:?} monotonic vs {:?} wall since last chunk); scheduling request retry: {message}",
+                                last_progress_mono.elapsed(),
+                                wall_elapsed,
+                            ));
+                            sleep_resume_pending = true;
+                            break;
                         }
                         // #103: when the stream errors before any content was
                         // streamed AND we still have retry budget, transparently
@@ -879,18 +905,37 @@ impl Engine {
                 && current_text_visible.trim().is_empty()
                 && current_thinking.trim().is_empty()
                 && !pending_message_complete;
-            if stream_died_with_nothing {
+            if stream_died_with_nothing || sleep_resume_pending {
                 if stream_retry_attempts < MAX_STREAM_RETRIES {
                     stream_retry_attempts = stream_retry_attempts.saturating_add(1);
-                    crate::logging::warn(format!(
-                        "Stream died with no content (attempt {stream_retry_attempts}/{MAX_STREAM_RETRIES}); retrying request"
-                    ));
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Connection interrupted; retrying ({stream_retry_attempts}/{MAX_STREAM_RETRIES})"
-                        )))
-                        .await;
+                    if sleep_resume_pending {
+                        crate::logging::warn(format!(
+                            "Resuming after system sleep (attempt {stream_retry_attempts}/{MAX_STREAM_RETRIES}); discarding partial output and retrying request"
+                        ));
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!(
+                                "System sleep detected; connection lost — retrying request ({stream_retry_attempts}/{MAX_STREAM_RETRIES})"
+                            )))
+                            .await;
+                        // Finalize any partially-rendered assistant cell so
+                        // the retried stream renders fresh instead of
+                        // appending to the pre-sleep fragment.
+                        if pending_message_complete {
+                            let index = last_text_index.unwrap_or(0);
+                            let _ = self.tx_event.send(Event::MessageComplete { index }).await;
+                        }
+                    } else {
+                        crate::logging::warn(format!(
+                            "Stream died with no content (attempt {stream_retry_attempts}/{MAX_STREAM_RETRIES}); retrying request"
+                        ));
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!(
+                                "Connection interrupted; retrying ({stream_retry_attempts}/{MAX_STREAM_RETRIES})"
+                            )))
+                            .await;
+                    }
                     // Don't preserve the per-stream `turn_error` — we're
                     // about to retry, and a successful retry should not
                     // surface the transient error as the turn outcome.
@@ -1287,6 +1332,14 @@ impl Engine {
             }
 
             // Execute tools
+            if self.shared_paused.lock().is_ok_and(|paused| *paused) {
+                let _ = self
+                    .tx_event
+                    .send(Event::status("Request was Paused"))
+                    .await;
+                return (TurnOutcomeStatus::Interrupted, None);
+            }
+
             let tool_exec_lock = self.tool_exec_lock.clone();
             let mcp_pool = if tool_uses
                 .iter()
@@ -2180,7 +2233,6 @@ impl Engine {
             if self
                 .run_capacity_post_tool_checkpoint(
                     turn,
-                    mode,
                     tool_registry,
                     tool_exec_lock.clone(),
                     mcp_pool.clone(),
@@ -2212,7 +2264,6 @@ impl Engine {
             if self
                 .run_capacity_error_escalation_checkpoint(
                     turn,
-                    mode,
                     step_error_count,
                     consecutive_tool_error_steps,
                     &step_error_categories,
@@ -2285,11 +2336,15 @@ impl Engine {
     }
 
     pub(super) fn messages_with_turn_metadata(&self) -> Vec<Message> {
-        // `<turn_meta>` is stored on user-text messages when the message is
-        // appended. Do not rewrite historical messages at request time: doing
-        // so makes the API prefix differ from the bytes sent in earlier turns
-        // and destroys DeepSeek's KV prefix cache reuse.
-        self.session.messages.clone()
+        // Keep stored history byte-stable and provider-compatible: runtime
+        // mode/approval contracts are projected as a transient user message
+        // at request time instead of being persisted as appended system
+        // messages. This preserves the stable prefix through all stored
+        // messages while avoiding strict chat templates that only allow
+        // system messages at messages[0].
+        let mut messages = self.session.messages.clone();
+        messages.push(self.runtime_prompt_message());
+        messages
     }
 }
 
@@ -2321,6 +2376,29 @@ XML unless the user explicitly asks to debug sub-agent internals.\n\n\
 
 fn should_hold_turn_for_subagents(queued_completions: usize, running_children: usize) -> bool {
     queued_completions > 0 || running_children > 0
+}
+
+fn stream_chunk_timeout_budget(config: &EngineConfig) -> (u64, Duration) {
+    let secs = config.stream_chunk_timeout.as_secs();
+    (secs, Duration::from_secs(secs))
+}
+
+#[cfg(test)]
+mod stream_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn stream_chunk_timeout_budget_uses_engine_config() {
+        let config = EngineConfig {
+            stream_chunk_timeout: Duration::from_secs(42),
+            ..EngineConfig::default()
+        };
+
+        assert_eq!(
+            stream_chunk_timeout_budget(&config),
+            (42, Duration::from_secs(42))
+        );
+    }
 }
 
 fn command_allows_tool(allowed_tools: Option<&[String]>, tool_name: &str) -> bool {

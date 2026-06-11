@@ -471,7 +471,13 @@ struct AppServerArgs {
 
 const MCP_SERVER_DEFINITIONS_KEY: &str = "mcp.server_definitions";
 
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 pub fn run_cli() -> std::process::ExitCode {
+    install_rustls_crypto_provider();
+
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
@@ -759,11 +765,13 @@ fn provider_slot(provider: ProviderKind) -> &'static str {
         ProviderKind::Vllm => "vllm",
         ProviderKind::Ollama => "ollama",
         ProviderKind::Huggingface => "huggingface",
+        ProviderKind::Together => "together",
+        ProviderKind::OpenaiCodex => "openai-codex",
     }
 }
 
 /// Provider order used by the `auth list` and `auth status` outputs.
-const PROVIDER_LIST: [ProviderKind; 18] = [
+const PROVIDER_LIST: [ProviderKind; 20] = [
     ProviderKind::Deepseek,
     ProviderKind::NvidiaNim,
     ProviderKind::Openai,
@@ -782,6 +790,8 @@ const PROVIDER_LIST: [ProviderKind; 18] = [
     ProviderKind::Vllm,
     ProviderKind::Ollama,
     ProviderKind::Huggingface,
+    ProviderKind::Together,
+    ProviderKind::OpenaiCodex,
 ];
 
 #[cfg(test)]
@@ -853,6 +863,8 @@ fn provider_env_vars(provider: ProviderKind) -> &'static [&'static str] {
             "WANJIE_API_KEY",
             "WANJIE_MAAS_API_KEY",
         ],
+        ProviderKind::Together => &["TOGETHER_API_KEY"],
+        ProviderKind::OpenaiCodex => &["OPENAI_CODEX_ACCESS_TOKEN", "CODEX_ACCESS_TOKEN"],
     }
 }
 
@@ -1599,6 +1611,7 @@ fn build_tui_command(
             | ProviderKind::Openai
             | ProviderKind::Atlascloud
             | ProviderKind::WanjieArk
+            | ProviderKind::Volcengine
             | ProviderKind::Openrouter
             | ProviderKind::XiaomiMimo
             | ProviderKind::Novita
@@ -1611,7 +1624,7 @@ fn build_tui_command(
             | ProviderKind::Ollama
     ) {
         bail!(
-            "The interactive TUI supports DeepSeek, NVIDIA NIM, OpenAI-compatible, AtlasCloud, Wanjie Ark, OpenRouter, Xiaomi MiMo, Novita, Fireworks, SiliconFlow, Arcee AI, Moonshot/Kimi, SGLang, vLLM, and Ollama providers. Remove --provider {} or use `codewhale model ...` for provider registry inspection.",
+            "The interactive TUI supports DeepSeek, NVIDIA NIM, OpenAI-compatible, AtlasCloud, Wanjie Ark, Volcengine Ark, OpenRouter, Xiaomi MiMo, Novita, Fireworks, SiliconFlow, Arcee AI, Moonshot/Kimi, SGLang, vLLM, and Ollama providers. Remove --provider {} or use `codewhale model ...` for provider registry inspection.",
             resolved_runtime.provider.as_str()
         );
     }
@@ -2965,6 +2978,7 @@ mod tests {
             api_key_source: Some(RuntimeApiKeySource::Keyring),
             base_url: "https://openai-compatible.example/v4".to_string(),
             auth_mode: Some("api_key".to_string()),
+            insecure_skip_tls_verify: false,
             output_mode: None,
             log_level: None,
             telemetry: false,
@@ -3024,6 +3038,7 @@ mod tests {
             api_key_source: Some(RuntimeApiKeySource::ConfigFile),
             base_url: "https://api.deepseek.com/beta".to_string(),
             auth_mode: Some("api_key".to_string()),
+            insecure_skip_tls_verify: false,
             output_mode: None,
             log_level: None,
             telemetry: false,
@@ -3079,6 +3094,7 @@ mod tests {
             api_key_source: Some(RuntimeApiKeySource::Keyring),
             base_url: "https://api.moonshot.ai/v1".to_string(),
             auth_mode: Some("api_key".to_string()),
+            insecure_skip_tls_verify: false,
             output_mode: None,
             log_level: None,
             telemetry: false,
@@ -3117,6 +3133,70 @@ mod tests {
     }
 
     #[test]
+    fn build_tui_command_allows_volcengine_and_forwards_ark_keys() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let custom = dir
+            .path()
+            .join(format!("custom-tui{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&custom, b"").unwrap();
+        let custom_str = custom.to_string_lossy().into_owned();
+        let _bin = ScopedEnvVar::set("DEEPSEEK_TUI_BIN", &custom_str);
+
+        let cli = parse_ok(&[
+            "codewhale",
+            "--provider",
+            "volcengine",
+            "--model",
+            "DeepSeek-V4-Pro",
+            "--workspace",
+            "/tmp/codewhale-workspace",
+        ]);
+        let resolved = ResolvedRuntimeOptions {
+            provider: ProviderKind::Volcengine,
+            model: "DeepSeek-V4-Pro".to_string(),
+            api_key: Some("resolved-ark-key".to_string()),
+            api_key_source: Some(RuntimeApiKeySource::Keyring),
+            base_url: "https://ark.cn-beijing.volces.com/api/coding/v3".to_string(),
+            auth_mode: Some("api_key".to_string()),
+            insecure_skip_tls_verify: false,
+            output_mode: None,
+            log_level: None,
+            telemetry: false,
+            approval_policy: None,
+            sandbox_mode: None,
+            yolo: None,
+            http_headers: std::collections::BTreeMap::new(),
+        };
+
+        let cmd = build_tui_command(&cli, &resolved, Vec::new()).expect("command");
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_PROVIDER").as_deref(),
+            Some("volcengine")
+        );
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_MODEL").as_deref(),
+            Some("DeepSeek-V4-Pro")
+        );
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_API_KEY").as_deref(),
+            Some("resolved-ark-key")
+        );
+        assert_eq!(
+            command_env(&cmd, "VOLCENGINE_API_KEY").as_deref(),
+            Some("resolved-ark-key")
+        );
+        assert_eq!(
+            command_env(&cmd, "VOLCENGINE_ARK_API_KEY").as_deref(),
+            Some("resolved-ark-key")
+        );
+        assert_eq!(
+            command_env(&cmd, "ARK_API_KEY").as_deref(),
+            Some("resolved-ark-key")
+        );
+    }
+
+    #[test]
     fn build_tui_command_exports_explicit_provider_model_and_base_url() {
         let _lock = env_lock();
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -3145,6 +3225,7 @@ mod tests {
             api_key_source: None,
             base_url: "https://openai-compatible.example/v4".to_string(),
             auth_mode: None,
+            insecure_skip_tls_verify: false,
             output_mode: None,
             log_level: None,
             telemetry: false,
@@ -3240,6 +3321,7 @@ mod tests {
                 api_key_source: Some(RuntimeApiKeySource::Keyring),
                 base_url: "http://localhost:8000/v1".to_string(),
                 auth_mode: Some("api_key".to_string()),
+                insecure_skip_tls_verify: false,
                 output_mode: None,
                 log_level: None,
                 telemetry: false,

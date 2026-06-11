@@ -15,6 +15,7 @@ pub mod compaction;
 pub mod composer_history;
 pub mod composer_stash;
 pub mod config;
+pub mod config_persistence; // [pinvou3-fork C1] v0.8.57 上游新增,facade 同步
 pub mod config_ui;
 pub mod core;
 pub mod cost_status;
@@ -27,19 +28,24 @@ pub mod features;
 pub mod handoff;
 pub mod hooks;
 pub mod llm_client;
+pub mod llm_response_cache; // [pinvou3-fork C1] v0.8.57 上游新增,facade 同步
 pub mod localization;
 pub mod logging;
 pub mod lsp;
 pub mod mcp;
 pub mod mcp_server;
 pub mod memory;
+pub mod model_routing; // [pinvou3-fork C1] v0.8.57 上游新增(模型解析迁出 models.rs),facade 同步
 pub mod models;
 pub mod network_policy;
+pub mod oauth; // [pinvou3-fork C1] v0.8.57 上游新增(openai-codex provider),facade 同步
 pub mod palette;
 pub mod prefix_cache;
 pub mod pricing;
 pub mod project_context;
+pub mod project_context_cache; // [pinvou3-fork C1] v0.8.57 上游新增(跨会话上下文缓存),facade 同步
 pub mod project_doc;
+pub mod prompt_persist; // [pinvou3-fork C1] v0.8.57 上游新增(跨会话 prompt 前缀缓存),facade 同步
 pub mod prompt_zones;
 pub mod prompts;
 pub mod purge;
@@ -61,6 +67,7 @@ pub mod skills;
 pub mod slop_ledger;
 pub mod snapshot;
 pub mod task_manager;
+pub mod tls; // [pinvou3-fork C1] v0.8.57 上游新增(insecure_skip_tls_verify),facade 同步
 pub mod tool_output_receipts;
 pub mod tools;
 pub mod tui;
@@ -86,7 +93,7 @@ pub async fn resolve_cli_auto_route(
     model: &str,
     prompt: &str,
 ) -> CliAutoRoute {
-    use commands::resolve_auto_route_with_flash;
+    use model_routing::resolve_auto_route_with_flash; // [pinvou3-fork C1] v0.8.57 从 commands 迁到 model_routing
     if model.trim().eq_ignore_ascii_case("auto") {
         let selection = resolve_auto_route_with_flash(config, prompt, "", "auto", "auto").await;
         CliAutoRoute {

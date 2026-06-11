@@ -532,6 +532,7 @@ enum ConfigSection {
     Provider,
     Model,
     Permissions,
+    Network,
     Display,
     Composer,
     Sidebar,
@@ -545,6 +546,7 @@ impl ConfigSection {
             ConfigSection::Provider => "Provider",
             ConfigSection::Model => "Model",
             ConfigSection::Permissions => "Permissions",
+            ConfigSection::Network => "Network",
             ConfigSection::Display => "Display",
             ConfigSection::Composer => "Composer",
             ConfigSection::Sidebar => "Sidebar",
@@ -659,6 +661,13 @@ impl ConfigView {
                 scope: ConfigScope::Saved,
             },
             ConfigRow {
+                section: ConfigSection::Network,
+                key: "stream_chunk_timeout_secs".to_string(),
+                value: app.stream_chunk_timeout_secs.to_string(),
+                editable: true,
+                scope: ConfigScope::Session,
+            },
+            ConfigRow {
                 section: ConfigSection::Display,
                 key: "theme".to_string(),
                 value: settings.theme.clone(),
@@ -742,6 +751,13 @@ impl ConfigView {
                 section: ConfigSection::Display,
                 key: "transcript_spacing".to_string(),
                 value: settings.transcript_spacing.clone(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::Display,
+                key: "tool_collapse".to_string(),
+                value: settings.tool_collapse_mode.clone(),
                 editable: true,
                 scope: ConfigScope::Saved,
             },
@@ -1244,6 +1260,7 @@ fn config_hint_for_key(key: &str) -> &'static str {
         | "composer_border"
         | "paste_burst_detection" => "on/off, true/false, yes/no, 1/0",
         "composer_density" | "transcript_spacing" => "compact | comfortable | spacious",
+        "tool_collapse" => "compact | expanded | calm",
         "theme" => "system | dark | light | grayscale",
         "locale" => "auto | en | ja | zh-Hans | pt-BR",
         "background_color" => "#RRGGBB | default",
@@ -1760,6 +1777,8 @@ fn live_subagent_result(
         agent_id: agent_id.to_string(),
         context_mode: "fresh".to_string(),
         fork_context: false,
+        workspace: None,
+        git_branch: None,
         agent_type,
         assignment: SubAgentAssignment {
             objective: summarize_tool_output(objective),
@@ -1770,6 +1789,7 @@ fn live_subagent_result(
         status,
         result: None,
         steps_taken: 0,
+        checkpoint: None,
         duration_ms: 0,
         from_prior_session: false,
     }
@@ -2057,6 +2077,25 @@ fn append_subagent_group(
             ]));
         }
 
+        if let Some(branch) = agent.git_branch.as_deref() {
+            let workspace = agent
+                .workspace
+                .as_deref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty());
+            let mut branch_detail = format!("branch {branch}");
+            if let Some(workspace) = workspace {
+                branch_detail.push_str(&format!(" @ {workspace}"));
+            }
+            let max_len = content_width.saturating_sub(14);
+            let branch_detail = truncate_view_text(&branch_detail, max_len);
+            lines.push(Line::from(vec![
+                Span::styled("    git: ", Style::default().fg(palette::TEXT_MUTED)),
+                Span::styled(branch_detail, Style::default().fg(palette::DEEPSEEK_SKY)),
+            ]));
+        }
+
         let max_len = content_width.saturating_sub(18);
         let objective = truncate_view_text(&agent.assignment.objective, max_len);
         lines.push(Line::from(vec![
@@ -2258,6 +2297,8 @@ mod tests {
             agent_id: id.to_string(),
             context_mode: "fresh".to_string(),
             fork_context: false,
+            workspace: None,
+            git_branch: None,
             agent_type: SubAgentType::Explore,
             assignment: SubAgentAssignment {
                 objective: "read the docs".to_string(),
@@ -2268,6 +2309,7 @@ mod tests {
             status,
             result: None,
             steps_taken: 1,
+            checkpoint: None,
             duration_ms: 10,
             from_prior_session: false,
         }
@@ -2361,6 +2403,7 @@ mod tests {
                 ConfigSection::Provider.label(),
                 ConfigSection::Model.label(),
                 ConfigSection::Permissions.label(),
+                ConfigSection::Network.label(),
                 ConfigSection::Display.label(),
                 ConfigSection::Composer.label(),
                 ConfigSection::Sidebar.label(),
@@ -2385,6 +2428,7 @@ mod tests {
         assert!(keys.contains(&"base_url"));
         assert!(keys.contains(&"approval_mode"));
         assert!(keys.contains(&"allow_shell"));
+        assert!(keys.contains(&"stream_chunk_timeout_secs"));
         assert!(keys.contains(&"theme"));
         assert!(keys.contains(&"locale"));
         assert!(keys.contains(&"background_color"));
@@ -2392,6 +2436,7 @@ mod tests {
         assert!(keys.contains(&"status_indicator"));
         assert!(keys.contains(&"synchronized_output"));
         assert!(keys.contains(&"auto_compact"));
+        assert!(keys.contains(&"tool_collapse"));
         assert!(keys.contains(&"composer_border"));
         assert!(keys.contains(&"composer_vim_mode"));
         assert!(keys.contains(&"bracketed_paste"));
