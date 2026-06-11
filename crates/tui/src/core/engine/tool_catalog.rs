@@ -290,7 +290,14 @@ pub(super) fn ensure_advanced_tooling(
         catalog.push(tool);
     }
 
-    if !catalog.iter().any(|t| t.name == TOOL_SEARCH_REGEX_NAME) {
+    // [pinvou3-fork] tool_search 工具(v0.8.57 上游新增注入)让模型能搜索并激活 deferred 工具。
+    // pinvou3 blocklist 是「defer 不删除」(工具仍在 catalog,只是首轮不显示),所以模型可用
+    // tool_search 激活被 blocklist 的 agent/delegate/rlm 等工具,绕过工具门控 → 前端不认识
+    // 这些工具,渲染成裸 JSON。pinvou3 把 tool_search 名加进 blocklist,is_pinvou3_hidden 为真
+    // 时不注入 → catalog 根本不含 tool_search → 模型无法激活任何 deferred 工具。详见 §C2 / sync §4。
+    if !catalog.iter().any(|t| t.name == TOOL_SEARCH_REGEX_NAME)
+        && !crate::tools::pinvou3_blocklist::is_pinvou3_hidden(TOOL_SEARCH_REGEX_NAME)
+    {
         catalog.push(Tool {
             tool_type: Some(TOOL_SEARCH_REGEX_TYPE.to_string()),
             name: TOOL_SEARCH_REGEX_NAME.to_string(),
@@ -317,7 +324,10 @@ pub(super) fn ensure_advanced_tooling(
         });
     }
 
-    if !catalog.iter().any(|t| t.name == TOOL_SEARCH_BM25_NAME) {
+    // [pinvou3-fork] 同上:tool_search BM25 变体也受 blocklist gate(见上方 regex 注释)。
+    if !catalog.iter().any(|t| t.name == TOOL_SEARCH_BM25_NAME)
+        && !crate::tools::pinvou3_blocklist::is_pinvou3_hidden(TOOL_SEARCH_BM25_NAME)
+    {
         catalog.push(Tool {
             tool_type: Some(TOOL_SEARCH_BM25_TYPE.to_string()),
             name: TOOL_SEARCH_BM25_NAME.to_string(),

@@ -3295,6 +3295,7 @@ fn tool_search_respects_and_caps_max_results() {
 }
 
 #[test]
+#[ignore = "pinvou3 fork(C2): tool_search 工具被 blocklist + ensure_advanced_tooling gate 禁用注入(防模型激活 deferred 工具),catalog 不含 tool_search,其 schema 无从校验"]
 fn tool_search_schema_exposes_max_results_default_and_cap() {
     let mut catalog = Vec::new();
     let always_load = HashSet::new();
@@ -4136,4 +4137,22 @@ async fn post_edit_hook_skips_unknown_tool_names() {
     engine.run_post_edit_lsp_hook("read_file", &input).await;
     assert!(engine.pending_lsp_blocks.is_empty());
     assert_eq!(fake.call_count(), 0);
+}
+
+#[test]
+fn forkguard_tool_search_not_injected_blocks_deferred_activation() {
+    // [pinvou3-fork] 回归保护:v0.8.57 上游新增 tool_search 工具注入(ensure_advanced_tooling),
+    // 让模型能搜索并激活 deferred 工具。pinvou3 blocklist 是 defer 不删除,模型可借 tool_search
+    // 激活被 blocklist 的 agent/delegate 等 → 前端裸 JSON(sync §4 回归)。pinvou3 把 tool_search
+    // 加进 blocklist + ensure_advanced_tooling 注入处 gate → catalog 根本不含 tool_search。
+    let always_load = HashSet::new();
+    let mut catalog = vec![api_tool("read_file"), api_tool("web_search")];
+    ensure_advanced_tooling(&mut catalog, AppMode::Yolo, &always_load);
+    assert!(
+        !catalog.iter().any(|t| t.name.starts_with("tool_search_tool")),
+        "tool_search 不应被注入(否则模型可借它激活被 blocklist 的 agent/delegate);catalog={:?}",
+        catalog.iter().map(|t| t.name.clone()).collect::<Vec<_>>()
+    );
+    assert!(crate::tools::pinvou3_blocklist::is_pinvou3_hidden("tool_search_tool_regex"));
+    assert!(crate::tools::pinvou3_blocklist::is_pinvou3_hidden("tool_search_tool_bm25"));
 }

@@ -110,6 +110,12 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     "slop_ledger_export",
     "slop_ledger_query",
     "slop_ledger_update",
+    // tool_search(v0.8.57 上游新增):让模型搜索并**激活 deferred 工具**,会绕过 pinvou3
+    // blocklist(blocklist 是 defer 不删除)激活 agent/delegate 等被隐藏的工具。pinvou3 的
+    // 23 工具是完整 active 集、无合法 deferred 工具要激活,故彻底禁用。tool_catalog.rs 注入处
+    // 配套 gate(is_pinvou3_hidden 为真不注入)→ catalog 根本不含 tool_search。
+    "tool_search_tool_regex",
+    "tool_search_tool_bm25",
 ];
 
 /// 工具名是否在 pinvou3 隐藏清单内。
