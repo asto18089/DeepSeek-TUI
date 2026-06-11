@@ -96,6 +96,20 @@ pub struct UserInputResponse {
     pub answers: Vec<UserInputAnswer>,
 }
 
+// [pinvou3-fork] Public decision envelope so sub-agent turn loops can
+// subscribe to the same `request_user_input` answer bus as the parent engine
+// and route replies by `tool_call_id`.
+#[derive(Debug, Clone)]
+pub enum UserInputDecision {
+    Submitted {
+        id: String,
+        response: UserInputResponse,
+    },
+    Cancelled {
+        id: String,
+    },
+}
+
 pub struct RequestUserInputTool;
 
 #[async_trait]

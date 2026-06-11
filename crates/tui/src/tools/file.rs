@@ -378,7 +378,19 @@ fn read_pdf_via_pdf_extract(
         // pdf-extract returns pages in document order; `start`/`end` are
         // 1-indexed inclusive (validated above), so we convert to a
         // 0-indexed half-open slice with bounds clamping.
-        let pages = pdf_extract::extract_text_by_pages(path).map_err(|e| {
+        // [pinvou3-fork] catch_unwind prevents pdf-extract font/CMap panics
+        // from crashing a whole sub-agent task; the model receives a normal
+        // tool error and can continue or ask for a converted PDF.
+        let pages = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pdf_extract::extract_text_by_pages(path)
+        }))
+        .map_err(|_| {
+            ToolError::execution_failed(format!(
+                "pdf-extract panicked on {} (PDF 字体编码不支持，如 Identity-H；请提供文本版或转换后重试)",
+                path.display()
+            ))
+        })?
+        .map_err(|e| {
             ToolError::execution_failed(format!(
                 "pdf-extract failed on {}: {e} (set `prefer_external_pdftotext = true` in settings.toml to retry via pdftotext)",
                 path.display()
@@ -401,7 +413,16 @@ fn read_pdf_via_pdf_extract(
         // extract_text uses an internal codepath that can hang on certain PDF
         // cross-reference tables or font encodings (#2641). The per-page path
         // avoids that hang and produces identical output when joined.
-        pdf_extract::extract_text_by_pages(path)
+        // [pinvou3-fork] Same panic guard for whole-document extraction.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pdf_extract::extract_text_by_pages(path)
+        }))
+        .map_err(|_| {
+            ToolError::execution_failed(format!(
+                "pdf-extract panicked on {} (PDF 字体编码不支持，如 Identity-H；请提供文本版或转换后重试)",
+                path.display()
+            ))
+        })?
             .map(|pages| pages.join("\n"))
             .map_err(|e| {
                 ToolError::execution_failed(format!(
@@ -1506,6 +1527,13 @@ mod tests {
         let raw = "   indented line\nregular line";
         let cleaned = super::clean_pdf_text(raw);
         assert_eq!(cleaned, "   indented line\nregular line");
+    }
+
+    #[test]
+    fn forkguard_clean_pdf_text_chinese_trailing_no_panic() {
+        let raw = "①性能：测试\n";
+        let cleaned = super::clean_pdf_text(raw);
+        assert_eq!(cleaned, "①性能：测试");
     }
 
     #[test]

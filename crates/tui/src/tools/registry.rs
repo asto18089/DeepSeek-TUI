@@ -979,6 +979,9 @@ impl ToolRegistryBuilder {
             .with_review_tool(client.clone(), model.clone())
             .with_rlm_tool(client, model)
             .with_speech_tools(speech_client, speech_output_dir)
+            // [pinvou3-fork] Sub-agents inherit web_search/fetch_url/web.run;
+            // workflow PM/research roles rely on this surface.
+            .with_web_tools()
             .with_subagent_tools(manager, runtime)
     }
 

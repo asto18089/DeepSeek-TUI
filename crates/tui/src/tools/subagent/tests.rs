@@ -1142,6 +1142,40 @@ fn test_subagent_tool_registry_reports_unavailable_tools() {
     );
 }
 
+/// [pinvou3-fork] Sub-agent registries must include web tools. Workflow roles
+/// such as researcher/product_manager may be spawned with explicit
+/// `web_search`/`fetch_url` allowlists; missing registration makes them die at
+/// spawn time before the model can produce fresh artifacts.
+#[test]
+fn forkguard_subagent_registry_includes_web_tools() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    runtime.allow_shell = false;
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::Custom,
+        Some(vec![
+            "read_file".to_string(),
+            "write_file".to_string(),
+            "web_search".to_string(),
+            "fetch_url".to_string(),
+        ]),
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    );
+    assert!(
+        registry.unavailable_allowed_tools().is_empty(),
+        "web_search/fetch_url must be registered for workflow sub-agents"
+    );
+}
+
+/// [pinvou3-fork] Sub-agent model calls are deterministic for workflow gates.
+#[test]
+fn forkguard_subagent_request_temperature_is_zero() {
+    assert_eq!(SUBAGENT_TEMPERATURE, 0.0);
+}
+
 #[test]
 fn test_review_agent_tools_exclude_agent_spawn() {
     let tmp = tempdir().expect("tempdir");
@@ -2633,6 +2667,7 @@ fn stub_runtime() -> SubAgentRuntime {
         fork_context: None,
         mcp_pool: None,
         step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
+        user_input_tx: None,
         speech_output_dir: None,
     }
 }

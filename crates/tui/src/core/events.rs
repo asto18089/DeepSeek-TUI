@@ -209,6 +209,9 @@ pub enum Event {
         id: String,
         result: String,
         role: Option<String>,
+        /// [pinvou3-fork] True when sub-agent execution ended via error rather
+        /// than a normal `SubAgentResult` completion.
+        failed: bool,
     },
 
     /// Sub-agent listing
