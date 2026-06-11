@@ -2343,7 +2343,13 @@ impl Engine {
         // messages while avoiding strict chat templates that only allow
         // system messages at messages[0].
         let mut messages = self.session.messages.clone();
-        messages.push(self.runtime_prompt_message());
+        // [pinvou3-fork #42] runtime_prompt tag 受 composer gate:装了 composer 的
+        // embedder(pinvou3)单固定模式,tag 恒定零信息;且其解释文档(Runtime Policy
+        // Reference)已被 composer gate 抑制——无解释的 internal tag 只会诱发模型复述。
+        // 未装 composer 时与上游行为完全一致。
+        if !crate::prompts::static_prompt_composer_installed() {
+            messages.push(self.runtime_prompt_message());
+        }
         messages
     }
 }

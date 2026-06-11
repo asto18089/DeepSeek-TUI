@@ -409,6 +409,16 @@ fn static_prompt_composer() -> Option<&'static StaticPromptComposer> {
     STATIC_PROMPT_COMPOSER.get().map(Box::as_ref)
 }
 
+/// [pinvou3-fork #42] Whether an embedder composer is installed. Used by
+/// turn_loop to gate the per-turn `<runtime_prompt>` tag projection: with a
+/// composer the embedder owns all mode doctrine (single fixed mode), so the
+/// tag is constant zero-information noise and its explainer (Runtime Policy
+/// Reference) is suppressed — an unexplained internal tag would only invite
+/// the model to narrate it.
+pub fn static_prompt_composer_installed() -> bool {
+    STATIC_PROMPT_COMPOSER.get().is_some()
+}
+
 fn set_prompt_override(cell: &std::sync::OnceLock<String>, s: String) -> Result<(), String> {
     cell.set(s)
 }
