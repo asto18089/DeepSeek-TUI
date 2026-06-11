@@ -65,6 +65,9 @@ impl Engine {
                 &self.config.tools_always_load,
             );
         }
+        // [pinvou3-fork] 监工硬白名单:在 advanced tooling/provider policy 之后裁,
+        // 保证 meta 工具同样受限(详见 EngineConfig.tool_whitelist)。
+        apply_tool_whitelist(&mut tool_catalog, self.config.tool_whitelist.as_ref());
         let mut active_tool_names = initial_active_tools(&tool_catalog);
         let mut loop_guard = LoopGuard::default();
         let mut goal_continuations_this_turn = 0u32;

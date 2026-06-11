@@ -252,6 +252,13 @@ pub struct EngineConfig {
     pub allow_shell: bool,
     /// Enable trust mode (skip approvals) when true.
     pub trust_mode: bool,
+    /// [pinvou3-fork] Hard tool whitelist for this engine. When `Some`, the
+    /// model-visible catalog is filtered down to exactly these tool names — a
+    /// true allowlist, not a `defer_loading` soft-hide: non-whitelisted tools
+    /// are removed entirely so `tool_search` cannot re-activate them. Used to
+    /// structurally constrain the workflow-session supervisor (品悟) to
+    /// read + review tools only.
+    pub tool_whitelist: Option<std::collections::HashSet<String>>,
     /// Path to the notes file used by the notes tool.
     pub notes_path: PathBuf,
     /// Path to the MCP configuration file.
@@ -379,6 +386,7 @@ impl Default for EngineConfig {
             workspace: PathBuf::from("."),
             allow_shell: true,
             trust_mode: false,
+            tool_whitelist: None,
             notes_path: PathBuf::from("notes.txt"),
             mcp_config_path: PathBuf::from("mcp.json"),
             skills_dir: crate::skills::default_skills_dir(),
@@ -2896,7 +2904,7 @@ use self::streaming::{
 use self::tool_catalog::{
     CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME,
     REQUEST_USER_INPUT_NAME, active_tools_for_step, apply_provider_tool_policy,
-    build_model_tool_catalog, ensure_advanced_tooling, execute_code_execution_tool,
+    apply_tool_whitelist, build_model_tool_catalog, ensure_advanced_tooling, execute_code_execution_tool,
     execute_tool_search, initial_active_tools, is_tool_search_tool,
     maybe_hydrate_requested_deferred_tool, missing_tool_error_message,
 };
