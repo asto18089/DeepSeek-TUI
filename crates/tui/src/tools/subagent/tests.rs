@@ -3208,3 +3208,34 @@ fn model_catalog_only_advertises_canonical_subagent_tools() {
         );
     }
 }
+
+// [pinvou3-fork] 项目目录识别按 _state/workflow_progress.json 标记,与目录名前缀无关。
+// 回归:6/12 前缀 ppt-→wf- 后,旧实现(starts_with("ppt-"))找不到项目目录,
+// 结构化产出落到会话根,taizi 硬闸 FAIL"文件不存在: zhiyi.json"。
+#[test]
+fn find_project_dir_matches_marker_not_prefix() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws = tmp.path();
+
+    // 无标记的目录(哪怕叫 ppt-*)不算项目
+    std::fs::create_dir_all(ws.join("ppt-20260601-000000-x")).unwrap();
+    assert_eq!(super::find_project_dir_in_workspace(ws), None);
+
+    // wf- 前缀 + 标记 → 命中
+    let proj = ws.join("wf-20260612-023105-sansheng_liubu");
+    std::fs::create_dir_all(proj.join("_state")).unwrap();
+    std::fs::write(proj.join("_state/workflow_progress.json"), "{}").unwrap();
+    assert_eq!(super::find_project_dir_in_workspace(ws), Some(proj.clone()));
+
+    // 两个候选 → 取 progress mtime 最新的(后写的 ppt- 旧前缀项目也认)
+    let proj2 = ws.join("ppt-20260611-135848-sansheng_liubu");
+    std::fs::create_dir_all(proj2.join("_state")).unwrap();
+    std::fs::write(proj2.join("_state/workflow_progress.json"), "{}").unwrap();
+    let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    let f = std::fs::File::options()
+        .write(true)
+        .open(proj2.join("_state/workflow_progress.json"))
+        .unwrap();
+    f.set_modified(newer).unwrap();
+    assert_eq!(super::find_project_dir_in_workspace(ws), Some(proj2));
+}

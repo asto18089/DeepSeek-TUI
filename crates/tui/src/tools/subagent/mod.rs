@@ -6140,10 +6140,12 @@ fn validate_node(value: &Value, schema: &Value, path: &str, depth: usize, errs: 
     }
 }
 
-/// [pinvou3-fork] 在会话 workspace 下找 `ppt-*` 项目子目录(会话与项目 1:1)。
+/// [pinvou3-fork] 在会话 workspace 下找工作流项目子目录(会话与项目 1:1)。
 /// 用于把结构化产出落盘到项目目录而非会话根(12 号决策1)。
-/// [codex MAJOR 修] 多个 ppt-* 时不取"遍历第一个"(顺序不定会写错项目),
-/// 而是取 mtime 最新的那个(同会话重跑/换场景会留旧目录,最新即当前 run)。
+/// 识别标记 = 子目录含 `_state/workflow_progress.json`(与宿主 harness::find_project_dir
+/// 同一判据)——不按目录名前缀认(历史 `ppt-`/现行 `wf-` 都兼容,前缀再改也不受影响)。
+/// [codex MAJOR 修] 多个候选时不取"遍历第一个"(顺序不定会写错项目),
+/// 而是取 progress 文件 mtime 最新的那个(同会话重跑/换场景会留旧目录,最新即当前 run)。
 fn find_project_dir_in_workspace(workspace: &Path) -> Option<PathBuf> {
     let entries = fs::read_dir(workspace).ok()?;
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
@@ -6152,17 +6154,11 @@ fn find_project_dir_in_workspace(workspace: &Path) -> Option<PathBuf> {
         if !path.is_dir() {
             continue;
         }
-        let is_ppt = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| name.starts_with("ppt-"));
-        if !is_ppt {
+        let progress = path.join("_state").join("workflow_progress.json");
+        let Ok(meta) = progress.metadata() else {
             continue;
-        }
-        let mtime = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(UNIX_EPOCH);
+        };
+        let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
         if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
             best = Some((mtime, path));
         }
