@@ -3910,9 +3910,12 @@ async fn run_subagent_task(task: SubAgentTask) {
             )
         }
     };
-    let failed = result
-        .as_ref()
-        .map_or(true, |res| matches!(res.status, SubAgentStatus::Failed(_)));
+    // [pinvou3-fork] Interrupted(SSE 超时/放弃)/Cancelled 也算 failed——半成品不应
+    // 被宿主当成功接收。当前宿主推进靠产物硬闸(page_output_is_real/validate_deliverable)
+    // 而非此布尔，故主要影响日志/语义准确性 + 防未来有消费方误判。
+    let failed = result.as_ref().map_or(true, |res| {
+        !matches!(res.status, SubAgentStatus::Completed)
+    });
 
     if let Some(mb) = task.runtime.mailbox.as_ref() {
         let envelope = match &result {
@@ -4896,6 +4899,25 @@ async fn run_subagent(
                 )
                 .await,
             );
+        }
+
+        // [pinvou3-fork] submit_output 校验失败也 fail-closed：模型反复提交不合格产出
+        // (schema 不过 / 落盘失败 / 未落盘)时，retries 满即终止——与上方"模型整轮不调
+        // 任何工具"的催交路径对称。否则坏 submit_output 可无限循环空转(本地弱模型常见)，
+        // 只剩 heartbeat 兜底。structured_failed 会映射成 Failed status，正确传播给宿主。
+        if output_schema.is_some()
+            && output_submitted.is_none()
+            && structured_retries >= MAX_STRUCTURED_OUTPUT_RETRIES
+        {
+            structured_failed = true;
+            final_result = Some(format!(
+                "max_structured_output_retries: 角色 {} 经 {MAX_STRUCTURED_OUTPUT_RETRIES} 次提交均未通过校验。最后错误:\n{}",
+                transcript_role,
+                last_structured_error
+                    .as_deref()
+                    .unwrap_or("missing submit_output")
+            ));
+            break;
         }
     }
 
