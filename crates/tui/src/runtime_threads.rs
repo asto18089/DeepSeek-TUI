@@ -2023,6 +2023,7 @@ impl RuntimeThreadManager {
             allow_shell: thread.allow_shell,
             trust_mode: thread.trust_mode,
             tool_whitelist: None,
+        reasoning_effort: None,
             notes_path: self.config.notes_path(),
             mcp_config_path: self.config.mcp_config_path(),
             skills_dir: self.config.skills_dir(),

@@ -259,6 +259,12 @@ pub struct EngineConfig {
     /// structurally constrain the workflow-session supervisor (品悟) to
     /// read + review tools only.
     pub tool_whitelist: Option<std::collections::HashSet<String>>,
+    /// [pinvou3-fork] 会话初始 reasoning_effort。session 原本只在第一条
+    /// SendMessage 时才获得该值;纯 SpawnSubAgent 驱动的会话(工作流宿主,
+    /// 取消对话型品悟后无任何 SendMessage)会一直停留在 None →
+    /// 对 vLLM/Qwen3.6 即回落到默认 thinking 全开。宿主对本地 vLLM 应填
+    /// Some("off")。后续 SendMessage 仍可按 op 覆盖。
+    pub reasoning_effort: Option<String>,
     /// Path to the notes file used by the notes tool.
     pub notes_path: PathBuf,
     /// Path to the MCP configuration file.
@@ -387,6 +393,7 @@ impl Default for EngineConfig {
             allow_shell: true,
             trust_mode: false,
             tool_whitelist: None,
+            reasoning_effort: None,
             notes_path: PathBuf::from("notes.txt"),
             mcp_config_path: PathBuf::from("mcp.json"),
             skills_dir: crate::skills::default_skills_dir(),
@@ -688,6 +695,9 @@ impl Engine {
             config.notes_path.clone(),
             config.mcp_config_path.clone(),
         );
+        // [pinvou3-fork] 无对话消息的会话(工作流宿主)也要有正确的思考开关,
+        // 不能依赖"碰巧先来过一条 SendMessage"。
+        session.reasoning_effort = config.reasoning_effort.clone();
         // Set up stable system prompt with project context (default to agent mode).
         // Per-turn working-set metadata is injected into the latest user
         // message at request time so file churn does not rewrite this prefix.
