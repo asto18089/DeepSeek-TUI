@@ -2022,6 +2022,7 @@ impl RuntimeThreadManager {
             workspace: thread.workspace.clone(),
             allow_shell: thread.allow_shell,
             trust_mode: thread.trust_mode,
+            tool_whitelist: None,
             notes_path: self.config.notes_path(),
             mcp_config_path: self.config.mcp_config_path(),
             skills_dir: self.config.skills_dir(),
@@ -2654,7 +2655,7 @@ impl RuntimeThreadManager {
                     )
                     .await?;
                 }
-                EngineEvent::AgentComplete { id, result } => {
+                EngineEvent::AgentComplete { id, result, .. } => {
                     let message = format!(
                         "Sub-agent {id} completed: {}",
                         summarize_text(&result, SUMMARY_LIMIT)

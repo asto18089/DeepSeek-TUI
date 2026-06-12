@@ -355,6 +355,18 @@ pub(super) fn ensure_advanced_tooling(
     }
 }
 
+/// [pinvou3-fork] Hard tool whitelist: drop every tool whose name is not in
+/// `whitelist` from the model-visible catalog. A true allowlist, NOT a
+/// `defer_loading` soft-hide — non-whitelisted tools are removed entirely, so
+/// `tool_search` cannot re-surface them either. No-op when `whitelist` is
+/// `None`. Call AFTER `ensure_advanced_tooling` so the appended meta-tools
+/// are subject to the same restriction.
+pub(super) fn apply_tool_whitelist(catalog: &mut Vec<Tool>, whitelist: Option<&HashSet<String>>) {
+    if let Some(set) = whitelist {
+        catalog.retain(|t| set.contains(&t.name));
+    }
+}
+
 pub(super) fn initial_active_tools(catalog: &[Tool]) -> HashSet<String> {
     let mut active = HashSet::new();
     for tool in catalog {

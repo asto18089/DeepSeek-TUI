@@ -106,20 +106,20 @@ impl EngineHandle {
         id: impl Into<String>,
         response: UserInputResponse,
     ) -> Result<()> {
-        self.tx_user_input
-            .send(UserInputDecision::Submitted {
-                id: id.into(),
-                response,
-            })
-            .await?;
+        // [pinvou3-fork] broadcast send is synchronous; zero subscribers means
+        // the waiting turn/sub-agent already ended, so ignore that race.
+        let _ = self.tx_user_input.send(UserInputDecision::Submitted {
+            id: id.into(),
+            response,
+        });
         Ok(())
     }
 
     /// Cancel a request_user_input prompt.
     pub async fn cancel_user_input(&self, id: impl Into<String>) -> Result<()> {
-        self.tx_user_input
-            .send(UserInputDecision::Cancelled { id: id.into() })
-            .await?;
+        let _ = self
+            .tx_user_input
+            .send(UserInputDecision::Cancelled { id: id.into() });
         Ok(())
     }
 

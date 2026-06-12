@@ -15,6 +15,10 @@ const USER_INPUT_TIMEOUT: Duration = Duration::from_secs(300);
 
 use super::Engine;
 
+// [pinvou3-fork] `UserInputDecision` lives in `tools::user_input` so
+// sub-agent runtimes can subscribe to the same broadcast channel.
+pub(super) use crate::tools::user_input::UserInputDecision;
+
 #[derive(Debug, Clone)]
 pub(super) enum ApprovalDecision {
     Approved {
@@ -27,17 +31,6 @@ pub(super) enum ApprovalDecision {
     RetryWithPolicy {
         id: String,
         policy: crate::sandbox::SandboxPolicy,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub(super) enum UserInputDecision {
-    Submitted {
-        id: String,
-        response: UserInputResponse,
-    },
-    Cancelled {
-        id: String,
     },
 }
 
@@ -128,21 +121,10 @@ impl Engine {
                     ));
                 }
                 result = tokio::time::timeout(USER_INPUT_TIMEOUT, self.rx_user_input.recv()) => {
-                    match result {
-                        Ok(Some(decision)) => {
-                            match decision {
-                                UserInputDecision::Submitted { id, response } if id == tool_id => {
-                                    return Ok(response);
-                                }
-                                UserInputDecision::Cancelled { id } if id == tool_id => {
-                                    return Err(ToolError::execution_failed(
-                                        "User input cancelled".to_string(),
-                                    ));
-                                }
-                                _ => continue,
-                            }
-                        }
-                        Ok(None) => {
+                    let decision = match result {
+                        Ok(Ok(decision)) => decision,
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                             return Err(ToolError::execution_failed(
                                 "User input channel closed".to_string(),
                             ));
@@ -164,6 +146,17 @@ impl Engine {
                                 ),
                             ));
                         }
+                    };
+                    match decision {
+                        UserInputDecision::Submitted { id, response } if id == tool_id => {
+                            return Ok(response);
+                        }
+                        UserInputDecision::Cancelled { id } if id == tool_id => {
+                            return Err(ToolError::execution_failed(
+                                "User input cancelled".to_string(),
+                            ));
+                        }
+                        _ => continue,
                     }
                 }
             }

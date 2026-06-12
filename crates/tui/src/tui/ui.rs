@@ -861,6 +861,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         workspace: app.workspace.clone(),
         allow_shell: app.allow_shell,
         trust_mode: app.trust_mode,
+        tool_whitelist: None,
         notes_path: config.notes_path(),
         mcp_config_path: config.mcp_config_path(),
         skills_dir: app.skills_dir.clone(),
@@ -2319,7 +2320,7 @@ async fn run_event_loop(
                         }
                         app.status_message = Some(format!("Sub-agent {id}: {display}"));
                     }
-                    EngineEvent::AgentComplete { id, result } => {
+                    EngineEvent::AgentComplete { id, result, .. } => {
                         execute_subagent_observer_hook(
                             app,
                             HookEvent::SubagentComplete,
