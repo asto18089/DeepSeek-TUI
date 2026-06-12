@@ -4376,6 +4376,15 @@ async fn run_subagent(
             }
         }
 
+        // [pinvou3-fork] 贪心(temp=0)撞上病态解码路径时——光想不调工具、或思考失控
+        // 连续顶格——同温度重试是确定性复现(2026-06-12 taizi 三连卡实证:重试 note
+        // 只挪动几十个 token,逃不出吸引子)。结构化提交被打回/响应被截断后,
+        // 后续请求逐级升温跳出锁死路径;恢复正常后截断计数清零自动回到贪心。
+        let retry_temperature = match structured_retries + consecutive_truncated_responses {
+            0 => SUBAGENT_TEMPERATURE,
+            1 => 0.3,
+            _ => 0.6,
+        };
         let request = MessageRequest {
             model: runtime.model.clone(),
             messages: messages.clone(),
@@ -4387,7 +4396,7 @@ async fn run_subagent(
             thinking: None,
             reasoning_effort: runtime.reasoning_effort.clone(),
             stream: Some(false),
-            temperature: Some(SUBAGENT_TEMPERATURE),
+            temperature: Some(retry_temperature),
             top_p: None,
         };
         latest_checkpoint = Some(
