@@ -5797,6 +5797,7 @@ async fn run_exec_agent(
         allow_shell: auto_approve || config.allow_shell(),
         trust_mode,
         tool_whitelist: None,
+        reasoning_effort: None,
         notes_path: config.notes_path(),
         mcp_config_path: config.mcp_config_path(),
         skills_dir: config.skills_dir(),

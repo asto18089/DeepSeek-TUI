@@ -862,6 +862,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         allow_shell: app.allow_shell,
         trust_mode: app.trust_mode,
         tool_whitelist: None,
+        reasoning_effort: None,
         notes_path: config.notes_path(),
         mcp_config_path: config.mcp_config_path(),
         skills_dir: app.skills_dir.clone(),
