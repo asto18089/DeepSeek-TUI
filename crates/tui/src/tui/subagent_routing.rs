@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::task_manager::{TaskRecord, TaskStatus, TaskSummary};
 use crate::tools::subagent::{MailboxMessage, SubAgentResult, SubAgentStatus};
-use crate::tui::app::{App, AppMode, TaskPanelEntry};
+use crate::tui::app::{App, AppMode, TaskPanelEntry, TaskPanelEntryKind};
 use crate::tui::history::{HistoryCell, SubAgentCell, summarize_tool_output};
 use crate::tui::pager::PagerView;
 use crate::tui::tool_routing::refreshes_workspace_context_on_completion;
@@ -68,6 +68,66 @@ pub(super) fn reconcile_subagent_activity_state(app: &mut App) {
         app.agent_activity_started_at = None;
     } else if app.agent_activity_started_at.is_none() {
         app.agent_activity_started_at = Some(Instant::now());
+    }
+
+    reconcile_cards_with_snapshots(app);
+}
+
+/// Sync in-transcript card slots that still render as running against the
+/// canonical manager snapshot statuses. A card can miss its terminal mailbox
+/// envelope (e.g. API-timeout interruption observed only via `AgentList`),
+/// which would otherwise leave the fanout/delegate UI counting the agent as
+/// running indefinitely.
+fn reconcile_cards_with_snapshots(app: &mut App) {
+    let non_running: Vec<(String, AgentLifecycle)> = app
+        .subagent_cache
+        .iter()
+        .filter_map(|agent| {
+            let lifecycle = match &agent.status {
+                SubAgentStatus::Running => return None,
+                SubAgentStatus::Interrupted(_) => AgentLifecycle::Interrupted,
+                SubAgentStatus::Completed => AgentLifecycle::Completed,
+                SubAgentStatus::Failed(_) => AgentLifecycle::Failed,
+                SubAgentStatus::Cancelled => AgentLifecycle::Cancelled,
+            };
+            Some((agent.agent_id.clone(), lifecycle))
+        })
+        .collect();
+    for (agent_id, lifecycle) in non_running {
+        let Some(&idx) = app.subagent_card_index.get(&agent_id) else {
+            continue;
+        };
+        let updated = match app.history.get_mut(idx) {
+            Some(HistoryCell::SubAgent(SubAgentCell::Delegate(card)))
+                if card.agent_id == agent_id
+                    && matches!(
+                        card.status,
+                        AgentLifecycle::Pending | AgentLifecycle::Running
+                    ) =>
+            {
+                card.status = lifecycle;
+                true
+            }
+            Some(HistoryCell::SubAgent(SubAgentCell::Fanout(card))) => {
+                match card.workers.iter_mut().find(|slot| {
+                    slot.agent_id == agent_id
+                        && matches!(
+                            slot.status,
+                            AgentLifecycle::Pending | AgentLifecycle::Running
+                        )
+                }) {
+                    Some(slot) => {
+                        slot.status = lifecycle;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        };
+        if updated {
+            app.bump_history_cell(idx);
+        }
     }
 }
 
@@ -204,6 +264,7 @@ pub(super) fn task_summary_to_panel_entry(summary: TaskSummary) -> TaskPanelEntr
         status: task_status_label(summary.status).to_string(),
         prompt_summary: summary.prompt_summary,
         duration_ms: summary.duration_ms,
+        kind: TaskPanelEntryKind::Background,
     }
 }
 

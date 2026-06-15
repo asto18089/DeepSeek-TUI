@@ -222,6 +222,24 @@ mod tests {
     }
 
     #[test]
+    fn selected_row_text_contrasts_on_selection_bg() {
+        for theme in ALL_THEMES {
+            let name = theme.name;
+            let Some(fg) = rgb(theme.text_body) else {
+                continue;
+            };
+            let Some(bg) = rgb(theme.selection_bg) else {
+                continue;
+            };
+            let cr = contrast_ratio(fg, bg);
+            assert!(
+                cr >= 4.5,
+                "{name}: selected-row text contrast {cr:.1}:1 is below 4.5:1 (fg={fg:?}, bg={bg:?})"
+            );
+        }
+    }
+
+    #[test]
     fn surface_layers_are_distinct() {
         for theme in ALL_THEMES {
             let name = theme.name;

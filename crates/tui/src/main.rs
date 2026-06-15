@@ -29,6 +29,7 @@ mod composer_stash;
 mod config;
 mod config_persistence;
 mod config_ui;
+mod context_report;
 mod core;
 mod cost_status;
 mod deepseek_theme;
@@ -37,6 +38,7 @@ mod error_taxonomy;
 mod eval;
 mod execpolicy;
 mod features;
+mod fleet;
 mod handoff;
 mod hooks;
 mod llm_client;
@@ -47,6 +49,7 @@ mod lsp;
 mod mcp;
 mod mcp_server;
 mod memory;
+mod model_inventory;
 mod model_routing;
 mod models;
 mod network_policy;
@@ -57,7 +60,6 @@ mod pricing;
 mod project_context;
 mod project_context_cache;
 mod project_doc;
-mod prompt_persist;
 mod prompt_zones;
 mod prompts;
 mod purge;
@@ -242,6 +244,8 @@ enum Commands {
     Exec(ExecArgs),
     /// Generate SWE-bench prediction rows from CodeWhale runs
     Swebench(SwebenchArgs),
+    /// Manage local Agent Fleet runs and workers
+    Fleet(FleetArgs),
     /// Run a code review over a git diff
     Review(ReviewArgs),
     /// Open the TUI pre-seeded with a GitHub PR's title, body, and diff (#451)
@@ -307,14 +311,6 @@ Plain `codewhale exec` is a one-shot model response. Use `--auto` for
 non-interactive filesystem/shell tool use.
 ")]
 struct ExecArgs {
-    /// Prompt to send to the model
-    #[arg(
-        value_name = "PROMPT",
-        required = true,
-        trailing_var_arg = true,
-        allow_hyphen_values = true
-    )]
-    prompt: Vec<String>,
     /// Override model for this run
     #[arg(long)]
     model: Option<String>,
@@ -336,6 +332,27 @@ struct ExecArgs {
     /// Output format for exec mode
     #[arg(long, value_enum, default_value_t = ExecOutputFormat::Text)]
     output_format: ExecOutputFormat,
+    /// Comma-separated list of tools to allow (all others denied).
+    /// Lowercase catalog names: read_file, write_file, exec_shell, grep_files, etc.
+    #[arg(long, value_delimiter = ',')]
+    allowed_tools: Option<Vec<String>>,
+    /// Comma-separated list of tools to deny (deny wins over allow).
+    #[arg(long, value_delimiter = ',')]
+    disallowed_tools: Option<Vec<String>>,
+    /// Maximum number of model steps (tool calls) before the run ends.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    max_turns: Option<u32>,
+    /// Extra text appended to the system prompt for this run.
+    #[arg(long)]
+    append_system_prompt: Option<String>,
+    /// Prompt to send to the model
+    #[arg(
+        value_name = "PROMPT",
+        required = true,
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    prompt: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -357,6 +374,128 @@ enum SwebenchCommand {
     Run(SwebenchRunArgs),
     /// Export the current working-tree diff as one SWE-bench prediction row
     Export(SwebenchExportArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct FleetArgs {
+    #[command(subcommand)]
+    command: FleetCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum FleetCommand {
+    /// Initialize the local fleet ledger for this workspace
+    Init,
+    /// Create a run from a task spec and start the foreground manager loop
+    Run(FleetRunArgs),
+    /// Show queued/running/completed/failed/stale fleet counts
+    Status,
+    /// Inspect one worker's status, heartbeat, latest event, and artifacts
+    Inspect {
+        /// Worker id printed by `codewhale fleet run`
+        worker_id: String,
+    },
+    /// Print bounded log artifacts for one worker
+    Logs {
+        /// Worker id printed by `codewhale fleet run`
+        worker_id: String,
+    },
+    /// List artifact refs for one worker
+    Artifacts {
+        /// Worker id printed by `codewhale fleet run`
+        worker_id: String,
+    },
+    /// Interrupt a running worker task and record a terminal cancellation
+    Interrupt {
+        /// Worker id printed by `codewhale fleet run`
+        worker_id: String,
+    },
+    /// Restart the latest task for a worker
+    Restart {
+        /// Worker id printed by `codewhale fleet run`
+        worker_id: String,
+    },
+    /// Stop all queued and running fleet work
+    Stop {
+        /// Confirm stopping all queued and running fleet tasks
+        #[arg(long, required = true)]
+        all: bool,
+    },
+    /// Render a redacted fleet alert payload without sending it
+    AlertDryRun(FleetAlertDryRunArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct FleetRunArgs {
+    /// JSON or TOML task spec to enqueue
+    #[arg(value_name = "TASK_SPEC")]
+    task_spec: PathBuf,
+    /// Maximum local workers to lease concurrently
+    #[arg(long, default_value_t = 4)]
+    max_workers: usize,
+    /// Seconds without heartbeat before a running task is counted stale
+    #[arg(long, default_value_t = 300)]
+    stale_after_seconds: u64,
+    /// Schedule once and return instead of staying in the manager loop
+    #[arg(long, hide = true, default_value_t = false)]
+    once: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct FleetAlertDryRunArgs {
+    /// Alert event class to render
+    #[arg(long, value_enum)]
+    event: FleetAlertEventArg,
+    /// Fleet run id
+    #[arg(long)]
+    run_id: String,
+    /// Worker id, when the event belongs to one worker
+    #[arg(long)]
+    worker_id: Option<String>,
+    /// Task id, when the event belongs to one task
+    #[arg(long)]
+    task_id: Option<String>,
+    /// Short human-readable reason for the alert
+    #[arg(long, default_value = "manual fleet alert dry-run")]
+    reason: String,
+    /// Status label to include in the payload
+    #[arg(long)]
+    status: Option<String>,
+    /// Adapter payload shape to render
+    #[arg(long, value_enum, default_value_t = FleetAlertAdapterArg::Slack)]
+    adapter: FleetAlertAdapterArg,
+    /// Environment variable containing the Slack webhook URL
+    #[arg(long, default_value = "CODEWHALE_FLEET_SLACK_WEBHOOK")]
+    slack_webhook_env: String,
+    /// Environment variable containing the generic webhook URL
+    #[arg(long, default_value = "CODEWHALE_FLEET_WEBHOOK_URL")]
+    webhook_url_env: String,
+    /// Optional environment variable containing the generic webhook secret
+    #[arg(long)]
+    webhook_secret_env: Option<String>,
+    /// Environment variable containing the PagerDuty routing key
+    #[arg(long, default_value = "CODEWHALE_FLEET_PAGERDUTY_ROUTING_KEY")]
+    pagerduty_routing_key_env: String,
+    /// PagerDuty severity to render
+    #[arg(long, default_value = "error")]
+    pagerduty_severity: String,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum FleetAlertEventArg {
+    Stale,
+    RestartExhausted,
+    NeedsHuman,
+    BudgetExceeded,
+    VerifierFailed,
+    RunCompleted,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum FleetAlertAdapterArg {
+    Slack,
+    Webhook,
+    PagerDuty,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -451,7 +590,19 @@ fn resolve_exec_model(config: &Config, explicit_model: Option<&str>) -> String {
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .map(ToOwned::to_owned)
+        .or_else(exec_model_env_override)
         .unwrap_or_else(|| config.default_model())
+}
+
+fn exec_model_env_override() -> Option<String> {
+    ["CODEWHALE_MODEL", "DEEPSEEK_MODEL"]
+        .into_iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|model| model.trim().to_string())
+                .filter(|model| !model.is_empty())
+        })
 }
 
 fn top_level_prompt_initial_input(parts: &[String]) -> Option<tui::InitialInput> {
@@ -512,6 +663,9 @@ struct DoctorArgs {
     /// Emit machine-readable JSON output (skips live API connectivity check)
     #[arg(long, default_value_t = false)]
     json: bool,
+    /// Emit only the diagnostic context source map as JSON
+    #[arg(long, default_value_t = false, conflicts_with = "json")]
+    context_json: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -668,12 +822,14 @@ struct ServeArgs {
     workers: usize,
     /// Additional CORS origin to allow (repeatable). Stacks on top of the
     /// built-in defaults (localhost:3000, localhost:1420, tauri://localhost).
-    /// Also reads `DEEPSEEK_CORS_ORIGINS` (comma-separated) and
-    /// `[runtime_api] cors_origins` from `config.toml`. Whalescale#255.
+    /// Also reads `CODEWHALE_CORS_ORIGINS` (comma-separated), then
+    /// `DEEPSEEK_CORS_ORIGINS` as an alias, and `[runtime_api] cors_origins`
+    /// from `config.toml`. Whalescale#255.
     #[arg(long = "cors-origin", value_name = "URL")]
     cors_origin: Vec<String>,
     /// Require this bearer token for `/v1/*` runtime API routes. Also reads
-    /// `DEEPSEEK_RUNTIME_TOKEN` when omitted.
+    /// `CODEWHALE_RUNTIME_TOKEN` when omitted, then `DEEPSEEK_RUNTIME_TOKEN`
+    /// as an alias.
     #[arg(long = "auth-token", value_name = "TOKEN")]
     auth_token: Option<String>,
     /// Disable runtime API auth when no token is configured. Only use on a trusted loopback.
@@ -930,7 +1086,9 @@ async fn main() -> Result<()> {
             Commands::Doctor(args) => {
                 let config = load_config_from_cli(&cli)?;
                 let workspace = resolve_workspace(&cli);
-                if args.json {
+                if args.context_json {
+                    run_doctor_context_json(&config, &workspace)
+                } else if args.json {
                     run_doctor_json(&config, &workspace, cli.config.as_deref())
                 } else {
                     run_doctor(&config, &workspace, cli.config.as_deref()).await;
@@ -975,13 +1133,28 @@ async fn main() -> Result<()> {
                 let needs_engine = args.auto
                     || yolo
                     || resume_session_id.is_some()
-                    || args.output_format == ExecOutputFormat::StreamJson;
+                    || args.output_format == ExecOutputFormat::StreamJson
+                    || args.max_turns.is_some()
+                    || args.allowed_tools.is_some()
+                    || args.disallowed_tools.is_some()
+                    || args.append_system_prompt.is_some();
                 if needs_engine {
                     let max_subagents = cli.max_subagents.map_or_else(
                         || config.max_subagents(),
                         |value| value.clamp(1, MAX_SUBAGENTS),
                     );
                     let auto_mode = args.auto || yolo;
+                    let max_turns = args.max_turns.unwrap_or(100);
+                    let allowed_tools = args.allowed_tools.as_ref().map(|v| {
+                        v.iter()
+                            .map(|s| s.to_ascii_lowercase().trim().to_string())
+                            .collect::<Vec<_>>()
+                    });
+                    let disallowed_tools = args.disallowed_tools.as_ref().map(|v| {
+                        v.iter()
+                            .map(|s| s.to_ascii_lowercase().trim().to_string())
+                            .collect::<Vec<_>>()
+                    });
                     run_exec_agent(
                         &config,
                         &model,
@@ -993,6 +1166,10 @@ async fn main() -> Result<()> {
                         args.json,
                         resume_session_id,
                         args.output_format,
+                        max_turns,
+                        allowed_tools,
+                        disallowed_tools,
+                        args.append_system_prompt.clone(),
                     )
                     .await
                 } else if args.json {
@@ -1015,6 +1192,11 @@ async fn main() -> Result<()> {
                     |value| value.clamp(1, MAX_SUBAGENTS),
                 );
                 run_swebench_command(&config, &model, workspace, max_subagents, args).await
+            }
+            Commands::Fleet(args) => {
+                let config = load_config_from_cli(&cli)?;
+                let workspace = resolve_workspace(&cli);
+                run_fleet_command(&workspace, &config, args).await
             }
             Commands::Review(args) => {
                 let config = load_config_from_cli(&cli)?;
@@ -1249,6 +1431,10 @@ async fn run_swebench_command(
                 false,
                 None,
                 args.output_format,
+                100,
+                None,
+                None,
+                None,
             )
             .await?;
 
@@ -1270,6 +1456,377 @@ async fn run_swebench_command(
                 &args.instance_id,
                 &model_name,
             )
+        }
+    }
+}
+
+async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -> Result<()> {
+    use crate::fleet::alerts::{
+        FleetAlertAdapterConfig, FleetAlertConfig, FleetAlertDispatcher, FleetAlertEvent,
+        FleetEnvSecretResolver,
+    };
+    use crate::fleet::executor::FleetExecutor;
+    use crate::fleet::manager::{FleetManager, FleetStatusSnapshot, FleetWorkerInspection};
+    use codewhale_protocol::fleet::{
+        FleetAlertEventClass, FleetArtifactKind, FleetRunId, FleetWorkerEventPayload,
+        FleetWorkerStatus,
+    };
+
+    fn worker_status_label(status: &FleetWorkerStatus) -> &'static str {
+        match status {
+            FleetWorkerStatus::Unknown => "unknown",
+            FleetWorkerStatus::Online => "online",
+            FleetWorkerStatus::Busy => "busy",
+            FleetWorkerStatus::Offline => "offline",
+            FleetWorkerStatus::Unhealthy => "unhealthy",
+            FleetWorkerStatus::Draining => "draining",
+            FleetWorkerStatus::Retired => "retired",
+        }
+    }
+
+    fn artifact_kind_label(kind: &FleetArtifactKind) -> String {
+        match kind {
+            FleetArtifactKind::Log => "log".to_string(),
+            FleetArtifactKind::Patch => "patch".to_string(),
+            FleetArtifactKind::TestResult => "test_result".to_string(),
+            FleetArtifactKind::Report => "report".to_string(),
+            FleetArtifactKind::Checkpoint => "checkpoint".to_string(),
+            FleetArtifactKind::Receipt => "receipt".to_string(),
+            FleetArtifactKind::Other(value) => value.clone(),
+        }
+    }
+
+    fn event_label(payload: &FleetWorkerEventPayload) -> String {
+        match payload {
+            FleetWorkerEventPayload::Queued => "queued".to_string(),
+            FleetWorkerEventPayload::Leased { .. } => "leased".to_string(),
+            FleetWorkerEventPayload::Starting => "starting".to_string(),
+            FleetWorkerEventPayload::Running => "running".to_string(),
+            FleetWorkerEventPayload::ModelWait { model } => model
+                .as_ref()
+                .map(|model| format!("model_wait model={model}"))
+                .unwrap_or_else(|| "model_wait".to_string()),
+            FleetWorkerEventPayload::RunningTool { tool, call_id } => call_id
+                .as_ref()
+                .map(|call_id| format!("running_tool tool={tool} call_id={call_id}"))
+                .unwrap_or_else(|| format!("running_tool tool={tool}")),
+            FleetWorkerEventPayload::Heartbeat { .. } => "heartbeat".to_string(),
+            FleetWorkerEventPayload::Artifact(artifact) => {
+                format!("artifact kind={}", artifact_kind_label(&artifact.kind))
+            }
+            FleetWorkerEventPayload::Completed { exit_code, summary } => match (exit_code, summary)
+            {
+                (Some(code), Some(summary)) => format!("completed exit_code={code} {summary}"),
+                (Some(code), None) => format!("completed exit_code={code}"),
+                (None, Some(summary)) => format!("completed {summary}"),
+                (None, None) => "completed".to_string(),
+            },
+            FleetWorkerEventPayload::Failed {
+                reason,
+                recoverable,
+            } => {
+                format!("failed recoverable={recoverable} reason={reason}")
+            }
+            FleetWorkerEventPayload::Cancelled { cancelled_by } => cancelled_by
+                .as_ref()
+                .map(|by| format!("cancelled by={by}"))
+                .unwrap_or_else(|| "cancelled".to_string()),
+            FleetWorkerEventPayload::Interrupted { signal } => signal
+                .as_ref()
+                .map(|signal| format!("interrupted signal={signal}"))
+                .unwrap_or_else(|| "interrupted".to_string()),
+            FleetWorkerEventPayload::Stale { last_heartbeat_at } => last_heartbeat_at
+                .as_ref()
+                .map(|ts| format!("stale last_heartbeat_at={ts}"))
+                .unwrap_or_else(|| "stale".to_string()),
+            FleetWorkerEventPayload::Restarted { restart_count } => {
+                format!("restarted count={restart_count}")
+            }
+            FleetWorkerEventPayload::Escalated { channel, alert_id } => alert_id
+                .as_ref()
+                .map(|alert_id| format!("escalated channel={channel} alert_id={alert_id}"))
+                .unwrap_or_else(|| format!("escalated channel={channel}")),
+        }
+    }
+
+    fn print_status(status: &FleetStatusSnapshot) {
+        println!(
+            "fleet: runs={} queued={} running={} completed={} partial={} failed={} restarted={} escalated={} transport_failed={} task_failed={} verifier_failed={} cancelled={} stale={}",
+            status.runs,
+            status.queued,
+            status.running,
+            status.completed,
+            status.partial,
+            status.failed,
+            status.restarted,
+            status.escalated,
+            status.transport_failed,
+            status.task_failed,
+            status.verifier_failed,
+            status.cancelled,
+            status.stale
+        );
+        if !status.workers.is_empty() {
+            println!("workers:");
+            for (worker_id, worker_status) in &status.workers {
+                println!("  {worker_id} {}", worker_status_label(worker_status));
+            }
+        }
+    }
+
+    fn print_inspection(inspection: &FleetWorkerInspection) {
+        println!("worker: {}", inspection.worker_id);
+        println!("status: {}", worker_status_label(&inspection.status));
+        if let Some(run_id) = &inspection.current_run_id {
+            println!("run: {}", run_id.0);
+        }
+        if let Some(task_id) = &inspection.current_task_id {
+            println!("task: {task_id}");
+        }
+        if let Some(objective) = &inspection.objective {
+            println!("objective: {objective}");
+        }
+        if let Some(role) = &inspection.role {
+            println!("role: {role}");
+        }
+        if let Some(host) = &inspection.host {
+            println!("host: {host}");
+        }
+        if let Some(heartbeat) = &inspection.latest_heartbeat_at {
+            println!("heartbeat: {heartbeat}");
+        }
+        if let Some(event) = &inspection.latest_event {
+            println!(
+                "latest_event: seq={} {}",
+                event.seq,
+                event_label(&event.payload)
+            );
+        }
+        if !inspection.artifacts.is_empty() {
+            println!("artifacts:");
+            for artifact in &inspection.artifacts {
+                println!(
+                    "  {} {}",
+                    artifact_kind_label(&artifact.kind),
+                    artifact.path.display()
+                );
+            }
+        }
+        if let Some(error) = &inspection.last_error {
+            println!("last_error: {error}");
+        }
+        if let Some(alert) = &inspection.alert_state {
+            println!("alert: {alert}");
+        }
+    }
+
+    fn print_artifacts(inspection: &FleetWorkerInspection) {
+        if inspection.artifacts.is_empty() {
+            println!("artifacts: none");
+            return;
+        }
+        println!("artifacts:");
+        for artifact in &inspection.artifacts {
+            let size = artifact
+                .size_bytes
+                .map(|size| format!(" size={size}"))
+                .unwrap_or_default();
+            let mime = artifact
+                .mime_type
+                .as_ref()
+                .map(|mime| format!(" mime={mime}"))
+                .unwrap_or_default();
+            println!(
+                "  {} {}{}{}",
+                artifact_kind_label(&artifact.kind),
+                artifact.path.display(),
+                size,
+                mime
+            );
+        }
+    }
+
+    fn print_logs(workspace: &Path, inspection: &FleetWorkerInspection) -> Result<()> {
+        let mut printed = false;
+        for artifact in inspection
+            .artifacts
+            .iter()
+            .filter(|artifact| matches!(artifact.kind, FleetArtifactKind::Log))
+        {
+            let path = workspace.join(&artifact.path);
+            println!("== {} ==", artifact.path.display());
+            let contents = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading fleet log {}", path.display()))?;
+            let preview: String = contents.chars().take(16 * 1024).collect();
+            print!("{preview}");
+            if contents.chars().count() > preview.chars().count() {
+                println!("\n[truncated]");
+            } else if !preview.ends_with('\n') {
+                println!();
+            }
+            printed = true;
+        }
+        if !printed {
+            println!("logs: none");
+        }
+        Ok(())
+    }
+
+    fn alert_event_class(arg: FleetAlertEventArg) -> FleetAlertEventClass {
+        match arg {
+            FleetAlertEventArg::Stale => FleetAlertEventClass::Stale,
+            FleetAlertEventArg::RestartExhausted => FleetAlertEventClass::RestartExhausted,
+            FleetAlertEventArg::NeedsHuman => FleetAlertEventClass::NeedsHuman,
+            FleetAlertEventArg::BudgetExceeded => FleetAlertEventClass::BudgetExceeded,
+            FleetAlertEventArg::VerifierFailed => FleetAlertEventClass::VerifierFailed,
+            FleetAlertEventArg::RunCompleted => FleetAlertEventClass::RunCompleted,
+        }
+    }
+
+    fn alert_status(class: FleetAlertEventClass, override_status: Option<String>) -> String {
+        if let Some(status) = override_status {
+            return status;
+        }
+        match class {
+            FleetAlertEventClass::Stale => "stale",
+            FleetAlertEventClass::RestartExhausted => "failed",
+            FleetAlertEventClass::NeedsHuman => "needs_human",
+            FleetAlertEventClass::BudgetExceeded => "budget_exceeded",
+            FleetAlertEventClass::VerifierFailed => "verifier_failed",
+            FleetAlertEventClass::RunCompleted => "completed",
+        }
+        .to_string()
+    }
+
+    fn alert_adapter(args: &FleetAlertDryRunArgs) -> FleetAlertAdapterConfig {
+        match args.adapter {
+            FleetAlertAdapterArg::Slack => FleetAlertAdapterConfig::Slack {
+                webhook_env: args.slack_webhook_env.clone(),
+                channel: None,
+            },
+            FleetAlertAdapterArg::Webhook => FleetAlertAdapterConfig::Webhook {
+                url_env: args.webhook_url_env.clone(),
+                secret_env: args.webhook_secret_env.clone(),
+            },
+            FleetAlertAdapterArg::PagerDuty => FleetAlertAdapterConfig::PagerDuty {
+                routing_key_env: args.pagerduty_routing_key_env.clone(),
+                severity: args.pagerduty_severity.clone(),
+            },
+        }
+    }
+
+    fn fleet_codewhale_binary() -> String {
+        std::env::var("CODEWHALE_FLEET_CODEWHALE_BINARY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "codewhale".to_string())
+    }
+
+    let exec_config = config
+        .fleet
+        .as_ref()
+        .map(|fleet| fleet.exec.clone())
+        .unwrap_or_default();
+    let manager = FleetManager::open(workspace)?.with_exec_config(exec_config);
+    match args.command {
+        FleetCommand::Init => {
+            println!("fleet ledger: {}", manager.ledger_path().display());
+            Ok(())
+        }
+        FleetCommand::Run(args) => {
+            let max_workers = args.max_workers.clamp(1, 128);
+            let manager =
+                manager.with_stale_after(Duration::from_secs(args.stale_after_seconds.max(1)));
+            let report = manager.create_run_from_task_spec_path(&args.task_spec, max_workers)?;
+            println!(
+                "fleet run: {} tasks={} leased={} queued={}",
+                report.run_id.0, report.task_count, report.leased, report.queued
+            );
+            println!("workers:");
+            for worker_id in &report.worker_ids {
+                println!("  {worker_id}");
+            }
+            if args.once {
+                print_status(&manager.run_status(&report.run_id)?);
+                return Ok(());
+            }
+            println!(
+                "manager loop running; use `codewhale fleet status`, `inspect`, `interrupt`, or `stop --all` from another terminal."
+            );
+            let mut executor = FleetExecutor::new(workspace);
+            let codewhale_binary = fleet_codewhale_binary();
+            let status = manager
+                .run_to_completion(
+                    &report.run_id,
+                    max_workers,
+                    &mut executor,
+                    &codewhale_binary,
+                    None,
+                    Duration::from_secs(2),
+                )
+                .await?;
+            print_status(&status);
+            Ok(())
+        }
+        FleetCommand::Status => {
+            print_status(&manager.status()?);
+            Ok(())
+        }
+        FleetCommand::Inspect { worker_id } => {
+            print_inspection(&manager.inspect_worker(&worker_id)?);
+            Ok(())
+        }
+        FleetCommand::Logs { worker_id } => {
+            let inspection = manager.inspect_worker(&worker_id)?;
+            print_logs(workspace, &inspection)
+        }
+        FleetCommand::Artifacts { worker_id } => {
+            let inspection = manager.inspect_worker(&worker_id)?;
+            print_artifacts(&inspection);
+            Ok(())
+        }
+        FleetCommand::Interrupt { worker_id } => {
+            let inspection = manager.interrupt_worker(&worker_id)?;
+            print_inspection(&inspection);
+            Ok(())
+        }
+        FleetCommand::Restart { worker_id } => {
+            let inspection = manager.restart_worker(&worker_id)?;
+            print_inspection(&inspection);
+            Ok(())
+        }
+        FleetCommand::Stop { all } => {
+            if !all {
+                bail!("pass --all to stop all fleet work");
+            }
+            let stopped = manager.stop_all()?;
+            println!("stopped: {stopped}");
+            Ok(())
+        }
+        FleetCommand::AlertDryRun(args) => {
+            let class = alert_event_class(args.event);
+            let adapter = alert_adapter(&args);
+            let event = FleetAlertEvent {
+                class,
+                run_id: FleetRunId::from(args.run_id.clone()),
+                worker_id: args.worker_id.clone(),
+                task_id: args.task_id.clone(),
+                status: alert_status(class, args.status.clone()),
+                reason: args.reason.clone(),
+            };
+            let dispatcher = FleetAlertDispatcher::new(
+                FleetAlertConfig::dry_run_for_adapter(adapter),
+                FleetEnvSecretResolver,
+            );
+            let deliveries = dispatcher.dispatch(&event)?;
+            for delivery in deliveries {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&delivery.redacted_payload)?
+                );
+            }
+            Ok(())
         }
     }
 }
@@ -1687,7 +2244,8 @@ fn init_plugins_dir(
 ///
 /// Sources, in priority order (later sources extend earlier ones):
 /// 1. `--cors-origin URL` flags (repeatable)
-/// 2. `DEEPSEEK_CORS_ORIGINS` env var (comma-separated)
+/// 2. `CODEWHALE_CORS_ORIGINS` env var (comma-separated),
+///    then `DEEPSEEK_CORS_ORIGINS` as an alias
 /// 3. `[runtime_api] cors_origins = [...]` in `config.toml`
 ///
 /// The runtime API always allows the built-in dev defaults
@@ -1708,7 +2266,9 @@ fn resolve_cors_origins(config: &Config, flag_origins: &[String]) -> Vec<String>
     for o in flag_origins {
         push(o);
     }
-    if let Ok(env_value) = std::env::var("DEEPSEEK_CORS_ORIGINS") {
+    if let Ok(env_value) =
+        std::env::var("CODEWHALE_CORS_ORIGINS").or_else(|_| std::env::var("DEEPSEEK_CORS_ORIGINS"))
+    {
         for piece in env_value.split(',') {
             push(piece);
         }
@@ -1990,6 +2550,10 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                     "OPENAI_API_KEY",
                     "codewhale auth set --provider openai --api-key \"...\"",
                 ),
+                crate::config::ApiProvider::Anthropic => (
+                    "ANTHROPIC_API_KEY",
+                    "codewhale auth set --provider anthropic --api-key \"...\"",
+                ),
                 crate::config::ApiProvider::Atlascloud => (
                     "ATLASCLOUD_API_KEY",
                     "codewhale auth set --provider atlascloud --api-key \"...\"",
@@ -2057,6 +2621,18 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                 crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN => {
                     ("DEEPSEEK_API_KEY", "codewhale auth set --provider deepseek")
                 }
+                crate::config::ApiProvider::Zai => (
+                    "ZAI_API_KEY/Z_AI_API_KEY",
+                    "codewhale auth set --provider zai --api-key \"...\"",
+                ),
+                crate::config::ApiProvider::Stepfun => (
+                    "STEPFUN_API_KEY/STEP_API_KEY",
+                    "codewhale auth set --provider stepfun --api-key \"...\"",
+                ),
+                crate::config::ApiProvider::Minimax => (
+                    "MINIMAX_API_KEY",
+                    "codewhale auth set --provider minimax --api-key \"...\"",
+                ),
             };
             println!(
                 "  {} api_key: missing  (set {env_var} or `[providers.{}].api_key` in ~/.codewhale/config.toml; or run `{login_hint}`)",
@@ -2064,6 +2640,7 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                 match config.api_provider() {
                     crate::config::ApiProvider::NvidiaNim => "nvidia_nim",
                     crate::config::ApiProvider::Openai => "openai",
+                    crate::config::ApiProvider::Anthropic => "anthropic",
                     crate::config::ApiProvider::Atlascloud => "atlascloud",
                     crate::config::ApiProvider::WanjieArk => "wanjie_ark",
                     crate::config::ApiProvider::Volcengine => "volcengine",
@@ -2083,6 +2660,9 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                     crate::config::ApiProvider::OpenaiCodex => "openai_codex",
                     crate::config::ApiProvider::Deepseek
                     | crate::config::ApiProvider::DeepseekCN => "deepseek",
+                    crate::config::ApiProvider::Zai => "zai",
+                    crate::config::ApiProvider::Stepfun => "stepfun",
+                    crate::config::ApiProvider::Minimax => "minimax",
                 }
             );
         }
@@ -3410,6 +3990,12 @@ fn run_doctor_json(
     Ok(())
 }
 
+fn run_doctor_context_json(config: &Config, workspace: &Path) -> Result<()> {
+    let report = crate::context_report::build_headless_context_report(config, workspace);
+    println!("{}", crate::context_report::context_report_json(&report));
+    Ok(())
+}
+
 /// Build the `capability` section for the machine-readable doctor report.
 ///
 /// Returns a JSON value with the resolved provider, resolved model, context
@@ -4177,11 +4763,12 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
         .model
         .or_else(|| config.default_text_model.clone())
         .unwrap_or_else(|| config.default_model());
-    let route = resolve_cli_auto_route(config, &model, &diff).await;
-    let model = route.model;
+    let route = resolve_cli_auto_route(config, &model, &diff).await?;
+    let execution_config = config_for_cli_route(config, &route);
+    let model = route.model.clone();
     let reasoning_effort = route
         .reasoning_effort
-        .map(|effort| effort.as_setting().to_string());
+        .and_then(|effort| cli_reasoning_effort_value(&execution_config, effort));
 
     let system = SystemPrompt::Text(
         "You are a senior code reviewer. Focus on bugs, risks, behavioral regressions, and missing tests. \
@@ -4191,7 +4778,7 @@ Provide findings ordered by severity with file references, then open questions, 
     let user_prompt =
         format!("Review the following diff and provide feedback:\n\n{diff}\n\nEnd of diff.");
 
-    let client = DeepSeekClient::new(config)?;
+    let client = DeepSeekClient::new(&execution_config)?;
     let request = MessageRequest {
         model: model.clone(),
         messages: vec![Message {
@@ -5510,35 +6097,92 @@ async fn run_interactive(
     .await
 }
 
+#[derive(Debug)]
 struct CliAutoRoute {
+    provider: crate::config::ApiProvider,
     model: String,
     reasoning_effort: Option<crate::tui::app::ReasoningEffort>,
     auto_model: bool,
 }
 
-async fn resolve_cli_auto_route(config: &Config, model: &str, prompt: &str) -> CliAutoRoute {
+fn cli_reasoning_effort_value(
+    config: &Config,
+    effort: crate::tui::app::ReasoningEffort,
+) -> Option<String> {
+    effort
+        .api_value_for_provider(config.api_provider())
+        .map(str::to_string)
+}
+
+fn config_for_cli_route(config: &Config, route: &CliAutoRoute) -> Config {
+    let mut execution_config = config.clone();
+    execution_config.provider = Some(route.provider.as_str().to_string());
+    execution_config
+        .provider_config_for_mut(route.provider)
+        .model = Some(route.model.clone());
+    if matches!(
+        route.provider,
+        crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN
+    ) {
+        execution_config.default_text_model = Some(route.model.clone());
+    }
+    execution_config
+}
+
+async fn resolve_cli_auto_route(
+    config: &Config,
+    model: &str,
+    prompt: &str,
+) -> Result<CliAutoRoute> {
     if model.trim().eq_ignore_ascii_case("auto") {
         let selection =
-            model_routing::resolve_auto_route_with_flash(config, prompt, "", "auto", "auto").await;
-        CliAutoRoute {
+            model_routing::resolve_auto_route_with_inventory(config, prompt, "", "auto", "auto")
+                .await?;
+        Ok(CliAutoRoute {
+            provider: selection.provider,
             model: selection.model,
             reasoning_effort: selection.reasoning_effort,
             auto_model: true,
-        }
+        })
     } else {
+        if let Some(selection) = model_routing::resolve_explicit_route_with_inventory(config, model)
+        {
+            return Ok(CliAutoRoute {
+                provider: selection.provider,
+                model: selection.model,
+                reasoning_effort: selection.reasoning_effort,
+                auto_model: false,
+            });
+        }
+
+        let candidate_providers = model_routing::explicit_route_candidate_providers(config, model);
+        if !candidate_providers.is_empty() && !candidate_providers.contains(&config.api_provider())
+        {
+            let providers = candidate_providers
+                .iter()
+                .map(|provider| provider.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "model `{model}` is available from configured provider route(s): {providers}. \
+                 Pass `--provider <provider>` with `--model {model}` to choose one explicitly."
+            );
+        }
+
         // When --model is not `auto`, fall back to the reasoning_effort
         // declared in the user's config.toml. The previous hard-coded `None`
         // silently dropped the user's setting on every non-auto-route exec
         // call, which (for example) prevented vllm + Qwen3 users from
         // disabling thinking via `reasoning_effort = "off"` and caused
         // 30+ second SSE idle timeouts on trivial prompts.
-        CliAutoRoute {
+        Ok(CliAutoRoute {
+            provider: config.api_provider(),
             model: model.to_string(),
             reasoning_effort: config
                 .reasoning_effort()
                 .map(crate::tui::app::ReasoningEffort::from_setting),
             auto_model: false,
-        }
+        })
     }
 }
 
@@ -5546,11 +6190,12 @@ async fn run_one_shot(config: &Config, model: &str, prompt: &str) -> Result<()> 
     use crate::client::DeepSeekClient;
     use crate::models::{ContentBlock, Message, MessageRequest};
 
-    let client = DeepSeekClient::new(config)?;
-    let route = resolve_cli_auto_route(config, model, prompt).await;
+    let route = resolve_cli_auto_route(config, model, prompt).await?;
+    let execution_config = config_for_cli_route(config, &route);
+    let client = DeepSeekClient::new(&execution_config)?;
     let reasoning_effort = route
         .reasoning_effort
-        .map(|effort| effort.as_setting().to_string());
+        .and_then(|effort| cli_reasoning_effort_value(&execution_config, effort));
 
     let request = MessageRequest {
         model: route.model,
@@ -5588,12 +6233,13 @@ async fn run_one_shot_json(config: &Config, model: &str, prompt: &str) -> Result
     use crate::client::DeepSeekClient;
     use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt};
 
-    let client = DeepSeekClient::new(config)?;
-    let route = resolve_cli_auto_route(config, model, prompt).await;
-    let model = route.model;
+    let route = resolve_cli_auto_route(config, model, prompt).await?;
+    let execution_config = config_for_cli_route(config, &route);
+    let client = DeepSeekClient::new(&execution_config)?;
+    let model = route.model.clone();
     let reasoning_effort = route
         .reasoning_effort
-        .map(|effort| effort.as_setting().to_string());
+        .and_then(|effort| cli_reasoning_effort_value(&execution_config, effort));
     let request = MessageRequest {
         model: model.clone(),
         messages: vec![Message {
@@ -5748,6 +6394,10 @@ async fn run_exec_agent(
     json_output: bool,
     resume_session_id: Option<String>,
     output_format: ExecOutputFormat,
+    max_turns: u32,
+    allowed_tools: Option<Vec<String>>,
+    disallowed_tools: Option<Vec<String>>,
+    append_system_prompt: Option<String>,
 ) -> Result<()> {
     use crate::compaction::CompactionConfig;
     use crate::core::engine::{EngineConfig, spawn_engine};
@@ -5760,12 +6410,13 @@ async fn run_exec_agent(
     use crate::tools::todo::new_shared_todo_list;
     use crate::tui::app::AppMode;
 
-    let route = resolve_cli_auto_route(config, model, prompt).await;
+    let route = resolve_cli_auto_route(config, model, prompt).await?;
+    let execution_config = config_for_cli_route(config, &route);
     let auto_model = route.auto_model;
     let effective_model = route.model;
     let effective_reasoning_effort = route
         .reasoning_effort
-        .map(|effort| effort.as_setting().to_string());
+        .and_then(|effort| cli_reasoning_effort_value(&execution_config, effort));
 
     let settings = crate::settings::Settings::load().unwrap_or_default();
     let auto_compact_enabled = if crate::settings::Settings::auto_compact_explicitly_configured() {
@@ -5783,76 +6434,102 @@ async fn run_exec_agent(
         ..Default::default()
     };
 
-    let network_policy = config.network.clone().map(|toml_cfg| {
+    let network_policy = execution_config.network.clone().map(|toml_cfg| {
         crate::network_policy::NetworkPolicyDecider::with_default_audit(toml_cfg.into_runtime())
     });
 
-    let lsp_config = config
+    let lsp_config = execution_config
         .lsp
         .clone()
         .map(crate::config::LspConfigToml::into_runtime);
     let engine_config = EngineConfig {
         model: effective_model.clone(),
         workspace: workspace.clone(),
-        allow_shell: auto_approve || config.allow_shell(),
+        allow_shell: auto_approve || execution_config.allow_shell(),
         trust_mode,
         tool_whitelist: None,
         reasoning_effort: None,
-        notes_path: config.notes_path(),
-        mcp_config_path: config.mcp_config_path(),
-        skills_dir: config.skills_dir(),
-        instructions: config
-            .instructions_paths()
-            .into_iter()
-            .map(Into::into)
-            .collect(),
-        project_context_pack_enabled: config.project_context_pack_enabled(),
+        notes_path: execution_config.notes_path(),
+        mcp_config_path: execution_config.mcp_config_path(),
+        skills_dir: execution_config.skills_dir(),
+        instructions: {
+            let mut instrs: Vec<crate::prompts::InstructionSource> = execution_config
+                .instructions_paths()
+                .into_iter()
+                .map(Into::into)
+                .collect();
+            if let Some(ref extra) = append_system_prompt {
+                instrs.push(crate::prompts::InstructionSource::Inline {
+                    name: "cli:append-system-prompt".into(),
+                    content: extra.clone(),
+                });
+            }
+            instrs
+        },
+        project_context_pack_enabled: execution_config.project_context_pack_enabled(),
         translation_enabled: false,
         show_thinking: settings.show_thinking,
-        max_steps: 100,
+        max_steps: max_turns,
         max_subagents,
-        features: config.features(),
+        interactive_launch_limit: execution_config.interactive_launch_limit(),
+        features: execution_config.features(),
         compaction,
-        capacity: crate::core::capacity::CapacityControllerConfig::from_app_config(config),
+        capacity: crate::core::capacity::CapacityControllerConfig::from_app_config(
+            &execution_config,
+        ),
         todos: new_shared_todo_list(),
         plan_state: new_shared_plan_state(),
         goal_state: crate::tools::goal::new_shared_goal_state(),
         max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
         network_policy,
-        snapshots_enabled: config.snapshots_config().enabled,
-        snapshots_max_workspace_bytes: config
+        snapshots_enabled: execution_config.snapshots_config().enabled,
+        snapshots_max_workspace_bytes: execution_config
             .snapshots_config()
             .max_workspace_gb
             .saturating_mul(1024 * 1024 * 1024),
         lsp_config,
         runtime_services: crate::tools::spec::RuntimeToolServices::default(),
-        subagent_model_overrides: config.subagent_model_overrides(),
-        subagent_api_timeout: std::time::Duration::from_secs(config.subagent_api_timeout_secs()),
-        stream_chunk_timeout: std::time::Duration::from_secs(config.stream_chunk_timeout_secs()),
-        subagent_heartbeat_timeout: std::time::Duration::from_secs(
-            config.subagent_heartbeat_timeout_secs(),
+        subagent_model_overrides: execution_config.subagent_model_overrides(),
+        subagent_api_timeout: std::time::Duration::from_secs(
+            execution_config.subagent_api_timeout_secs(),
         ),
-        prefer_bwrap: config.prefer_bwrap.unwrap_or(false),
-        memory_enabled: config.memory_enabled(),
-        memory_path: config.memory_path(),
-        speech_output_dir: config.speech_output_dir(),
-        vision_config: config.vision_model_config(),
-        strict_tool_mode: config.strict_tool_mode.unwrap_or(false),
+        stream_chunk_timeout: std::time::Duration::from_secs(
+            execution_config.stream_chunk_timeout_secs(),
+        ),
+        subagent_heartbeat_timeout: std::time::Duration::from_secs(
+            execution_config.subagent_heartbeat_timeout_secs(),
+        ),
+        prefer_bwrap: execution_config.prefer_bwrap.unwrap_or(false),
+        memory_enabled: execution_config.memory_enabled(),
+        memory_path: execution_config.memory_path(),
+        speech_output_dir: execution_config.speech_output_dir(),
+        vision_config: execution_config.vision_model_config(),
+        strict_tool_mode: execution_config.strict_tool_mode.unwrap_or(false),
         goal_objective: None,
-        allowed_tools: None,
+        goal_token_budget: None,
+        goal_status: crate::tools::goal::GoalStatus::Active,
+        allowed_tools: allowed_tools.clone(),
+        disallowed_tools: disallowed_tools.clone(),
         hook_executor: None,
         locale_tag: crate::localization::resolve_locale(&settings.locale)
             .tag()
             .to_string(),
         workshop: config.workshop.clone(),
-        search_provider: config.search_provider(),
-        search_api_key: config.search.as_ref().and_then(|s| s.api_key.clone()),
-        search_base_url: config.search.as_ref().and_then(|s| s.base_url.clone()),
-        tools_always_load: config.tools_always_load(),
-        tools: config.tools.clone(),
+        search_provider: execution_config.search_provider(),
+        search_api_key: execution_config
+            .search
+            .as_ref()
+            .and_then(|s| s.api_key.clone()),
+        search_base_url: execution_config
+            .search
+            .as_ref()
+            .and_then(|s| s.base_url.clone()),
+        tools_always_load: execution_config.tools_always_load(),
+        tools: execution_config.tools.clone(),
+        verbosity: execution_config.verbosity.clone(),
     };
 
-    let engine_handle = spawn_engine(engine_config, config);
+    let engine_handle = spawn_engine(engine_config, &execution_config);
     let mode = if auto_approve {
         AppMode::Yolo
     } else {
@@ -5897,12 +6574,14 @@ async fn run_exec_agent(
             mode,
             model: effective_model.clone(),
             goal_objective: None,
-            allowed_tools: None,
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            allowed_tools: allowed_tools.clone(),
             hook_executor: None,
             reasoning_effort: effective_reasoning_effort,
             reasoning_effort_auto: auto_model,
             auto_model,
-            allow_shell: auto_approve || config.allow_shell(),
+            allow_shell: auto_approve || execution_config.allow_shell(),
             trust_mode,
             auto_approve,
             translation_enabled: false,
@@ -5910,12 +6589,13 @@ async fn run_exec_agent(
             approval_mode: if auto_approve {
                 crate::tui::approval::ApprovalMode::Auto
             } else {
-                config
+                execution_config
                     .approval_policy
                     .as_deref()
                     .and_then(crate::tui::approval::ApprovalMode::from_config_value)
                     .unwrap_or_default()
             },
+            verbosity: execution_config.verbosity.clone(),
         })
         .await?;
 
@@ -6185,6 +6865,15 @@ async fn run_exec_agent(
                 latest_system_prompt = system_prompt;
                 latest_model = model;
                 latest_workspace = workspace;
+            }
+            // #3027: surface the engine's max-steps notice in text mode so a
+            // --max-turns run that stops early says why instead of going quiet.
+            Event::Status { message }
+                if output_format == ExecOutputFormat::Text
+                    && !json_output
+                    && message.contains("Reached maximum steps") =>
+            {
+                eprintln!("{message}");
             }
             _ => {}
         }
@@ -6571,6 +7260,9 @@ mod terminal_mode_tests {
 
     #[test]
     fn exec_model_resolution_uses_provider_scoped_default() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _codewhale_model = crate::test_support::EnvVarGuard::remove("CODEWHALE_MODEL");
+        let _deepseek_model = crate::test_support::EnvVarGuard::remove("DEEPSEEK_MODEL");
         let config = Config {
             provider: Some("openrouter".to_string()),
             default_text_model: Some("deepseek/deepseek-v4-pro".to_string()),
@@ -6595,12 +7287,138 @@ mod terminal_mode_tests {
     }
 
     #[test]
+    fn exec_model_resolution_prefers_codewhale_model_env_override() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _codewhale_model = crate::test_support::EnvVarGuard::set("CODEWHALE_MODEL", " auto ");
+        let _deepseek_model =
+            crate::test_support::EnvVarGuard::set("DEEPSEEK_MODEL", "stale-deepseek-model");
+        let config = Config {
+            default_text_model: Some("deepseek/deepseek-v4-pro".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(resolve_exec_model(&config, None), "auto");
+    }
+
+    #[test]
+    fn exec_model_resolution_uses_legacy_deepseek_model_env_override() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _codewhale_model = crate::test_support::EnvVarGuard::remove("CODEWHALE_MODEL");
+        let _deepseek_model = crate::test_support::EnvVarGuard::set("DEEPSEEK_MODEL", " auto ");
+        let config = Config {
+            default_text_model: Some("deepseek/deepseek-v4-pro".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(resolve_exec_model(&config, None), "auto");
+    }
+
+    #[test]
+    fn exec_model_resolution_uses_provider_safe_default_for_zai() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _codewhale_model = crate::test_support::EnvVarGuard::remove("CODEWHALE_MODEL");
+        let _deepseek_model = crate::test_support::EnvVarGuard::remove("DEEPSEEK_MODEL");
+        let config = Config {
+            provider: Some("zai".to_string()),
+            default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_exec_model(&config, None),
+            crate::config::DEFAULT_ZAI_MODEL
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn explicit_exec_model_routes_to_unique_authenticated_provider_candidate() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-key");
+        let _openrouter = crate::test_support::EnvVarGuard::remove("OPENROUTER_API_KEY");
+        let config = Config {
+            provider: Some("deepseek".to_string()),
+            default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
+            ..Default::default()
+        };
+
+        let route = resolve_cli_auto_route(&config, crate::config::ZAI_GLM_5_2_MODEL, "pong")
+            .await
+            .expect("explicit GLM should route to the configured Z.ai provider");
+
+        assert_eq!(route.provider, crate::config::ApiProvider::Zai);
+        assert_eq!(route.model, crate::config::ZAI_GLM_5_2_MODEL);
+        assert!(!route.auto_model);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn explicit_exec_model_reports_ambiguous_authenticated_provider_candidates() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-key");
+        let _openrouter = crate::test_support::EnvVarGuard::set("OPENROUTER_API_KEY", "or-key");
+        let config = Config {
+            provider: Some("deepseek".to_string()),
+            default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
+            ..Default::default()
+        };
+
+        let err = resolve_cli_auto_route(&config, crate::config::ZAI_GLM_5_2_MODEL, "pong")
+            .await
+            .expect_err("ambiguous GLM route should ask for an explicit provider");
+        let message = err.to_string();
+
+        assert!(message.contains("model `GLM-5.2` is available"));
+        assert!(message.contains("openrouter"));
+        assert!(message.contains("zai"));
+        assert!(message.contains("--provider"));
+    }
+
+    #[test]
+    fn cli_route_execution_config_stamps_routed_model_into_provider_slot() {
+        let mut providers = crate::config::ProvidersConfig::default();
+        providers.deepseek.model = Some("deepseek-v4-pro".to_string());
+        let config = Config {
+            provider: Some("deepseek".to_string()),
+            providers: Some(providers),
+            ..Default::default()
+        };
+        let route = CliAutoRoute {
+            provider: crate::config::ApiProvider::Deepseek,
+            model: "deepseek-v4-flash".to_string(),
+            reasoning_effort: None,
+            auto_model: true,
+        };
+
+        let execution_config = config_for_cli_route(&config, &route);
+
+        assert_eq!(execution_config.default_model(), "deepseek-v4-flash");
+        assert_eq!(
+            execution_config
+                .provider_config_for(crate::config::ApiProvider::Deepseek)
+                .and_then(|entry| entry.model.as_deref()),
+            Some("deepseek-v4-flash")
+        );
+    }
+
+    #[test]
     fn exec_accepts_split_prompt_words_for_windows_cmd_shims() {
         let cli = parse_cli(&["codewhale", "exec", "hello", "world"]);
         let Some(Commands::Exec(args)) = cli.command else {
             panic!("expected exec command");
         };
 
+        assert_eq!(args.prompt, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn exec_keeps_model_flag_before_split_prompt_words() {
+        let cli = parse_cli(&["codewhale", "exec", "--model", "auto", "hello", "world"]);
+        let Some(Commands::Exec(args)) = cli.command else {
+            panic!("expected exec command");
+        };
+
+        assert_eq!(args.model.as_deref(), Some("auto"));
         assert_eq!(args.prompt, vec!["hello", "world"]);
     }
 
@@ -6644,6 +7462,45 @@ mod terminal_mode_tests {
 
         assert_eq!(args.session_id.as_deref(), Some("abc123"));
         assert_eq!(args.output_format, ExecOutputFormat::Text);
+    }
+
+    #[test]
+    fn exec_parses_tool_gate_and_hardening_flags() {
+        let cli = parse_cli(&[
+            "codewhale",
+            "exec",
+            "--allowed-tools",
+            "read_file,grep_files",
+            "--disallowed-tools",
+            "exec_shell",
+            "--max-turns",
+            "7",
+            "--append-system-prompt",
+            "extra rules",
+            "do the thing",
+        ]);
+        let Some(Commands::Exec(args)) = cli.command else {
+            panic!("expected exec command");
+        };
+
+        assert_eq!(
+            args.allowed_tools.as_deref(),
+            Some(&["read_file".to_string(), "grep_files".to_string()][..])
+        );
+        assert_eq!(
+            args.disallowed_tools.as_deref(),
+            Some(&["exec_shell".to_string()][..])
+        );
+        assert_eq!(args.max_turns, Some(7));
+        assert_eq!(args.append_system_prompt.as_deref(), Some("extra rules"));
+        assert_eq!(args.prompt, vec!["do the thing"]);
+    }
+
+    #[test]
+    fn exec_rejects_zero_max_turns() {
+        let err = Cli::try_parse_from(["codewhale", "exec", "--max-turns", "0", "hello"])
+            .expect_err("max-turns must be >= 1");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]

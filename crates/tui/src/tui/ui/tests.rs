@@ -6,7 +6,7 @@ use crate::config::{
 use crate::config_ui::{self, WebConfigSession, WebConfigSessionEvent};
 use crate::core::engine::mock_engine_handle;
 use crate::tui::active_cell::ActiveCell;
-use crate::tui::app::ToolDetailRecord;
+use crate::tui::app::{SidebarHoverRow, SidebarHoverSection, ToolDetailRecord};
 use crate::tui::file_mention::{
     apply_mention_menu_selection, find_file_mention_completions, partial_file_mention_at_cursor,
     try_autocomplete_file_mention, user_request_with_file_mentions, visible_mention_menu_entries,
@@ -20,7 +20,8 @@ use crate::tui::footer_ui::{
 use crate::tui::history::{
     ExecCell, ExecSource, GenericToolCell, HistoryCell, SubAgentCell, ToolCell, ToolStatus,
 };
-use crate::tui::views::{ModalView, ViewAction};
+use crate::tui::hotbar::actions::HotbarDispatch;
+use crate::tui::views::{HelpView, ModalView, ViewAction};
 use crate::working_set::Workspace;
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::text::Span;
@@ -296,6 +297,35 @@ fn word_cursor_modifier_accepts_control_and_alt() {
     ));
     assert!(!is_word_cursor_modifier(KeyModifiers::NONE));
     assert!(!is_word_cursor_modifier(KeyModifiers::SHIFT));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn normalize_macos_modifiers_maps_super_to_control() {
+    use crate::tui::composer_ui::normalize_macos_modifiers;
+    // SUPER (Cmd) without CONTROL should gain CONTROL and lose SUPER.
+    let normalized = normalize_macos_modifiers(KeyModifiers::SUPER);
+    assert!(normalized.contains(KeyModifiers::CONTROL));
+    assert!(!normalized.contains(KeyModifiers::SUPER));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn normalize_macos_modifiers_preserves_existing_control() {
+    use crate::tui::composer_ui::normalize_macos_modifiers;
+    // CONTROL already set — SUPER should be removed.
+    let normalized = normalize_macos_modifiers(KeyModifiers::CONTROL | KeyModifiers::SUPER);
+    assert!(normalized.contains(KeyModifiers::CONTROL));
+    assert!(!normalized.contains(KeyModifiers::SUPER));
+}
+
+#[test]
+fn normalize_macos_modifiers_leaves_alt_unchanged() {
+    use crate::tui::composer_ui::normalize_macos_modifiers;
+    let normalized = normalize_macos_modifiers(KeyModifiers::ALT);
+    // On non-macOS this is a no-op; on macOS ALT stays unchanged.
+    assert!(normalized.contains(KeyModifiers::ALT));
+    assert!(!normalized.contains(KeyModifiers::SUPER));
 }
 
 #[test]
@@ -697,6 +727,139 @@ fn loading_mouse_filter_keeps_active_drags() {
     app.viewport.transcript_selection.dragging = false;
     app.viewport.transcript_scrollbar_dragging = true;
     assert!(!should_drop_loading_mouse_motion(&app, drag));
+
+    // Sidebar drag-to-resize must also survive the loading filter (#3063).
+    app.viewport.transcript_scrollbar_dragging = false;
+    app.sidebar_resizing = true;
+    assert!(!should_drop_loading_mouse_motion(&app, drag));
+}
+
+#[test]
+fn loading_mouse_filter_allows_sidebar_resize_down_drag_up() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    setup_resize_handle(&mut app, 80, 33, 120);
+
+    let down = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 80,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(!should_drop_loading_mouse_motion(&app, down));
+    handle_mouse_event(&mut app, down);
+    assert!(app.sidebar_resizing, "down on handle starts resize");
+
+    let drag = MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: 76,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(
+        !should_drop_loading_mouse_motion(&app, drag),
+        "resize drag must not be dropped while loading"
+    );
+    handle_mouse_event(&mut app, drag);
+    let expected = ((37u32 * 100) / 120) as u16;
+    assert_eq!(app.sidebar_width_percent, expected);
+
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: 76,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(!should_drop_loading_mouse_motion(&app, up));
+    handle_mouse_event(&mut app, up);
+    assert!(!app.sidebar_resizing);
+    assert!(app.sidebar_width_dirty);
+}
+
+#[test]
+fn loading_mouse_filter_allows_sidebar_hover_popovers() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.viewport.last_sidebar_area = Some(Rect::new(60, 4, 20, 6));
+    app.sidebar_hover.sections.push(SidebarHoverSection {
+        content_area: Rect::new(60, 4, 20, 6),
+        lines: vec!["Visible row".to_string()],
+        rows: vec![SidebarHoverRow {
+            row_y: 5,
+            display_text: "Truncated".to_string(),
+            full_text: "Full sidebar task label".to_string(),
+            detail: Some("Detailed context".to_string()),
+            is_truncated: true,
+            click_action: None,
+        }],
+    });
+    let moved = MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: 65,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert!(!should_drop_loading_mouse_motion(&app, moved));
+    handle_mouse_event(&mut app, moved);
+
+    assert_eq!(
+        app.sidebar_hover_tooltip.as_deref(),
+        Some("Full sidebar task label\nDetailed context")
+    );
+    assert_eq!(app.last_mouse_pos, Some((65, 5)));
+}
+
+#[test]
+fn loading_mouse_filter_allows_sidebar_hover_to_clear() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.viewport.last_sidebar_area = Some(Rect::new(60, 4, 20, 6));
+    app.sidebar_hover_tooltip = Some("Stale sidebar tooltip".to_string());
+    let moved = MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: 12,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert!(!should_drop_loading_mouse_motion(&app, moved));
+    handle_mouse_event(&mut app, moved);
+
+    assert_eq!(app.sidebar_hover_tooltip, None);
+    assert_eq!(app.last_mouse_pos, Some((12, 5)));
+}
+
+#[test]
+fn loading_mouse_filter_allows_sidebar_exit_to_clear_highlight() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.viewport.last_sidebar_area = Some(Rect::new(60, 4, 20, 6));
+    app.last_mouse_pos = Some((60, 5));
+
+    let exit_left = MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: 59,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert!(
+        !should_drop_loading_mouse_motion(&app, exit_left),
+        "first move out of the sidebar must clear stale sidebar hover state"
+    );
+    handle_mouse_event(&mut app, exit_left);
+
+    assert_eq!(app.last_mouse_pos, Some((59, 5)));
+    assert!(should_drop_loading_mouse_motion(
+        &app,
+        MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 58,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        }
+    ));
 }
 
 #[test]
@@ -1259,6 +1422,32 @@ fn copy_shortcut_accepts_cmd_and_ctrl_shift_only() {
     )));
     assert!(!crate::tui::key_shortcuts::is_copy_shortcut(
         &KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL,)
+    ));
+}
+
+#[test]
+fn control_like_modifier_accepts_super_only_on_macos() {
+    use crate::tui::key_shortcuts::has_control_like_modifier_for_platform;
+
+    assert!(has_control_like_modifier_for_platform(
+        KeyModifiers::CONTROL,
+        false
+    ));
+    assert!(has_control_like_modifier_for_platform(
+        KeyModifiers::CONTROL,
+        true
+    ));
+    assert!(!has_control_like_modifier_for_platform(
+        KeyModifiers::SUPER,
+        false
+    ));
+    assert!(has_control_like_modifier_for_platform(
+        KeyModifiers::SUPER,
+        true
+    ));
+    assert!(has_control_like_modifier_for_platform(
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+        true
     ));
 }
 
@@ -2343,6 +2532,65 @@ async fn provider_switch_to_deepseek_drops_stale_xiaomi_root_base_url() {
 }
 
 #[tokio::test]
+async fn provider_switch_from_mimo_to_openrouter_without_key_fails_before_dispatch() {
+    let _home = SettingsHomeGuard::new();
+    let _openrouter_key = crate::test_support::EnvVarGuard::remove("OPENROUTER_API_KEY");
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::XiaomiMimo;
+    app.model = "mimo-v2.5-pro".to_string();
+    app.model_ids_passthrough = true;
+    let mut engine = mock_engine_handle();
+    let mut config = Config {
+        provider: Some("xiaomi-mimo".to_string()),
+        api_key: Some("deepseek-key".to_string()),
+        base_url: Some("https://token-plan-sgp.xiaomimimo.com/v1".to_string()),
+        default_text_model: Some("mimo-v2.5-pro".to_string()),
+        providers: Some(ProvidersConfig {
+            xiaomi_mimo: ProviderConfig {
+                api_key: Some("mimo-key".to_string()),
+                model: Some("mimo-v2.5-pro".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    switch_provider(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ApiProvider::Openrouter,
+        Some(crate::config::OPENROUTER_NEMOTRON_3_ULTRA_MODEL.to_string()),
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::XiaomiMimo);
+    assert_eq!(app.model, "mimo-v2.5-pro");
+    assert!(app.model_ids_passthrough);
+    assert_eq!(config.provider.as_deref(), Some("xiaomi-mimo"));
+    assert_eq!(
+        config
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.openrouter.api_key.as_deref()),
+        None
+    );
+    assert!(app.pending_provider_switch.is_none());
+    let last_system_message = app
+        .history
+        .iter()
+        .rev()
+        .find_map(|cell| match cell {
+            HistoryCell::System { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .expect("failed provider switch should add a system message");
+    assert!(last_system_message.contains("OpenRouter API key not found"));
+    assert!(last_system_message.contains("Provider unchanged (xiaomi-mimo)"));
+}
+
+#[tokio::test]
 async fn provider_switch_persists_provider_to_config_for_restart() {
     let _home = SettingsHomeGuard::new();
     let tmp = TempDir::new().expect("config tempdir");
@@ -2440,6 +2688,43 @@ async fn provider_switch_model_override_updates_target_provider_model_slot() {
             .and_then(|providers| providers.xiaomi_mimo.model.as_deref()),
         Some("mimo-v2.5-pro")
     );
+}
+
+#[tokio::test]
+async fn provider_switch_to_openai_codex_normalizes_deepseek_off_effort() {
+    let _home = SettingsHomeGuard::new();
+    let _token = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Deepseek;
+    app.model = DEFAULT_TEXT_MODEL.to_string();
+    app.reasoning_effort = ReasoningEffort::Off;
+    let mut engine = mock_engine_handle();
+    let mut config = Config {
+        provider: Some("deepseek".to_string()),
+        default_text_model: Some(DEFAULT_TEXT_MODEL.to_string()),
+        providers: Some(ProvidersConfig {
+            openai_codex: ProviderConfig {
+                model: Some(crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    switch_provider(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ApiProvider::OpenaiCodex,
+        None,
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::OpenaiCodex);
+    assert_eq!(app.model, crate::config::DEFAULT_OPENAI_CODEX_MODEL);
+    assert_eq!(app.reasoning_effort, ReasoningEffort::Low);
+    assert_eq!(app.reasoning_effort_display_label(), "low");
 }
 
 #[tokio::test]
@@ -2831,6 +3116,46 @@ async fn dispatch_resume_message_restores_paused_command_goal() {
 }
 
 #[test]
+fn apply_goal_snapshot_updates_visible_goal_status() {
+    let mut app = create_test_app();
+    app.hunt.quarry = Some("Ship the release lane".to_string());
+    app.hunt.token_budget = Some(10_000);
+    app.hunt.verdict = crate::tui::app::HuntVerdict::Hunting;
+    let started_at = Instant::now();
+    app.hunt.started_at = Some(started_at);
+
+    let completed = crate::tools::goal::GoalSnapshot {
+        objective: Some("Ship the release lane".to_string()),
+        status: "complete".to_string(),
+        token_budget: Some(10_000),
+        elapsed_seconds: Some(12),
+        evidence: Some("focused tests passed".to_string()),
+        blocker: None,
+    };
+
+    assert!(apply_goal_snapshot_to_app(&mut app, &completed));
+    assert_eq!(app.hunt.quarry.as_deref(), Some("Ship the release lane"));
+    assert_eq!(app.hunt.token_budget, Some(10_000));
+    assert_eq!(app.hunt.verdict, crate::tui::app::HuntVerdict::Hunted);
+    assert_eq!(app.hunt.started_at, Some(started_at));
+
+    let blocked = crate::tools::goal::GoalSnapshot {
+        objective: Some("Different objective".to_string()),
+        status: "blocked".to_string(),
+        token_budget: None,
+        elapsed_seconds: Some(1),
+        evidence: None,
+        blocker: Some("needs user approval".to_string()),
+    };
+
+    assert!(apply_goal_snapshot_to_app(&mut app, &blocked));
+    assert_eq!(app.hunt.quarry.as_deref(), Some("Different objective"));
+    assert_eq!(app.hunt.token_budget, None);
+    assert_eq!(app.hunt.verdict, crate::tui::app::HuntVerdict::Escaped);
+    assert!(app.hunt.started_at.is_some());
+}
+
+#[test]
 fn turn_liveness_watchdog_clears_stale_dispatch() {
     let mut app = create_test_app();
     app.is_loading = true;
@@ -3106,19 +3431,6 @@ fn spans_text(spans: &[Span<'_>]) -> String {
 }
 
 #[test]
-fn alt_4_focuses_agents_sidebar_without_switching_modes() {
-    let mut app = create_test_app();
-    app.mode = AppMode::Agent;
-    app.sidebar_focus = SidebarFocus::Auto;
-
-    apply_alt_4_shortcut(&mut app, KeyModifiers::ALT);
-
-    assert_eq!(app.mode, AppMode::Agent);
-    assert_eq!(app.sidebar_focus, SidebarFocus::Agents);
-    assert_eq!(app.status_message.as_deref(), Some("Sidebar focus: agents"));
-}
-
-#[test]
 fn ctrl_alt_4_focuses_agents_sidebar_without_switching_modes() {
     let mut app = create_test_app();
     app.mode = AppMode::Agent;
@@ -3129,6 +3441,75 @@ fn ctrl_alt_4_focuses_agents_sidebar_without_switching_modes() {
     assert_eq!(app.mode, AppMode::Agent);
     assert_eq!(app.sidebar_focus, SidebarFocus::Agents);
     assert_eq!(app.status_message.as_deref(), Some("Sidebar focus: agents"));
+}
+
+#[test]
+fn hotbar_bare_digit_fires_only_when_composer_empty() {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::None;
+
+    let bare_four = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE);
+    assert_eq!(hotbar_slot_from_key(&app, &bare_four), Some(4));
+
+    app.input = "draft".to_string();
+    assert_eq!(hotbar_slot_from_key(&app, &bare_four), None);
+
+    app.input = "   ".to_string();
+    assert_eq!(hotbar_slot_from_key(&app, &bare_four), None);
+}
+
+#[test]
+fn hotbar_alt_digit_fires_when_composer_has_text() {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::None;
+    app.input = "draft".to_string();
+
+    let alt_four = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT);
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), Some(4));
+}
+
+#[test]
+fn hotbar_digits_are_blocked_while_overlay_is_open() {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::None;
+    app.view_stack.push(HelpView::new());
+
+    let bare_four = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE);
+    let alt_four = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT);
+
+    assert_eq!(hotbar_slot_from_key(&app, &bare_four), None);
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), None);
+}
+
+#[test]
+fn hotbar_dispatches_bound_slot_and_ignores_empty_slot() {
+    let mut app = create_test_app();
+    let config = Config::default();
+    app.onboarding = OnboardingState::None;
+    app.mode = AppMode::Plan;
+    app.needs_redraw = false;
+
+    let dispatch = dispatch_hotbar_slot(&mut app, &config, 4).expect("hotbar dispatch");
+    assert!(matches!(
+        dispatch,
+        Some(HotbarDispatch::AppAction(AppAction::ModeChanged(
+            AppMode::Agent
+        )))
+    ));
+    assert_eq!(app.mode, AppMode::Agent);
+    assert!(
+        app.needs_redraw,
+        "mode-changing hotbar actions should leave the app ready to redraw"
+    );
+
+    let empty_config = Config {
+        hotbar: Some(Vec::new()),
+        ..Config::default()
+    };
+    assert_eq!(
+        dispatch_hotbar_slot(&mut app, &empty_config, 1).expect("empty slot is ok"),
+        None
+    );
 }
 
 #[test]
@@ -3150,6 +3531,7 @@ fn ctrl_alt_0_hides_sidebar() {
     apply_alt_0_shortcut(&mut app, KeyModifiers::ALT | KeyModifiers::CONTROL);
 
     assert_eq!(app.sidebar_focus, SidebarFocus::Hidden);
+    assert!(app.sidebar_focus_dirty);
     assert_eq!(app.status_message.as_deref(), Some("Sidebar hidden"));
 }
 
@@ -3162,6 +3544,20 @@ fn ctrl_alt_0_restores_auto_sidebar_when_already_hidden() {
 
     assert_eq!(app.sidebar_focus, SidebarFocus::Auto);
     assert_eq!(app.status_message.as_deref(), Some("Sidebar focus: auto"));
+}
+
+#[test]
+fn sidebar_focus_dirty_persists_saved_focus() {
+    let _guard = ConfigPathEnvGuard::new();
+    let mut app = create_test_app();
+    app.sidebar_focus = SidebarFocus::Hidden;
+    app.sidebar_focus_dirty = true;
+
+    persist_sidebar_settings_if_dirty(&mut app);
+
+    assert!(!app.sidebar_focus_dirty);
+    let settings = crate::settings::Settings::load().expect("load settings");
+    assert_eq!(settings.sidebar_focus, "hidden");
 }
 
 #[test]
@@ -3322,6 +3718,32 @@ fn sidebar_resize_up_ends_resizing_and_marks_dirty() {
         app.sidebar_width_dirty,
         "should mark width dirty for persistence"
     );
+}
+
+#[test]
+fn sidebar_resize_up_outside_handle_still_ends_resizing() {
+    let mut app = create_test_app();
+    setup_resize_handle(&mut app, 80, 33, 120);
+    app.sidebar_resizing = true;
+    app.sidebar_resize_anchor_x = 80;
+    app.sidebar_resize_anchor_width = 33;
+
+    // Release far away from the handle and the sidebar entirely.
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 5,
+            row: 20,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        !app.sidebar_resizing,
+        "mouse up must clear resize state even outside the handle"
+    );
+    assert!(app.sidebar_width_dirty);
 }
 
 fn make_subagent(
@@ -3527,6 +3949,177 @@ fn fanout_started_sibling_bumps_existing_card_revision() {
         }
         cell => panic!("expected fanout card, got {cell:?}"),
     }
+}
+
+#[test]
+fn fanout_interrupted_mailbox_drops_running_count() {
+    let mut app = create_test_app();
+    app.pending_subagent_dispatch = Some("rlm".to_string());
+
+    for (seq, id) in ["fanout-a", "fanout-b"].iter().enumerate() {
+        handle_subagent_mailbox(
+            &mut app,
+            seq as u64 + 1,
+            &crate::tools::subagent::MailboxMessage::Started {
+                agent_id: (*id).to_string(),
+                agent_type: "default".to_string(),
+            },
+        );
+    }
+    assert_eq!(
+        crate::tui::subagent_routing::active_fanout_counts(&app),
+        Some((2, 2))
+    );
+
+    handle_subagent_mailbox(
+        &mut app,
+        3,
+        &crate::tools::subagent::MailboxMessage::Interrupted {
+            agent_id: "fanout-a".to_string(),
+            reason: "API call timed out after 120000ms".to_string(),
+        },
+    );
+
+    assert_eq!(
+        crate::tui::subagent_routing::active_fanout_counts(&app),
+        Some((1, 2)),
+        "interrupted worker must no longer count as running"
+    );
+}
+
+#[test]
+fn stall_reason_provider_wait_includes_route_and_idle_budget() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(45));
+    app.turn_last_activity_at = Some(Instant::now() - Duration::from_secs(40));
+
+    let reason = crate::tui::footer_ui::stall_reason(&app).expect("stalled turn has a reason");
+    assert!(
+        reason.contains(&format!(
+            "waiting for {} {}",
+            app.api_provider.as_str(),
+            app.model
+        )),
+        "{reason}"
+    );
+    assert!(
+        reason.contains(&format!("/{}s idle timeout", app.stream_chunk_timeout_secs)),
+        "{reason}"
+    );
+}
+
+#[test]
+fn reconcile_syncs_stale_running_cards_with_interrupted_snapshots() {
+    let mut app = create_test_app();
+    app.pending_subagent_dispatch = Some("rlm".to_string());
+
+    for (seq, id) in ["fanout-a", "fanout-b"].iter().enumerate() {
+        handle_subagent_mailbox(
+            &mut app,
+            seq as u64 + 1,
+            &crate::tools::subagent::MailboxMessage::Started {
+                agent_id: (*id).to_string(),
+                agent_type: "default".to_string(),
+            },
+        );
+    }
+    let fanout_idx = app.last_fanout_card_index.expect("fanout card index");
+    let initial_revision = app.history_revisions[fanout_idx];
+
+    // The card missed its lifecycle envelope; only the manager snapshot
+    // (delivered via AgentList) knows the agents were interrupted.
+    app.subagent_cache = vec![
+        make_subagent(
+            "fanout-a",
+            crate::tools::subagent::SubAgentStatus::Interrupted("API call timed out".to_string()),
+        ),
+        make_subagent("fanout-b", crate::tools::subagent::SubAgentStatus::Running),
+    ];
+    reconcile_subagent_activity_state(&mut app);
+
+    assert_eq!(
+        crate::tui::subagent_routing::active_fanout_counts(&app),
+        Some((1, 2)),
+        "snapshot reconciliation must clear the stale running slot"
+    );
+    assert_ne!(
+        app.history_revisions[fanout_idx], initial_revision,
+        "reconciled card must invalidate cached transcript rows"
+    );
+    assert_eq!(running_agent_count(&app), 1);
+}
+
+#[test]
+fn stall_reason_provider_wait_reports_zero_running_for_planned_fanout() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(45));
+
+    // A fanout plan exists (card seeded with pending workers) but no child
+    // agent has launched yet: the reason must say 0 running explicitly.
+    let card = crate::tui::widgets::agent_card::FanoutCard::new("rlm", app.ui_locale)
+        .with_workers(["task:a", "task:b", "task:c", "task:d"]);
+    app.history
+        .push(HistoryCell::SubAgent(SubAgentCell::Fanout(card)));
+    app.history_revisions.push(0);
+    app.last_fanout_card_index = Some(app.history.len() - 1);
+
+    let reason = crate::tui::footer_ui::stall_reason(&app).expect("stalled turn has a reason");
+    assert!(reason.contains("fanout 0/4 running"), "{reason}");
+
+    // Once a worker is actually running the marker disappears.
+    if let Some(HistoryCell::SubAgent(SubAgentCell::Fanout(card))) = app
+        .last_fanout_card_index
+        .and_then(|idx| app.history.get_mut(idx))
+    {
+        card.upsert_worker(
+            "task:a",
+            crate::tui::widgets::agent_card::AgentLifecycle::Running,
+        );
+    }
+    let reason = crate::tui::footer_ui::stall_reason(&app).expect("stalled turn has a reason");
+    assert!(!reason.contains("0/4 running"), "{reason}");
+}
+
+#[test]
+fn stall_reason_provider_wait_flags_pending_dispatch() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(31));
+    app.pending_subagent_dispatch = Some("agent_spawn".to_string());
+
+    let reason = crate::tui::footer_ui::stall_reason(&app).expect("stalled turn has a reason");
+    assert!(
+        reason.contains("sub-agent dispatch pending, 0 running"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn provider_wait_incident_logs_once_per_turn() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(150));
+    app.pending_subagent_dispatch = Some("rlm".to_string());
+
+    assert!(!app.provider_wait_incident_logged);
+    crate::tui::footer_ui::maybe_log_provider_wait_incident(&mut app);
+    assert!(app.provider_wait_incident_logged, "incident logged once");
+
+    // Below threshold or without a fanout plan, nothing is logged.
+    let mut quiet = create_test_app();
+    quiet.is_loading = true;
+    quiet.turn_started_at = Some(Instant::now() - Duration::from_secs(150));
+    crate::tui::footer_ui::maybe_log_provider_wait_incident(&mut quiet);
+    assert!(!quiet.provider_wait_incident_logged);
+
+    let mut early = create_test_app();
+    early.is_loading = true;
+    early.turn_started_at = Some(Instant::now() - Duration::from_secs(60));
+    early.pending_subagent_dispatch = Some("rlm".to_string());
+    crate::tui::footer_ui::maybe_log_provider_wait_incident(&mut early);
+    assert!(!early.provider_wait_incident_logged);
 }
 
 #[test]
@@ -5125,6 +5718,57 @@ async fn steer_user_message_records_prompt_for_cancel_restore() {
 }
 
 #[tokio::test]
+async fn ctrl_s_sends_next_queued_message_into_running_turn() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.queue_message(crate::tui::app::QueuedMessage::new(
+        "please attend to your sub agents".to_string(),
+        None,
+    ));
+    let config = Config::default();
+    let mut engine = crate::core::engine::mock_engine_handle();
+
+    assert!(
+        send_ctrl_s_queued_message_now(&mut app, &config, &engine.handle)
+            .await
+            .expect("ctrl+s send succeeds")
+    );
+
+    assert_eq!(app.queued_message_count(), 0);
+    assert_eq!(
+        engine.rx_steer.recv().await.as_deref(),
+        Some("please attend to your sub agents")
+    );
+}
+
+#[tokio::test]
+async fn ctrl_s_sends_edited_queued_draft_into_running_turn() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.queued_draft = Some(crate::tui::app::QueuedMessage::new(
+        "original queued follow-up".to_string(),
+        Some("skill body".to_string()),
+    ));
+    app.input = "edited queued follow-up".to_string();
+    app.cursor_position = app.input.chars().count();
+    let config = Config::default();
+    let mut engine = crate::core::engine::mock_engine_handle();
+
+    assert!(
+        send_ctrl_s_queued_message_now(&mut app, &config, &engine.handle)
+            .await
+            .expect("ctrl+s draft send succeeds")
+    );
+
+    assert!(app.queued_draft.is_none());
+    assert!(app.input.is_empty());
+    assert_eq!(app.queued_message_count(), 0);
+    let content = engine.rx_steer.recv().await.expect("steer content");
+    assert!(content.contains("edited queued follow-up"));
+    assert!(content.contains("skill body"));
+}
+
+#[tokio::test]
 async fn numeric_plan_choice_still_queues_follow_up_when_busy() {
     let mut app = create_test_app();
     app.mode = AppMode::Plan;
@@ -5610,6 +6254,7 @@ fn active_rlm_task_entries_surface_foreground_rlm_work() {
     assert_eq!(entries[0].id, "rlm-1");
     assert_eq!(entries[0].status, "running");
     assert_eq!(entries[0].prompt_summary, "RLM: file_path: Cargo.lock");
+    assert_eq!(entries[0].kind, TaskPanelEntryKind::Background);
     assert!(entries[0].duration_ms.unwrap_or_default() >= 3000);
 }
 
@@ -5630,6 +6275,7 @@ fn active_reasoning_task_entries_surface_reasoning_only_turns() {
     assert_eq!(entries[0].id, "reasoning-1");
     assert_eq!(entries[0].status, "running");
     assert_eq!(entries[0].prompt_summary, "model reasoning");
+    assert_eq!(entries[0].kind, TaskPanelEntryKind::ModelReasoning);
     assert!(entries[0].duration_ms.unwrap_or_default() >= 2000);
 }
 
@@ -7627,6 +8273,45 @@ fn recoverable_engine_error_does_not_enter_offline_mode() {
     let _ = ErrorEnvelope::transient("");
 }
 
+#[test]
+fn recoverable_provider_error_advances_fallback_chain() {
+    use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, ErrorSeverity};
+
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Deepseek;
+    app.provider_chain = Some(codewhale_config::ProviderChain::new(
+        codewhale_config::ProviderKind::Deepseek,
+        &[codewhale_config::ProviderKind::Openrouter],
+    ));
+
+    apply_engine_error_to_app(
+        &mut app,
+        ErrorEnvelope::new(
+            ErrorCategory::RateLimit,
+            ErrorSeverity::Warning,
+            true,
+            "rate_limit",
+            "provider returned 429",
+        ),
+    );
+
+    assert_eq!(app.api_provider, ApiProvider::Openrouter);
+    assert!(app.is_fallback_active());
+    assert!(!app.offline_mode);
+    assert!(
+        app.status_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Switched to openrouter")
+    );
+    assert!(
+        app.last_fallback_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("provider returned 429")
+    );
+}
+
 #[tokio::test]
 async fn provider_switch_auth_error_restores_previous_provider_and_model() {
     use crate::error_taxonomy::ErrorEnvelope;
@@ -8836,7 +9521,7 @@ fn completed_turn_notification_uses_streaming_text() {
         Duration::from_secs(12),
         None,
     );
-    assert_eq!(msg, "Hello there.\nWhat's next?");
+    assert_eq!(msg, "Turn complete\nHello there.\nWhat's next?");
 }
 
 #[test]
@@ -8871,7 +9556,7 @@ fn completed_turn_notification_falls_back_to_latest_assistant_message() {
         Duration::from_secs(75),
         None,
     );
-    assert_eq!(msg, "Latest reply");
+    assert_eq!(msg, "Turn complete\nLatest reply");
 }
 
 #[test]
@@ -8884,7 +9569,7 @@ fn completed_turn_notification_falls_back_to_default_when_empty() {
         Duration::from_secs(5),
         None,
     );
-    assert_eq!(msg, "codewhale: turn complete");
+    assert_eq!(msg, "Turn complete");
 }
 
 #[test]
@@ -8899,34 +9584,55 @@ fn completed_turn_notification_truncates_long_text() {
         None,
     );
     assert!(msg.ends_with("..."));
+    let preview = msg
+        .strip_prefix("Turn complete\n")
+        .expect("notification should lead with completion status");
     // 360-char body + 3-char ellipsis
-    assert_eq!(msg.chars().count(), 363);
+    assert_eq!(preview.chars().count(), 363);
+}
+
+#[test]
+fn completed_turn_notification_leads_with_user_locale() {
+    let mut app = create_test_app();
+    app.ui_locale = crate::localization::Locale::Ja;
+    let msg = crate::tui::notifications::completed_turn_message(
+        &app,
+        "完了しました。",
+        true,
+        Duration::from_secs(65),
+        None,
+    );
+    assert_eq!(msg, "ターン完了 (1m 5s)\n完了しました。");
 }
 
 #[test]
 fn subagent_completion_notification_uses_summary_line_not_sentinel() {
     let msg = crate::tui::notifications::subagent_completion_message(
+        crate::localization::Locale::En,
         "agent_live",
         "Finished the docs audit.\n<codewhale:subagent.done>{}</codewhale:subagent.done>",
         false,
         Duration::from_secs(42),
     );
 
-    assert_eq!(msg, "sub-agent agent_live: Finished the docs audit.");
+    assert_eq!(
+        msg,
+        "Sub-agent complete\nagent_live: Finished the docs audit."
+    );
     assert!(!msg.contains("codewhale:subagent.done"));
 }
 
 #[test]
 fn subagent_completion_notification_can_include_elapsed_summary() {
     let msg = crate::tui::notifications::subagent_completion_message(
+        crate::localization::Locale::En,
         "agent_live",
         "",
         true,
         Duration::from_secs(65),
     );
 
-    assert!(msg.contains("codewhale: sub-agent agent_live complete"));
-    assert!(msg.contains("codewhale: sub-agent complete (1m 5s)"));
+    assert_eq!(msg, "Sub-agent complete (1m 5s)\nagent_live");
 }
 
 #[test]
@@ -9300,8 +10006,70 @@ mod work_sidebar_projection_tests {
             status: "completed".to_string(),
             prompt_summary: "echo hello".to_string(),
             duration_ms: Some(100),
+            kind: crate::tui::app::TaskPanelEntryKind::Background,
         };
         assert_eq!(entry.status, "completed");
         assert_ne!(entry.status, "running");
     }
+}
+
+// ── #3033: AgentProgress redraw throttle ───────────────────────────────────
+
+#[test]
+fn agent_progress_redraw_throttle_permits_first_and_spaced_events() {
+    let mut last_redraw = None;
+    let t0 = Instant::now();
+
+    assert!(
+        agent_progress_redraw_permitted(&mut last_redraw, t0),
+        "first progress event always repaints"
+    );
+    assert!(
+        !agent_progress_redraw_permitted(&mut last_redraw, t0 + Duration::from_millis(50)),
+        "events inside the 100ms window are throttled"
+    );
+    assert!(
+        !agent_progress_redraw_permitted(&mut last_redraw, t0 + Duration::from_millis(99)),
+        "throttled events must not advance the window"
+    );
+    assert!(
+        agent_progress_redraw_permitted(&mut last_redraw, t0 + Duration::from_millis(150)),
+        "events past the window repaint again"
+    );
+}
+
+#[test]
+fn throttled_progress_event_does_not_cancel_other_events_redraw() {
+    // Repro for the #3033 audit finding: `received_engine_event` is a shared
+    // accumulator for the whole drain batch. A throttled AgentProgress event
+    // must restore the PRE-EVENT value instead of clearing the flag, so
+    // redraws owed to other events (AgentSpawned, AgentList, cross-agent
+    // AgentComplete...) survive.
+    let t0 = Instant::now();
+    let mut last_redraw = Some(t0);
+
+    // Batch: AgentSpawned (requests redraw), then a throttled AgentProgress.
+    let mut received_engine_event = true; // AgentSpawned drained
+    let redraw_requested_before_event = received_engine_event;
+    received_engine_event = true; // AgentProgress drained
+    if !agent_progress_redraw_permitted(&mut last_redraw, t0 + Duration::from_millis(10)) {
+        received_engine_event = redraw_requested_before_event;
+    }
+    assert!(
+        received_engine_event,
+        "redraw owed to AgentSpawned must survive a throttled progress event"
+    );
+
+    // Same batch shape but with NO earlier redraw-worthy event: the lone
+    // throttled progress event contributes nothing.
+    let mut received_engine_event = false;
+    let redraw_requested_before_event = received_engine_event;
+    received_engine_event = true; // AgentProgress drained
+    if !agent_progress_redraw_permitted(&mut last_redraw, t0 + Duration::from_millis(20)) {
+        received_engine_event = redraw_requested_before_event;
+    }
+    assert!(
+        !received_engine_event,
+        "a lone throttled progress event must not trigger a repaint"
+    );
 }

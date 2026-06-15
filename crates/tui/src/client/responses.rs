@@ -16,79 +16,70 @@ use crate::models::{
     ContentBlock, ContentBlockStart, Delta, MessageDelta, MessageRequest, MessageResponse,
     StreamEvent, Tool, Usage,
 };
+use crate::tools::schema_sanitize;
 
 use super::{DeepSeekClient, ERROR_BODY_MAX_BYTES, bounded_error_text, system_to_instructions};
 
 /// Base URL path for the Codex Responses endpoint.
 const CODEX_RESPONSES_PATH: &str = "/codex/responses";
 
-impl DeepSeekClient {
-    /// Build the Responses API request body from a `MessageRequest`.
-    fn build_responses_body(&self, request: &MessageRequest) -> Value {
-        let model = &request.model;
-        let mut body = json!({
-            "model": model,
-            "stream": true,
-            "store": false,
-        });
+/// Build the Responses API request body from a `MessageRequest`.
+fn build_responses_body(request: &MessageRequest) -> Value {
+    let model = &request.model;
+    let mut body = json!({
+        "model": model,
+        "stream": true,
+        "store": false,
+    });
 
-        // Instructions (system prompt). The Codex Responses backend rejects
-        // requests without instructions, so fall back to a minimal system
-        // prompt when the caller did not supply one.
-        let instructions = system_to_instructions(request.system.clone())
-            .filter(|text| !text.trim().is_empty())
-            .unwrap_or_else(|| "You are a helpful assistant.".to_string());
-        body["instructions"] = json!(instructions);
+    // Instructions (system prompt). The Codex Responses backend rejects
+    // requests without instructions, so fall back to a minimal system
+    // prompt when the caller did not supply one.
+    let instructions = system_to_instructions(request.system.clone())
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| "You are a helpful assistant.".to_string());
+    body["instructions"] = json!(instructions);
 
-        // Convert messages to Responses input items.
-        let input = convert_messages_to_responses_input(request);
-        body["input"] = json!(input);
+    // Convert messages to Responses input items.
+    let input = convert_messages_to_responses_input(request);
+    body["input"] = json!(input);
 
-        // Convert tools to Responses function tools.
-        if let Some(tools) = request.tools.as_ref() {
-            let responses_tools: Vec<Value> =
-                tools.iter().map(tool_to_responses_function).collect();
-            if !responses_tools.is_empty() {
-                body["tools"] = json!(responses_tools);
-                body["tool_choice"] = json!("auto");
-                body["parallel_tool_calls"] = json!(true);
-            }
+    // Convert tools to Responses function tools.
+    if let Some(tools) = request.tools.as_ref() {
+        let responses_tools: Vec<Value> = tools.iter().map(tool_to_responses_function).collect();
+        if !responses_tools.is_empty() {
+            body["tools"] = json!(responses_tools);
+            body["tool_choice"] = json!("auto");
+            body["parallel_tool_calls"] = json!(true);
         }
-
-        // Reasoning configuration. The Codex Responses backend only accepts a
-        // fixed set of effort levels (none/minimal/low/medium/high/xhigh), so
-        // map CodeWhale's effort string onto those and omit reasoning entirely
-        // when it is disabled. CodeWhale's "auto" has no Codex equivalent and
-        // falls back to "medium".
-        if let Some(raw) = request.reasoning_effort.as_deref() {
-            let effort = match raw.trim().to_ascii_lowercase().as_str() {
-                "off" | "disabled" | "none" | "false" => None,
-                "minimal" => Some("minimal"),
-                "low" => Some("low"),
-                "high" => Some("high"),
-                "xhigh" | "max" => Some("xhigh"),
-                _ => Some("medium"),
-            };
-            if let Some(effort) = effort {
-                body["reasoning"] = json!({
-                    "effort": effort,
-                    "summary": "auto",
-                });
-            }
-        }
-
-        // Include reasoning summaries in the stream.
-        body["include"] = json!(["reasoning.encrypted_content"]);
-
-        body
     }
 
+    // Reasoning configuration. The Codex Responses backend accepts
+    // low/medium/high/xhigh, so provider-aware callers normalize inherited
+    // DeepSeek-only values before request construction: "off" becomes
+    // "low", and CodeWhale's "auto" falls back to "medium".
+    if let Some(raw) = request.reasoning_effort.as_deref()
+        && let Some(effort) = codex_responses_reasoning_effort(raw)
+    {
+        body["reasoning"] = json!({
+            "effort": effort,
+            "summary": "auto",
+        });
+    }
+
+    // Include reasoning summaries in the stream.
+    body["include"] = json!(["reasoning.encrypted_content"]);
+
+    body
+}
+
+impl DeepSeekClient {
     /// Handle a streaming Responses API request for the OpenAI Codex provider.
     pub(super) async fn handle_responses_stream(
         &self,
         request: MessageRequest,
     ) -> Result<StreamEventBox> {
-        let body = self.build_responses_body(&request);
+        let body = build_responses_body(&request);
         let url = format!("{}{}", self.base_url, CODEX_RESPONSES_PATH);
 
         // The bearer Authorization header is already installed as a default
@@ -174,7 +165,7 @@ impl DeepSeekClient {
                         continue;
                     }
 
-                    if let Some(data) = line.strip_prefix("data: ") {
+                    if let Some(data) = super::extract_sse_data_value(&line) {
                         if data == "[DONE]" {
                             done = true;
                             break;
@@ -323,13 +314,8 @@ impl DeepSeekClient {
                                         .and_then(|s| s.as_str())
                                         .unwrap_or("completed");
                                     let stop_reason = match status {
-                                        "completed" => {
-                                            if saw_tool_call {
-                                                "tool_use"
-                                            } else {
-                                                "end_turn"
-                                            }
-                                        }
+                                        "completed" if saw_tool_call => "tool_use",
+                                        "completed" => "end_turn",
                                         "incomplete" => "max_tokens",
                                         _ => "end_turn",
                                     };
@@ -342,15 +328,8 @@ impl DeepSeekClient {
                                     });
                                 }
                             }
-                            "error" => {
-                                let msg = event
-                                    .get("message")
-                                    .and_then(|m| m.as_str())
-                                    .unwrap_or("Unknown error");
-                                let code = event
-                                    .get("code")
-                                    .and_then(|c| c.as_str())
-                                    .unwrap_or("unknown");
+                            "error" | "response.failed" | "response.incomplete" => {
+                                let (code, msg) = responses_event_error_details(&event);
                                 yield Err(anyhow::anyhow!(
                                     "Responses API error [{code}]: {msg}"
                                 ));
@@ -413,9 +392,10 @@ impl DeepSeekClient {
                             text,
                             cache_control: None,
                         },
-                        ContentBlockStart::Thinking { thinking } => {
-                            ContentBlock::Thinking { thinking }
-                        }
+                        ContentBlockStart::Thinking { thinking } => ContentBlock::Thinking {
+                            thinking,
+                            signature: None,
+                        },
                         ContentBlockStart::ToolUse {
                             id,
                             name,
@@ -445,8 +425,9 @@ impl DeepSeekClient {
                             }
                         }
                         Delta::ThinkingDelta { thinking } => {
-                            if let Some(ContentBlock::Thinking { thinking: existing }) =
-                                response.content.get_mut(i)
+                            if let Some(ContentBlock::Thinking {
+                                thinking: existing, ..
+                            }) = response.content.get_mut(i)
                             {
                                 existing.push_str(&thinking);
                             }
@@ -455,6 +436,10 @@ impl DeepSeekClient {
                             if let Some(buf) = tool_args.get_mut(i) {
                                 buf.push_str(&partial_json);
                             }
+                        }
+                        Delta::SignatureDelta { .. } => {
+                            // Anthropic-native signature deltas never occur on
+                            // the Responses bridge (#3014).
                         }
                     }
                 }
@@ -508,6 +493,26 @@ fn convert_messages_to_responses_input(request: &MessageRequest) -> Vec<Value> {
                                 "image_url": image_url.url,
                             }));
                         }
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } => {
+                            if !content_items.is_empty() {
+                                items.push(json!({
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": content_items,
+                                }));
+                                content_items = Vec::new();
+                            }
+                            let (call_id, _item_id) = parse_tool_use_id(tool_use_id);
+                            items.push(json!({
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": content,
+                            }));
+                        }
                         _ => {}
                     }
                 }
@@ -543,7 +548,7 @@ fn convert_messages_to_responses_input(request: &MessageRequest) -> Vec<Value> {
                                 "arguments": serde_json::to_string(input).unwrap_or_default(),
                             }));
                         }
-                        ContentBlock::Thinking { thinking } => {
+                        ContentBlock::Thinking { thinking, .. } => {
                             items.push(json!({
                                 "type": "reasoning",
                                 "summary": [{
@@ -582,12 +587,76 @@ fn convert_messages_to_responses_input(request: &MessageRequest) -> Vec<Value> {
 
 /// Convert a CodeWhale tool definition to a Responses API function tool.
 fn tool_to_responses_function(tool: &Tool) -> Value {
+    let mut parameters = tool.input_schema.clone();
+    let constraint_note = schema_sanitize::sanitize_for_responses(&mut parameters);
+    let description = match constraint_note {
+        Some(note) if tool.description.trim().is_empty() => note,
+        Some(note) => format!("{}\n\n{}", tool.description.trim(), note),
+        None => tool.description.clone(),
+    };
     json!({
         "type": "function",
         "name": tool.name,
-        "description": tool.description,
-        "parameters": tool.input_schema,
+        "description": description,
+        "parameters": parameters,
         "strict": false,
+    })
+}
+
+fn codex_responses_reasoning_effort(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "off" | "disabled" | "none" | "false" => Some("low"),
+        "minimal" => Some("low"),
+        "low" => Some("low"),
+        "high" => Some("high"),
+        "xhigh" | "max" | "maximum" | "ultracode" => Some("xhigh"),
+        _ => Some("medium"),
+    }
+}
+
+fn responses_event_error_details(event: &Value) -> (String, String) {
+    let event_type = string_at(event, "/type").unwrap_or("error");
+    let code = first_string_at(
+        event,
+        &[
+            "/code",
+            "/error/code",
+            "/response/error/code",
+            "/response/incomplete_details/reason",
+            "/response/status",
+        ],
+    )
+    .unwrap_or("unknown");
+    let message = first_string_at(
+        event,
+        &[
+            "/message",
+            "/error/message",
+            "/response/error/message",
+            "/response/incomplete_details/reason",
+        ],
+    )
+    .map_or_else(
+        || format!("{event_type} event received"),
+        |message| {
+            if message == code && event_type == "response.incomplete" {
+                format!("response incomplete: {message}")
+            } else {
+                message.to_string()
+            }
+        },
+    );
+    (code.to_string(), message)
+}
+
+fn first_string_at<'a>(value: &'a Value, paths: &[&str]) -> Option<&'a str> {
+    paths.iter().find_map(|path| string_at(value, path))
+}
+
+fn string_at<'a>(value: &'a Value, path: &str) -> Option<&'a str> {
+    value.pointer(path).and_then(Value::as_str).and_then(|s| {
+        let trimmed = s.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
     })
 }
 
@@ -624,5 +693,244 @@ fn parse_responses_usage(val: &Value) -> Usage {
         reasoning_tokens: None,
         reasoning_replay_tokens: None,
         server_tool_use: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::models::Message;
+
+    #[test]
+    fn codex_reasoning_effort_uses_responses_labels() {
+        assert_eq!(codex_responses_reasoning_effort("max"), Some("xhigh"));
+        assert_eq!(codex_responses_reasoning_effort("maximum"), Some("xhigh"));
+        assert_eq!(codex_responses_reasoning_effort("xhigh"), Some("xhigh"));
+        assert_eq!(codex_responses_reasoning_effort("ultracode"), Some("xhigh"));
+        assert_eq!(codex_responses_reasoning_effort("high"), Some("high"));
+        assert_eq!(codex_responses_reasoning_effort("medium"), Some("medium"));
+        assert_eq!(codex_responses_reasoning_effort("minimal"), Some("low"));
+        assert_eq!(codex_responses_reasoning_effort("auto"), Some("medium"));
+        assert_eq!(codex_responses_reasoning_effort("off"), Some("low"));
+    }
+
+    #[test]
+    fn codex_responses_body_uses_responses_reasoning_not_deepseek_thinking() {
+        let request = MessageRequest {
+            model: "gpt-5.5".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "hello".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            max_tokens: 128,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: Some("max".to_string()),
+            stream: None,
+            temperature: None,
+            top_p: None,
+        };
+
+        let body = build_responses_body(&request);
+
+        assert_eq!(
+            body.pointer("/reasoning/effort").and_then(Value::as_str),
+            Some("xhigh")
+        );
+        assert_eq!(
+            body.pointer("/reasoning/summary").and_then(Value::as_str),
+            Some("auto")
+        );
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn responses_failed_event_reports_nested_error() {
+        let event = json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_123",
+                "error": {
+                    "code": "rate_limit_exceeded",
+                    "message": "Please retry later"
+                }
+            }
+        });
+
+        let (code, message) = responses_event_error_details(&event);
+
+        assert_eq!(code, "rate_limit_exceeded");
+        assert_eq!(message, "Please retry later");
+    }
+
+    #[test]
+    fn responses_incomplete_event_reports_reason() {
+        let event = json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_123",
+                "status": "incomplete",
+                "error": null,
+                "incomplete_details": {
+                    "reason": "content_filter"
+                }
+            }
+        });
+
+        let (code, message) = responses_event_error_details(&event);
+
+        assert_eq!(code, "content_filter");
+        assert_eq!(message, "response incomplete: content_filter");
+    }
+
+    #[test]
+    fn responses_input_includes_user_role_tool_results() {
+        let request = MessageRequest {
+            model: "gpt-5.5".to_string(),
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_abc|fc_123".to_string(),
+                        name: "checklist_write".to_string(),
+                        input: json!({"items": []}),
+                        caller: None,
+                    }],
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_abc|fc_123".to_string(),
+                        content: "<6 items>".to_string(),
+                        is_error: None,
+                        content_blocks: None,
+                    }],
+                },
+            ],
+            max_tokens: 128,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: None,
+            stream: None,
+            temperature: None,
+            top_p: None,
+        };
+
+        let input = convert_messages_to_responses_input(&request);
+
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "call_abc");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_abc");
+        assert_eq!(input[1]["output"], "<6 items>");
+    }
+
+    #[test]
+    fn responses_function_tool_sanitizes_root_composition_schema() {
+        let tool = Tool {
+            tool_type: None,
+            name: "apply_patch".to_string(),
+            description: "Apply patch".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "patch": {"type": "string"},
+                    "changes": {"type": "array"}
+                },
+                "oneOf": [
+                    {"required": ["patch"]},
+                    {"required": ["changes"]}
+                ]
+            }),
+            allowed_callers: None,
+            defer_loading: None,
+            input_examples: None,
+            strict: None,
+            cache_control: None,
+        };
+
+        let payload = tool_to_responses_function(&tool);
+        let parameters = &payload["parameters"];
+
+        assert_eq!(parameters["type"], "object");
+        assert!(parameters.get("oneOf").is_none());
+        assert!(parameters.get("anyOf").is_none());
+        assert!(parameters.get("allOf").is_none());
+        assert!(parameters.get("enum").is_none());
+        assert!(parameters.get("not").is_none());
+        assert!(parameters["properties"].get("patch").is_some());
+        assert!(parameters["properties"].get("changes").is_some());
+        assert_eq!(
+            payload["description"],
+            "Apply patch\n\nExactly one of these parameter groups must be provided: `changes` | `patch`."
+        );
+        assert!(tool.input_schema.get("oneOf").is_some());
+    }
+
+    #[test]
+    fn responses_function_tool_trims_description_before_constraint_note() {
+        let tool = Tool {
+            tool_type: None,
+            name: "apply_patch".to_string(),
+            description: "Apply patch\n".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "patch": {"type": "string"},
+                    "changes": {"type": "array"}
+                },
+                "oneOf": [
+                    {"required": ["patch"]},
+                    {"required": ["changes"]}
+                ]
+            }),
+            allowed_callers: None,
+            defer_loading: None,
+            input_examples: None,
+            strict: None,
+            cache_control: None,
+        };
+
+        let payload = tool_to_responses_function(&tool);
+
+        assert_eq!(
+            payload["description"],
+            "Apply patch\n\nExactly one of these parameter groups must be provided: `changes` | `patch`."
+        );
+    }
+
+    #[test]
+    fn responses_function_tool_leaves_description_unchanged_without_constraint_note() {
+        let tool = Tool {
+            tool_type: None,
+            name: "lookup".to_string(),
+            description: "Lookup".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                }
+            }),
+            allowed_callers: None,
+            defer_loading: None,
+            input_examples: None,
+            strict: None,
+            cache_control: None,
+        };
+
+        let payload = tool_to_responses_function(&tool);
+
+        assert_eq!(payload["description"], "Lookup");
     }
 }

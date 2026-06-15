@@ -20,11 +20,11 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.100"
-codewhale-config = { path = "../config", version = "0.8.57" }
-codewhale-protocol = { path = "../protocol", version = "0.8.57" }
-codewhale-release = { path = "../release", version = "0.8.57" }
-codewhale-secrets = { path = "../secrets", version = "0.8.57" }
-codewhale-tools = { path = "../tools", version = "0.8.57" }
+codewhale-config = { path = "../config", version = "0.8.60" }
+codewhale-protocol = { path = "../protocol", version = "0.8.60" }
+codewhale-release = { path = "../release", version = "0.8.60" }
+codewhale-secrets = { path = "../secrets", version = "0.8.60" }
+codewhale-tools = { path = "../tools", version = "0.8.60" }
 schemaui = { version = "0.12.0", default-features = false, optional = true }
 async-stream = "0.3.6"
 async-trait = "0.1"
@@ -55,7 +55,7 @@ unicode-width = "0.2"
 unicode-segmentation = "1.12"
 uuid = { version = "1.11", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-tempfile = "3.16"
+tempfile = "3.27"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { workspace = true }
@@ -68,7 +68,7 @@ ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 lru = "0.16"
 parking_lot = "0.12"
-pdf-extract = "0.7"
+pdf-extract = "0.10"
 tar = "0.4"
 flate2 = "1.1"
 sha2 = "0.10"

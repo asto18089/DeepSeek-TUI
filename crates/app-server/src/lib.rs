@@ -15,7 +15,8 @@ use codewhale_core::Runtime;
 use codewhale_hooks::{HookDispatcher, JsonlHookSink, StdoutHookSink, UnixSocketHookSink};
 use codewhale_mcp::McpManager;
 use codewhale_protocol::{
-    AppRequest, AppResponse, PromptRequest, PromptResponse, ThreadRequest, ThreadResponse,
+    AppRequest, AppResponse, PromptRequest, PromptResponse, ThreadGoalClearParams,
+    ThreadGoalGetParams, ThreadGoalSetParams, ThreadRequest, ThreadResponse,
 };
 use codewhale_state::StateStore;
 use codewhale_tools::{ToolCall, ToolRegistry};
@@ -241,6 +242,7 @@ async fn thread_handler(
             status: format!("error:{err}"),
             thread: None,
             threads: Vec::new(),
+            goal: None,
             model: None,
             model_provider: None,
             cwd: None,
@@ -568,6 +570,9 @@ async fn dispatch_stdio_request(
                     "thread/list",
                     "thread/read",
                     "thread/set_name",
+                    "thread/goal/set",
+                    "thread/goal/get",
+                    "thread/goal/clear",
                     "thread/archive",
                     "thread/unarchive",
                     "thread/message",
@@ -598,6 +603,9 @@ async fn dispatch_stdio_request(
                     "thread/list",
                     "thread/read",
                     "thread/set_name",
+                    "thread/goal/set",
+                    "thread/goal/get",
+                    "thread/goal/clear",
                     "thread/archive",
                     "thread/unarchive",
                     "thread/message"
@@ -681,6 +689,39 @@ async fn dispatch_stdio_request(
         }
         "thread/set_name" | "thread/set-name" => {
             let request = ThreadRequest::SetName(parse_params(params_or_object(params))?);
+            let response = handle_thread_request(state, request).await?;
+            StdioDispatchResult {
+                result: serde_json::to_value(response)
+                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
+                should_exit: false,
+            }
+        }
+        "thread/goal/set" | "thread/goal_set" | "thread/goal-set" => {
+            let request = ThreadRequest::GoalSet(parse_params::<ThreadGoalSetParams>(
+                params_or_object(params),
+            )?);
+            let response = handle_thread_request(state, request).await?;
+            StdioDispatchResult {
+                result: serde_json::to_value(response)
+                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
+                should_exit: false,
+            }
+        }
+        "thread/goal/get" | "thread/goal_get" | "thread/goal-get" => {
+            let request = ThreadRequest::GoalGet(parse_params::<ThreadGoalGetParams>(
+                params_or_object(params),
+            )?);
+            let response = handle_thread_request(state, request).await?;
+            StdioDispatchResult {
+                result: serde_json::to_value(response)
+                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
+                should_exit: false,
+            }
+        }
+        "thread/goal/clear" | "thread/goal_clear" | "thread/goal-clear" => {
+            let request = ThreadRequest::GoalClear(parse_params::<ThreadGoalClearParams>(
+                params_or_object(params),
+            )?);
             let response = handle_thread_request(state, request).await?;
             StdioDispatchResult {
                 result: serde_json::to_value(response)
@@ -1132,6 +1173,71 @@ mod tests {
         .await;
 
         assert_eq!(response.data["value"], "sk-deepseek-secret");
+    }
+
+    #[tokio::test]
+    async fn stdio_thread_goal_methods_round_trip_persisted_goal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        fs::write(&config_path, "").expect("write config");
+        let state = build_state(Some(config_path), None).expect("state");
+
+        let capabilities = dispatch_stdio_request(&state, "thread/capabilities", json!({}))
+            .await
+            .expect("thread capabilities");
+        assert!(
+            capabilities.result["methods"]
+                .as_array()
+                .expect("methods")
+                .iter()
+                .any(|method| method == "thread/goal/set")
+        );
+
+        let started = dispatch_stdio_request(&state, "thread/start", json!({}))
+            .await
+            .expect("start thread");
+        let thread_id = started.result["thread_id"]
+            .as_str()
+            .expect("thread id")
+            .to_string();
+
+        let set = dispatch_stdio_request(
+            &state,
+            "thread/goal/set",
+            json!({
+                "thread_id": thread_id,
+                "objective": "Release 0.8.59",
+                "token_budget": 59000
+            }),
+        )
+        .await
+        .expect("set goal");
+        assert_eq!(set.result["status"], "ok");
+        assert_eq!(set.result["goal"]["objective"], "Release 0.8.59");
+        assert_eq!(set.result["goal"]["status"], "active");
+
+        let got = dispatch_stdio_request(
+            &state,
+            "thread/goal/get",
+            json!({
+                "thread_id": thread_id
+            }),
+        )
+        .await
+        .expect("get goal");
+        assert_eq!(got.result["goal"]["token_budget"], 59000);
+
+        let cleared = dispatch_stdio_request(
+            &state,
+            "thread/goal/clear",
+            json!({
+                "thread_id": thread_id
+            }),
+        )
+        .await
+        .expect("clear goal");
+        assert_eq!(cleared.result["status"], "cleared");
+        assert_eq!(cleared.result["data"]["cleared"], true);
     }
 
     // ── resolve_auth_token ─────────────────────────────────────────────

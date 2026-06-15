@@ -407,6 +407,10 @@ Common event names: `thread.started`, `thread.forked`, `turn.started`,
 `item.failed`, `item.interrupted`, `approval.required`, `approval.decided`,
 `approval.timeout`, `sandbox.denied`, `coherence.state`.
 
+`approval.required` events may include a `matched_rule` string when an
+execution-policy rule caused the prompt. This field is explanatory metadata for
+clients and does not grant or persist permissions.
+
 ## Security boundary
 
 - **Localhost by default**. The server binds to `127.0.0.1` by default.
@@ -445,6 +449,73 @@ when developing a UI on Vite's default `:5173`), use any of:
 User-supplied origins **stack on top of** the built-in defaults; they do not
 replace them. Wildcard origins are not supported — the explicit allow-list
 model is preserved. Added in v0.8.10 (#561).
+
+## Runtime SDK Fleet Helpers
+
+The v0.8.60 Runtime SDK fixture lives in `npm/runtime-sdk` and is exposed as
+the `@codewhale/runtime-sdk` workspace package. It is deliberately thin: every
+helper calls the local Rust Runtime API and therefore cannot bypass CodeWhale's
+sandbox, approval prompts, provider configuration, or fleet ledger authority.
+
+```js
+import { createRuntimeClient } from "@codewhale/runtime-sdk";
+
+const client = createRuntimeClient({
+  baseUrl: "http://127.0.0.1:7878",
+  token: process.env.CODEWHALE_RUNTIME_TOKEN,
+});
+
+const { runs } = await client.listFleetRuns();
+const workers = await client.listFleetWorkers(runs[0].id);
+await client.restartWorker(workers.workers[0].worker_id);
+```
+
+Fleet helpers cover the v0.8.60 HTTP surface:
+
+| Helper | Runtime API route |
+|---|---|
+| `listFleetRuns()` | `GET /v1/fleet/runs` |
+| `getFleetRun(runId)` | `GET /v1/fleet/runs/{run_id}` |
+| `listFleetWorkers(runId)` | `GET /v1/fleet/runs/{run_id}/workers` |
+| `getFleetWorker(workerId)` | `GET /v1/fleet/workers/{worker_id}` |
+| `interruptWorker(workerId)` | `POST /v1/fleet/workers/{worker_id}/interrupt` |
+| `restartWorker(workerId)` | `POST /v1/fleet/workers/{worker_id}/restart` |
+| `stopFleetRun(runId)` | `POST /v1/fleet/runs/{run_id}/stop` |
+
+`createFleetRun(spec)` and `fleetEvents(runId)` are typed ahead of the current
+Rust routes so editor/web clients can code against the intended SDK contract.
+Until the Runtime API exposes `POST /v1/fleet/runs` and a fleet event stream,
+the SDK raises `RuntimeCapabilityError` with stable capability strings
+(`fleet_run_create`, `fleet_event_stream`) instead of surfacing those gaps as
+generic fetch failures.
+
+Verification:
+
+```bash
+npm test --workspace @codewhale/runtime-sdk
+```
+
+## Agent Run Receipts
+
+Sub-agent lanes persist compact run receipts in
+`.codewhale/state/subagents.v1.json`. The Runtime API exposes those receipts as
+a read-only inspection surface:
+
+| Operation | Endpoint |
+|---|---|
+| List persisted agent runs | `GET /v1/agent-runs` |
+| Inspect one run | `GET /v1/agent-runs/{run_id}` |
+
+The response is the same worker-record shape returned by `agent_eval`:
+`spec.run_id`, `actor_kind`, lifecycle `status`, bounded `events`,
+`follow_up`, `takeover`, `artifacts`, `usage`, and `verification`. `run_id`
+falls back to the worker id for older records, and `{run_id}` may be either the
+run id or the worker id.
+
+These endpoints do not start, cancel, or steer sub-agents. Live follow-up still
+goes through `agent_eval`; live cancellation still goes through `agent_close`.
+The API surface exists so app/editor/headless clients can inspect the same
+handoff receipts that the TUI and parent model see.
 
 ## Session lifecycle (native UI supervision)
 

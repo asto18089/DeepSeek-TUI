@@ -287,6 +287,16 @@ impl Default for ModelRegistry {
                 supports_reasoning: true,
             },
             ModelInfo {
+                id: "moonshotai/kimi-k2.7-code".to_string(),
+                provider: ProviderKind::Openrouter,
+                aliases: vec![
+                    "kimi-k2.7-code".to_string(),
+                    "openrouter-kimi-k2.7-code".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
                 id: "moonshotai/kimi-k2.6".to_string(),
                 provider: ProviderKind::Openrouter,
                 aliases: vec!["openrouter-kimi-k2.6".to_string()],
@@ -308,6 +318,37 @@ impl Default for ModelRegistry {
                 id: "z-ai/glm-5.1".to_string(),
                 provider: ProviderKind::Openrouter,
                 aliases: vec!["glm-5.1".to_string(), "zai-glm-5.1".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "z-ai/glm-5.2".to_string(),
+                provider: ProviderKind::Openrouter,
+                aliases: vec!["glm-5.2".to_string(), "zai-glm-5.2".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "GLM-5.1".to_string(),
+                provider: ProviderKind::Zai,
+                aliases: vec![
+                    "glm-5.1".to_string(),
+                    "glm-5-1".to_string(),
+                    "zai-glm-5.1".to_string(),
+                    "zai-glm-5-1".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "GLM-5.2".to_string(),
+                provider: ProviderKind::Zai,
+                aliases: vec![
+                    "glm-5.2".to_string(),
+                    "glm-5-2".to_string(),
+                    "zai-glm-5.2".to_string(),
+                    "zai-glm-5-2".to_string(),
+                ],
                 supports_tools: true,
                 supports_reasoning: true,
             },
@@ -486,13 +527,22 @@ impl Default for ModelRegistry {
                 supports_reasoning: false,
             },
             ModelInfo {
-                id: "kimi-k2.6".to_string(),
+                id: "kimi-k2.7-code".to_string(),
                 provider: ProviderKind::Moonshot,
                 aliases: vec![
                     "kimi".to_string(),
                     "kimi-k2".to_string(),
-                    "moonshot-kimi-k2.6".to_string(),
+                    "kimi-k2.7".to_string(),
+                    "kimi-code".to_string(),
+                    "moonshot-kimi-k2.7-code".to_string(),
                 ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "kimi-k2.6".to_string(),
+                provider: ProviderKind::Moonshot,
+                aliases: vec!["kimi-k2.6".to_string(), "moonshot-kimi-k2.6".to_string()],
                 supports_tools: true,
                 supports_reasoning: true,
             },
@@ -607,6 +657,28 @@ impl Default for ModelRegistry {
                 supports_tools: true,
                 supports_reasoning: true,
             },
+            // Anthropic native Messages API models (#3014)
+            ModelInfo {
+                id: "claude-opus-4-8".to_string(),
+                provider: ProviderKind::Anthropic,
+                aliases: vec!["opus".to_string(), "claude-opus".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "claude-sonnet-4-6".to_string(),
+                provider: ProviderKind::Anthropic,
+                aliases: vec!["sonnet".to_string(), "claude-sonnet".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "claude-haiku-4-5".to_string(),
+                provider: ProviderKind::Anthropic,
+                aliases: vec!["haiku".to_string(), "claude-haiku".to_string()],
+                supports_tools: true,
+                supports_reasoning: false,
+            },
             // MiniMax 2.7 (OpenRouter)
             ModelInfo {
                 id: "minimax/minimax-2.7".to_string(),
@@ -619,13 +691,113 @@ impl Default for ModelRegistry {
                 supports_tools: true,
                 supports_reasoning: true,
             },
+            ModelInfo {
+                id: "step-3.7-flash".to_string(),
+                provider: ProviderKind::Stepfun,
+                aliases: vec!["stepfun".to_string(), "stepflash".to_string()],
+                supports_tools: true,
+                supports_reasoning: false,
+            },
+            ModelInfo {
+                id: "MiniMax-M3".to_string(),
+                provider: ProviderKind::Minimax,
+                aliases: vec![
+                    "minimax".to_string(),
+                    "minimax-m3".to_string(),
+                    "minimax-m-3".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "MiniMax-M2.7".to_string(),
+                provider: ProviderKind::Minimax,
+                aliases: vec![
+                    "minimax-m2.7".to_string(),
+                    "minimax-m2-7".to_string(),
+                    "minimax-m-2.7".to_string(),
+                    "minimax-m-2-7".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "MiniMax-M2.7-highspeed".to_string(),
+                provider: ProviderKind::Minimax,
+                aliases: vec![
+                    "minimax-m2.7-highspeed".to_string(),
+                    "minimax-m2-7-highspeed".to_string(),
+                    "minimax-m-2.7-highspeed".to_string(),
+                    "minimax-m-2-7-highspeed".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "MiniMax-M2.5".to_string(),
+                provider: ProviderKind::Minimax,
+                aliases: vec![
+                    "minimax-m2.5".to_string(),
+                    "minimax-m2-5".to_string(),
+                    "minimax-m-2.5".to_string(),
+                    "minimax-m-2-5".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "MiniMax-M2.5-highspeed".to_string(),
+                provider: ProviderKind::Minimax,
+                aliases: vec![
+                    "minimax-m2.5-highspeed".to_string(),
+                    "minimax-m2-5-highspeed".to_string(),
+                    "minimax-m-2.5-highspeed".to_string(),
+                    "minimax-m-2-5-highspeed".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "MiniMax-M2.1".to_string(),
+                provider: ProviderKind::Minimax,
+                aliases: vec![
+                    "minimax-m2.1".to_string(),
+                    "minimax-m2-1".to_string(),
+                    "minimax-m-2.1".to_string(),
+                    "minimax-m-2-1".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "MiniMax-M2.1-highspeed".to_string(),
+                provider: ProviderKind::Minimax,
+                aliases: vec![
+                    "minimax-m2.1-highspeed".to_string(),
+                    "minimax-m2-1-highspeed".to_string(),
+                    "minimax-m-2.1-highspeed".to_string(),
+                    "minimax-m-2-1-highspeed".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "MiniMax-M2".to_string(),
+                provider: ProviderKind::Minimax,
+                aliases: vec!["minimax-m2".to_string(), "minimax-m-2".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
             // NVIDIA Nemotron 3 Ultra (OpenRouter)
             ModelInfo {
-                id: "nvidia/nemotron-3-ultra".to_string(),
+                id: "nvidia/nemotron-3-ultra-550b-a55b".to_string(),
                 provider: ProviderKind::Openrouter,
                 aliases: vec![
+                    "nvidia/nemotron-3-ultra".to_string(),
                     "nemotron-3-ultra".to_string(),
+                    "nemotron-3-ultra-550b-a55b".to_string(),
                     "nvidia-nemotron-3-ultra".to_string(),
+                    "nvidia-nemotron-3-ultra-550b-a55b".to_string(),
                 ],
                 supports_tools: true,
                 supports_reasoning: true,
@@ -1016,6 +1188,30 @@ mod tests {
     }
 
     #[test]
+    fn moonshot_default_and_aliases_use_kimi_k27_code() {
+        let registry = ModelRegistry::default();
+
+        for requested in [None, Some("kimi"), Some("kimi-k2.7-code")] {
+            let resolved = registry.resolve(requested, Some(ProviderKind::Moonshot));
+
+            assert_eq!(resolved.resolved.provider, ProviderKind::Moonshot);
+            assert_eq!(resolved.resolved.id, "kimi-k2.7-code");
+            assert!(resolved.resolved.supports_tools);
+            assert!(resolved.resolved.supports_reasoning);
+        }
+    }
+
+    #[test]
+    fn moonshot_explicit_kimi_k26_remains_available() {
+        let registry = ModelRegistry::default();
+        let resolved = registry.resolve(Some("kimi-k2.6"), Some(ProviderKind::Moonshot));
+
+        assert_eq!(resolved.resolved.provider, ProviderKind::Moonshot);
+        assert_eq!(resolved.resolved.id, "kimi-k2.6");
+        assert!(resolved.resolved.supports_reasoning);
+    }
+
+    #[test]
     fn xiaomi_mimo_tts_aliases_resolve_when_provider_hinted() {
         let registry = ModelRegistry::default();
         let resolved = registry.resolve(Some("tts"), Some(ProviderKind::XiaomiMimo));
@@ -1175,6 +1371,76 @@ mod tests {
     }
 
     #[test]
+    fn zai_direct_models_resolve_when_provider_hinted() {
+        let registry = ModelRegistry::default();
+
+        let default = registry.resolve(None, Some(ProviderKind::Zai));
+        assert_eq!(default.resolved.provider, ProviderKind::Zai);
+        assert_eq!(default.resolved.id, "GLM-5.1");
+
+        for (alias, expected) in [
+            ("GLM-5.1", "GLM-5.1"),
+            ("glm-5-1", "GLM-5.1"),
+            ("GLM-5.2", "GLM-5.2"),
+            ("glm-5.2", "GLM-5.2"),
+            ("zai-glm-5-2", "GLM-5.2"),
+        ] {
+            let resolved = registry.resolve(Some(alias), Some(ProviderKind::Zai));
+
+            assert_eq!(resolved.resolved.provider, ProviderKind::Zai);
+            assert_eq!(resolved.resolved.id, expected);
+            assert!(!resolved.used_fallback);
+            assert!(resolved.resolved.supports_tools);
+            assert!(resolved.resolved.supports_reasoning);
+        }
+    }
+
+    #[test]
+    fn first_party_recent_provider_models_are_listed() {
+        let registry = ModelRegistry::default();
+        let models = registry.list();
+
+        for (provider, id) in [
+            (ProviderKind::Zai, "GLM-5.2"),
+            (ProviderKind::Stepfun, "step-3.7-flash"),
+            (ProviderKind::Minimax, "MiniMax-M2.1"),
+        ] {
+            assert!(
+                models
+                    .iter()
+                    .any(|model| model.provider == provider && model.id == id),
+                "expected {provider:?} model {id} in registry"
+            );
+        }
+    }
+
+    #[test]
+    fn stepfun_and_minimax_direct_models_resolve_when_provider_hinted() {
+        let registry = ModelRegistry::default();
+
+        let stepfun = registry.resolve(None, Some(ProviderKind::Stepfun));
+        assert_eq!(stepfun.resolved.provider, ProviderKind::Stepfun);
+        assert_eq!(stepfun.resolved.id, "step-3.7-flash");
+
+        for (alias, expected) in [
+            ("minimax", "MiniMax-M3"),
+            ("minimax-m3", "MiniMax-M3"),
+            ("minimax-m2.7", "MiniMax-M2.7"),
+            ("minimax-m2-7-highspeed", "MiniMax-M2.7-highspeed"),
+            ("minimax-m2.1", "MiniMax-M2.1"),
+            ("minimax-m2", "MiniMax-M2"),
+        ] {
+            let resolved = registry.resolve(Some(alias), Some(ProviderKind::Minimax));
+
+            assert_eq!(resolved.resolved.provider, ProviderKind::Minimax);
+            assert_eq!(resolved.resolved.id, expected);
+            assert!(!resolved.used_fallback);
+            assert!(resolved.resolved.supports_tools);
+            assert!(resolved.resolved.supports_reasoning);
+        }
+    }
+
+    #[test]
     fn deepseek_v4_flash_alias_resolves_to_openrouter_when_provider_hinted() {
         let registry = ModelRegistry::default();
         let resolved = registry.resolve(Some("deepseek-v4-flash"), Some(ProviderKind::Openrouter));
@@ -1195,9 +1461,17 @@ mod tests {
             ("qwen3.6-plus", "qwen/qwen3.6-plus"),
             ("gemma-4-31b-it", "google/gemma-4-31b-it"),
             ("glm-5.1", "z-ai/glm-5.1"),
+            ("glm-5.2", "z-ai/glm-5.2"),
             ("minimax-m3", "minimax/minimax-m3"),
+            ("minimax-2.7", "minimax/minimax-2.7"),
             ("openrouter-mimo-v2.5-pro", "xiaomi/mimo-v2.5-pro"),
+            ("openrouter-kimi-k2.7-code", "moonshotai/kimi-k2.7-code"),
             ("openrouter-kimi-k2.6", "moonshotai/kimi-k2.6"),
+            ("nemotron-3-ultra", "nvidia/nemotron-3-ultra-550b-a55b"),
+            (
+                "nvidia/nemotron-3-ultra",
+                "nvidia/nemotron-3-ultra-550b-a55b",
+            ),
         ] {
             let resolved = registry.resolve(Some(alias), Some(ProviderKind::Openrouter));
 

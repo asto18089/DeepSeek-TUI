@@ -5,6 +5,7 @@ import { getFacts } from "@/lib/facts";
 import { Ticker } from "@/components/ticker";
 import { StatGrid } from "@/components/stat-grid";
 import { Seal } from "@/components/seal";
+import { ThinkingTrace } from "@/components/thinking-trace";
 import { MermaidDiagram } from "@/components/mermaid-diagram";
 import type { CuratedDispatch, FeedItem, RepoStats } from "@/lib/types";
 
@@ -20,6 +21,7 @@ const FALLBACK_STATS: RepoStats = {
 };
 
 const RELEASE_CONTRIBUTORS = [
+  "@1Git2Clone",
   "@cy2311",
   "@LING71671",
   "@axobase001",
@@ -79,6 +81,92 @@ const RELEASE_HELPERS = [
   "@nbiish",
 ];
 
+const RELEASE_FEATURES = [
+  {
+    area: "Fleet runs",
+    title: "Agent Fleet real-run cutover",
+    zhTitle: "Agent Fleet 真实执行切换",
+    tag: "#3154 / #3096",
+    blurb:
+      "fleet run now launches durable workers through the headless exec stream instead of the old local simulator, with lease-freeing events so queued work can keep moving.",
+    zhBlurb:
+      "fleet run 现在通过 headless exec 流启动持久 worker，不再走本地模拟器；终端 worker 事件会释放租约，让排队任务继续推进。",
+    prompt:
+      "Tell us whether the fleet task started, which worker/lease state looked wrong, and paste the fleet run output or event stream if you can.",
+  },
+  {
+    area: "Read-only shell parallelism",
+    title: "Read-only shell parallelism",
+    zhTitle: "只读 Shell 并行执行",
+    tag: "#2983",
+    blurb:
+      "conservative read-only shell calls can run in parallel, while writes, stdin, pipes, redirects, command substitution, TTY work, and follow-mode tails stay serial.",
+    zhBlurb:
+      "保守的只读 shell 调用可以并行执行；写入、stdin、管道、重定向、命令替换、TTY 和 follow-mode tail 仍保持串行。",
+    prompt:
+      "Tell us the exact command, whether it should have been parallel or serial, and whether CodeWhale asked for approval at the right time.",
+  },
+  {
+    area: "WhaleFlow JS/TS authoring",
+    title: "Declarative JS/TS WhaleFlow authoring",
+    zhTitle: "声明式 JS/TS WhaleFlow 编写",
+    tag: "#3097",
+    blurb:
+      "workflow({...}) authoring now compiles JavaScript or TypeScript into the existing WorkflowSpec validator without executing user JavaScript.",
+    zhBlurb:
+      "workflow({...}) 写法现在可以把 JavaScript 或 TypeScript 编译到现有 WorkflowSpec 校验器，不执行用户 JavaScript。",
+    prompt:
+      "Paste the workflow({...}) snippet, the validation error, and what you expected the compiled WorkflowSpec to contain.",
+  },
+  {
+    area: "Terminal interaction polish",
+    title: "TUI/provider polish",
+    zhTitle: "TUI 与 provider 细节修复",
+    tag: "#3196 / #2743",
+    blurb:
+      "slash-menu Ctrl+P/Ctrl+N navigation, nonblocking sub-agent eval, Z.ai GLM thinking traces, and Claude-style skill archive handling are smoother.",
+    zhBlurb:
+      "slash 菜单 Ctrl+P/Ctrl+N、非阻塞 sub-agent eval、Z.ai GLM thinking trace，以及 Claude 风格 skill 压缩包处理都更顺。",
+    prompt:
+      "Tell us which interaction failed, your terminal/provider/model, and the shortest reproduction you have.",
+  },
+];
+
+const LATEST_RELEASE_CREDITS = [
+  {
+    handle: "@1Git2Clone",
+    note: "slash-menu Ctrl+P/Ctrl+N navigation",
+    zhNote: "slash 菜单 Ctrl+P/Ctrl+N 导航",
+  },
+  {
+    handle: "@AiurArtanis",
+    note: "Claude-style skill archive compatibility request",
+    zhNote: "Claude 风格 skill 压缩包兼容性请求",
+  },
+];
+
+function releaseIssueHref(area: string, prompt: string): string {
+  const body = [
+    `## Area`,
+    area,
+    ``,
+    `## What happened?`,
+    ``,
+    `## What did you expect?`,
+    ``,
+    `## Useful detail`,
+    prompt,
+    ``,
+    `## Version`,
+    `0.8.60`,
+  ].join("\n");
+  const params = new URLSearchParams({
+    title: `[0.8.60] ${area}: `,
+    body,
+  });
+  return `https://github.com/Hmbown/CodeWhale/issues/new?${params.toString()}`;
+}
+
 const FALLBACK_DISPATCH_EN: CuratedDispatch = {
   generatedAt: new Date().toISOString(),
   headline: "Quiet release week — install paths and contributor guides up to date.",
@@ -132,6 +220,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
   }
 
   const highlights = isZh && dispatch.highlightsZh ? dispatch.highlightsZh : dispatch.highlights;
+  const releaseVersion = facts.version ?? "0.8.60";
 
   return (
     <>
@@ -142,33 +231,33 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
         <div className="mx-auto max-w-[1400px] px-4 sm:px-6 pt-10 sm:pt-14 pb-12 grid lg:grid-cols-12 gap-10">
           <div className="lg:col-span-7">
             <div className="mb-6">
-              <span className="pill pill-hot">DeepSeek V4 · 1M context</span>
+              <span className="pill pill-hot">{isZh ? "开源 · 多模型 · 本地优先" : "Open source · multi-model · local-first"}</span>
             </div>
 
             <h1 className="font-display tracking-crisp">
               {isZh
-                ? "先有自我，再有法律，永远留下证据。"
-                : "Ego first. Law next. Evidence always."}
+                ? "面向最佳可用模型的终端智能体。"
+                : "An agentic terminal for the best available models."}
             </h1>
 
             <p className="mt-6 text-lg text-ink-soft leading-relaxed max-w-2xl">
               <span className="font-cjk text-indigo font-semibold">CodeWhale</span>
               {isZh
-                ? " 是 DeepSeek V4 和开放模型的本地运行层。它给 Agent 一个可追责的自我、一套处理冲突的 law，以及把工具、审批、回滚、子 Agent 和交接都留在明面上的证据循环。"
-                : " is a local operating layer for DeepSeek V4 and open-model coding work. It gives an agent an accountable self, a conflict law for the workspace, and an evidence loop where tools, approvals, rollback, sub-agents, and handoffs stay visible."}
+                ? " 是社区共建的终端智能体，本地运行，支持你真正在用的模型——GLM、DeepSeek、Kimi、MiniMax、OpenRouter 等等。完整的工具面、审批闸门、快照回滚、子智能体与可恢复会话，都在你的终端里。"
+                : " is a community-built terminal agent that runs locally and works with the models you actually use — GLM, DeepSeek, Kimi, MiniMax, OpenRouter, and more. A full tool surface, approval gates, snapshots you can roll back, sub-agents, and sessions you can resume."}
             </p>
 
-            {/* MISSION CALLOUT */}
+            {/* COMMUNITY CALLOUT */}
             <div className="mt-6 px-4 py-3 bg-indigo-pale border-l-4 border-indigo text-sm leading-relaxed max-w-2xl">
               {isZh ? (
                 <>
-                  <span className="font-display text-indigo font-semibold mr-1">设计骨架</span>
-                  ego 是责任落点：这个用户、这个仓库、这个会话。constitution 是冲突法：当上下文吵起来时，谁赢。
+                  <span className="font-display text-indigo font-semibold mr-1">社区共建</span>
+                  在公开环境中打造，目标是把最好的智能体工具带给最多的人。无论你经验如何，议题和 PR 都欢迎。
                 </>
               ) : (
                 <>
-                  <span className="font-display text-indigo font-semibold mr-1">Design thesis</span>
-                  Ego is where responsibility attaches: this user, this repo, this session. Constitution is conflict law for a noisy workspace.
+                  <span className="font-display text-indigo font-semibold mr-1">Built in the open</span>
+                  Community-shaped to bring the best agent harness to the most people. Issues and pull requests are welcome at any experience level.
                 </>
               )}
             </div>
@@ -240,8 +329,100 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
 
       <StatGrid stats={stats} />
 
+      {/* LATEST RELEASE */}
+      <section id="latest" className="mx-auto max-w-[1400px] px-6 py-14">
+        <div className="grid lg:grid-cols-12 gap-10 items-start">
+          <div className="lg:col-span-4">
+            <div className="flex items-baseline gap-4 mb-5">
+              <Seal char="新" />
+              <div className="eyebrow">
+                {isZh ? `最新版本 · v${releaseVersion}` : `New in v${releaseVersion}`}
+              </div>
+            </div>
+            <h2 className="font-display text-3xl leading-tight">
+              {isZh ? "更可靠的长任务执行，更清楚的反馈入口。" : "Durable long-running work, clearer feedback paths."}
+            </h2>
+            <p className={`mt-5 text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
+              {isZh
+                ? "0.8.60 的主线是让 CodeWhale 更像一个可继承的维护者工具：fleet worker 真正运行，只读证据可以并行收集，workflow 可以用 JS/TS 声明式编写，终端交互和 provider trace 更稳定。"
+                : "0.8.60 is about making CodeWhale easier to hand off and verify: fleet workers actually run, read-only evidence can be gathered in parallel, workflows can be authored in JS/TS, and terminal/provider edges are less sticky."}
+            </p>
+            <div className="mt-6 flex flex-wrap gap-3">
+              <Link href="https://github.com/Hmbown/CodeWhale/blob/main/CHANGELOG.md#0860---2026-06-13" className="px-4 py-2 bg-ink text-paper font-mono text-sm uppercase tracking-wider hover:bg-indigo transition-colors">
+                {isZh ? "完整 changelog →" : "Full changelog →"}
+              </Link>
+              <Link href="#release-credits" className="px-4 py-2 font-mono text-sm uppercase tracking-wider text-ink-mute hover:text-indigo transition-colors">
+                {isZh ? "贡献者 →" : "Credits →"}
+              </Link>
+            </div>
+            <div className="mt-6 hairline-t pt-4">
+              <div className="eyebrow mb-3">{isZh ? "0.8.60 直接致谢" : "Direct 0.8.60 credits"}</div>
+              <div className="space-y-2">
+                {LATEST_RELEASE_CREDITS.map((credit) => (
+                  <Link
+                    key={credit.handle}
+                    href={`https://github.com/${credit.handle.slice(1)}`}
+                    className="block text-sm text-ink-soft hover:text-indigo"
+                  >
+                    <span className="font-mono text-xs text-indigo">{credit.handle}</span>
+                    <span className={isZh ? "ml-2 leading-[1.8]" : "ml-2"}>{isZh ? credit.zhNote : credit.note}</span>
+                  </Link>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="lg:col-span-8 hairline-t hairline-b hairline-l hairline-r bg-paper">
+            <div className="grid md:grid-cols-2 gap-0 col-rule">
+              {RELEASE_FEATURES.map((feature) => (
+                <div key={feature.area} className="p-5">
+                  <div className="flex items-baseline justify-between gap-4 mb-3">
+                    <div className="eyebrow text-indigo">{feature.tag}</div>
+                    <Link
+                      href={releaseIssueHref(feature.area, feature.prompt)}
+                      className="font-mono text-[0.68rem] uppercase tracking-widest text-ink-mute hover:text-indigo"
+                    >
+                      {isZh ? "报告问题 →" : "Report →"}
+                    </Link>
+                  </div>
+                  <h3 className="font-display text-xl mb-2">
+                    {isZh ? feature.zhTitle : feature.title}
+                  </h3>
+                  <p className={`text-sm text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
+                    {isZh ? feature.zhBlurb : feature.blurb}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </section>
+ 
+      {/* SEE HOW IT DECIDES — real reasoning traces prove the constitution operates */}
+      <section className="bg-paper-deep hairline-t hairline-b">
+        <div className="mx-auto max-w-[1400px] px-6 py-20">
+        <div className="flex items-baseline gap-4 mb-3 hairline-b pb-4">
+          <Seal char="判" />
+          <h2 className="font-display">
+            {isZh ? "看它如何决策" : "See how it decides"}
+          </h2>
+        </div>
+        <p className={`mb-8 text-ink-soft max-w-2xl ${isZh ? "leading-[1.9] tracking-wide" : "text-sm leading-relaxed"}`}>
+          {isZh
+            ? "别的 Agent 声称自己「对齐」「可信」。CodeWhale 能证明——因为宪法会在模型的推理中现身：它决策时会援引「第 II 条」「第 V 条」。下面是真实会话中的推理摘录，以及它们所促成的决定。"
+            : "Every agent claims to be aligned and trustworthy. CodeWhale can prove it — the Constitution shows up in the model's reasoning, citing \"Article II\" and \"Article V\" as it decides. These are real traces from an actual session, paired with the decision each produced."}
+        </p>
+        <ThinkingTrace locale={locale} />
+        <div className="mt-6 text-[0.72rem] font-mono uppercase tracking-wider text-ink-mute">
+          {isZh
+            ? "这些是真实推理的忠实摘录，非杜撰。宪法不是墙上的口号，而是模型决策时真正遵循的顺序。"
+            : "Faithful excerpts from real reasoning — not invented. The constitution isn't a poster on the wall; it's the order the model actually follows when it decides."}
+        </div>
+        </div>
+      </section>
+
       {/* WHAT IT IS — the core ideas behind the harness */}
-      <section className="mx-auto max-w-[1400px] px-6 py-16">
+      <section className="mx-auto max-w-[1400px] px-6 py-12">
         <div className="flex items-baseline gap-4 mb-2 hairline-b pb-4">
           <Seal char="是" />
           <h2 className="font-display">
@@ -264,7 +445,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                   Agent 不是模型卡片，也不是排行榜数字。它是这个终端、这个工作区、这个会话里的实例。先有地址，责任才有落点。
                 </p>
               </div>
-              <div className="p-6">
+              <div className="p-6 bg-paper-deep">
                 <div className="eyebrow mb-3">02 · 嵌套宪法</div>
                 <h3 className="font-display text-xl mb-3">冲突时有法律</h3>
                 <p className="text-sm text-ink-soft leading-[1.9]">
@@ -288,7 +469,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                   The agent is not a model card or leaderboard score. It is an instance in this terminal, this workspace, this session. Give it an address before you ask it to act.
                 </p>
               </div>
-              <div className="p-6">
+              <div className="p-6 bg-paper-deep">
                 <div className="eyebrow mb-3">02 · nested constitution</div>
                 <h3 className="font-display text-xl mb-3">Conflict has law</h3>
                 <p className="text-sm text-ink-soft leading-relaxed">
@@ -320,7 +501,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
 
       {/* MAINTAINER LOOP */}
       <section className="bg-paper-deep hairline-t hairline-b">
-        <div className="mx-auto max-w-[1400px] px-6 py-16">
+        <div className="mx-auto max-w-[1400px] px-6 py-14">
           <div className="grid lg:grid-cols-12 gap-10 items-start">
             <div className="lg:col-span-5">
               <div className="flex items-baseline gap-4 mb-4">
@@ -376,7 +557,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                     ]
                 ).map((item) => (
                   <div key={item.n} className="p-5">
-                    <div className="font-mono text-[0.7rem] text-indigo uppercase tracking-widest mb-2">{item.n}</div>
+                    <div className={`font-mono uppercase tracking-widest mb-2 ${item.n === "01" ? "text-[0.6rem] text-indigo/60" : item.n === "04" ? "text-[0.82rem] text-indigo font-semibold" : "text-[0.7rem] text-indigo"}`}>{item.n}</div>
                     <h3 className="font-display text-lg mb-2">{item.t}</h3>
                     <p className={`text-sm text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
                       {item.d}
@@ -390,7 +571,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
       </section>
 
       {/* HOW IT WORKS */}
-      <section className="mx-auto max-w-[1400px] px-6 py-16">
+      <section className="mx-auto max-w-[1400px] px-6 py-12">
         <div className="flex items-baseline gap-4 mb-8 hairline-b pb-4">
           <Seal char="作" />
           <h2 className="font-display">
@@ -478,11 +659,11 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
       </section>
 
       {/* RELEASE CREDITS */}
-      <section className="mx-auto max-w-[1400px] px-6 py-14">
+      <section id="release-credits" className="mx-auto max-w-[1400px] px-6 py-14">
         <div className="flex items-baseline gap-4 mb-5 hairline-b pb-4">
           <Seal char="谢" />
           <div>
-            <div className="eyebrow mb-2">{isZh ? "v0.8.56 致谢" : "v0.8.56 credits"}</div>
+            <div className="eyebrow mb-2">{isZh ? `v${facts.version} 致谢` : `v${facts.version} credits`}</div>
             <h2 className="font-display text-3xl">
               {isZh ? "每个补丁和报告都算数" : "Every patch and report counts"}
             </h2>
@@ -495,7 +676,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                 ? "这一版合并和吸收了来自社区的大量工作。完整条目在 CHANGELOG 中；这里保留最新发布的公开致谢入口。"
                 : "This release merged and harvested a large community tranche. The full notes live in the changelog; this keeps the latest public credit surface easy to find."}
             </p>
-            <Link href="https://github.com/Hmbown/CodeWhale/blob/main/CHANGELOG.md#0856---2026-06-09" className="inline-block mt-4 font-mono text-xs uppercase tracking-wider text-indigo hover:underline">
+            <Link href="https://github.com/Hmbown/CodeWhale/blob/main/CHANGELOG.md#0860---2026-06-13" className="inline-block mt-4 font-mono text-xs uppercase tracking-wider text-indigo hover:underline">
               {isZh ? "查看完整 changelog →" : "Full changelog →"}
             </Link>
           </div>
@@ -534,7 +715,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
 
       {/* JOIN IN */}
       <section className="bg-ink text-paper">
-        <div className="mx-auto max-w-[1400px] px-6 py-16 grid lg:grid-cols-12 gap-10 items-center">
+        <div className="mx-auto max-w-[1400px] px-6 py-20 grid lg:grid-cols-12 gap-10 items-center">
           <div className="lg:col-span-8">
             <div className="eyebrow text-paper-deep/70 mb-3">{isZh ? "加入" : "Join in"}</div>
             <h2 className="font-display text-paper text-4xl leading-tight">

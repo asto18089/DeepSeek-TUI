@@ -127,7 +127,11 @@ impl DefaultKeyringStore {
         #[cfg(any(
             target_os = "macos",
             target_os = "windows",
-            all(target_os = "linux", not(target_env = "ohos"))
+            all(
+                target_os = "linux",
+                not(target_env = "ohos"),
+                not(target_env = "musl")
+            )
         ))]
         {
             // `Entry::new` is enough to validate the native macOS/Windows
@@ -156,7 +160,11 @@ impl DefaultKeyringStore {
         #[cfg(not(any(
             target_os = "macos",
             target_os = "windows",
-            all(target_os = "linux", not(target_env = "ohos"))
+            all(
+                target_os = "linux",
+                not(target_env = "ohos"),
+                not(target_env = "musl")
+            )
         )))]
         {
             let _ = &self.service;
@@ -170,7 +178,11 @@ impl KeyringStore for DefaultKeyringStore {
         #[cfg(any(
             target_os = "macos",
             target_os = "windows",
-            all(target_os = "linux", not(target_env = "ohos"))
+            all(
+                target_os = "linux",
+                not(target_env = "ohos"),
+                not(target_env = "musl")
+            )
         ))]
         {
             let entry = keyring::Entry::new(&self.service, key)
@@ -184,7 +196,11 @@ impl KeyringStore for DefaultKeyringStore {
         #[cfg(not(any(
             target_os = "macos",
             target_os = "windows",
-            all(target_os = "linux", not(target_env = "ohos"))
+            all(
+                target_os = "linux",
+                not(target_env = "ohos"),
+                not(target_env = "musl")
+            )
         )))]
         {
             let _ = key;
@@ -196,7 +212,11 @@ impl KeyringStore for DefaultKeyringStore {
         #[cfg(any(
             target_os = "macos",
             target_os = "windows",
-            all(target_os = "linux", not(target_env = "ohos"))
+            all(
+                target_os = "linux",
+                not(target_env = "ohos"),
+                not(target_env = "musl")
+            )
         ))]
         {
             let entry = keyring::Entry::new(&self.service, key)
@@ -208,7 +228,11 @@ impl KeyringStore for DefaultKeyringStore {
         #[cfg(not(any(
             target_os = "macos",
             target_os = "windows",
-            all(target_os = "linux", not(target_env = "ohos"))
+            all(
+                target_os = "linux",
+                not(target_env = "ohos"),
+                not(target_env = "musl")
+            )
         )))]
         {
             let _ = (key, value);
@@ -220,7 +244,11 @@ impl KeyringStore for DefaultKeyringStore {
         #[cfg(any(
             target_os = "macos",
             target_os = "windows",
-            all(target_os = "linux", not(target_env = "ohos"))
+            all(
+                target_os = "linux",
+                not(target_env = "ohos"),
+                not(target_env = "musl")
+            )
         ))]
         {
             let entry = keyring::Entry::new(&self.service, key)
@@ -233,7 +261,11 @@ impl KeyringStore for DefaultKeyringStore {
         #[cfg(not(any(
             target_os = "macos",
             target_os = "windows",
-            all(target_os = "linux", not(target_env = "ohos"))
+            all(
+                target_os = "linux",
+                not(target_env = "ohos"),
+                not(target_env = "musl")
+            )
         )))]
         {
             let _ = key;
@@ -249,7 +281,11 @@ impl KeyringStore for DefaultKeyringStore {
 #[cfg(not(any(
     target_os = "macos",
     target_os = "windows",
-    all(target_os = "linux", not(target_env = "ohos"))
+    all(
+        target_os = "linux",
+        not(target_env = "ohos"),
+        not(target_env = "musl")
+    )
 )))]
 fn unsupported_keyring_message() -> String {
     "system keyring backend is unsupported on this platform".to_string()
@@ -701,6 +737,44 @@ impl Secrets {
     pub fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
         self.store.get(name)
     }
+
+    /// Resolve a secret by key name with an optional source constraint.
+    ///
+    /// This is the fleet-worker secret resolution path. Unlike
+    /// [`resolve`](Secrets::resolve), this does NOT map provider names
+    /// to their canonical env vars — the caller controls the exact key
+    /// and resolution order.
+    ///
+    /// `source_hint` controls the resolution order:
+    /// - `Some("env")` — only check environment variables
+    /// - `Some("keyring")` — only check the keyring/file store
+    /// - `None` — try the store first, then fall back to environment
+    #[must_use]
+    pub fn resolve_direct(&self, key: &str, source_hint: Option<&str>) -> Option<String> {
+        match source_hint {
+            Some("env") => {
+                // Only check process environment — skip the store entirely.
+                std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+            }
+            Some("keyring") | Some("file") => {
+                // Only check the store backend.
+                self.store
+                    .get(key)
+                    .ok()
+                    .flatten()
+                    .filter(|v| !v.trim().is_empty())
+            }
+            Some(_) | None => {
+                // Default: store first, then env fallback.
+                if let Ok(Some(v)) = self.store.get(key)
+                    && !v.trim().is_empty()
+                {
+                    return Some(v);
+                }
+                std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+            }
+        }
+    }
 }
 
 /// Map a canonical provider name to its environment variable(s), returning
@@ -754,6 +828,7 @@ pub fn env_for(name: &str) -> Option<String> {
         "vllm" | "v-llm" => &["VLLM_API_KEY"],
         "ollama" | "ollama-local" => &["OLLAMA_API_KEY"],
         "openai" => &["OPENAI_API_KEY"],
+        "anthropic" | "claude" => &["ANTHROPIC_API_KEY"],
         "atlascloud" | "atlas-cloud" | "atlas_cloud" | "atlas" => &["ATLASCLOUD_API_KEY"],
         "volcengine" | "volcengine-ark" | "volcengine_ark" | "ark" | "volc-ark"
         | "volcengineark" => &[

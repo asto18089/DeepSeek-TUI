@@ -17,6 +17,7 @@ pub mod composer_stash;
 pub mod config;
 pub mod config_persistence; // [pinvou3-fork C1] v0.8.57 上游新增,facade 同步
 pub mod config_ui;
+pub mod context_report; // [pinvou3-fork C1] v0.8.60 上游新增(context 用量报告),facade 同步
 pub mod core;
 pub mod cost_status;
 pub mod deepseek_theme;
@@ -25,6 +26,7 @@ pub mod error_taxonomy;
 pub mod eval;
 pub mod execpolicy;
 pub mod features;
+pub mod fleet; // [pinvou3-fork C1] v0.8.60 上游新增(Agent Fleet 工作者运行时),facade 同步
 pub mod handoff;
 pub mod hooks;
 pub mod llm_client;
@@ -35,6 +37,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod mcp_server;
 pub mod memory;
+pub mod model_inventory; // [pinvou3-fork C1] v0.8.60 上游新增(模型清单),facade 同步
 pub mod model_routing; // [pinvou3-fork C1] v0.8.57 上游新增(模型解析迁出 models.rs),facade 同步
 pub mod models;
 pub mod network_policy;
@@ -45,7 +48,7 @@ pub mod pricing;
 pub mod project_context;
 pub mod project_context_cache; // [pinvou3-fork C1] v0.8.57 上游新增(跨会话上下文缓存),facade 同步
 pub mod project_doc;
-pub mod prompt_persist; // [pinvou3-fork C1] v0.8.57 上游新增(跨会话 prompt 前缀缓存),facade 同步
+// [pinvou3-fork C1] prompt_persist 于 v0.8.60 被上游删除(prompt 持久化重构),facade 同步移除孤儿声明
 pub mod prompt_zones;
 pub mod prompts;
 pub mod purge;

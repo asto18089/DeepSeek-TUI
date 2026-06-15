@@ -58,6 +58,9 @@ pub enum MailboxMessage {
     Completed { agent_id: String, summary: String },
     /// Agent failed with the carried error message.
     Failed { agent_id: String, error: String },
+    /// Agent was interrupted (e.g. API timeout) with a continuable
+    /// checkpoint; the worker is parked waiting for continuation input.
+    Interrupted { agent_id: String, reason: String },
     /// Cancellation propagated to this agent.
     Cancelled { agent_id: String },
     /// Incremental token usage from a sub-agent's API call.
@@ -83,6 +86,7 @@ impl MailboxMessage {
             | Self::ToolCallCompleted { agent_id, .. }
             | Self::Completed { agent_id, .. }
             | Self::Failed { agent_id, .. }
+            | Self::Interrupted { agent_id, .. }
             | Self::Cancelled { agent_id }
             | Self::TokenUsage { agent_id, .. } => agent_id,
             Self::ChildSpawned { child_id, .. } => child_id,
@@ -459,6 +463,13 @@ mod tests {
                     agent_id: "a8".into(),
                 },
                 "a8",
+            ),
+            (
+                MailboxMessage::Interrupted {
+                    agent_id: "a10".into(),
+                    reason: "API call timed out".into(),
+                },
+                "a10",
             ),
             (
                 MailboxMessage::TokenUsage {

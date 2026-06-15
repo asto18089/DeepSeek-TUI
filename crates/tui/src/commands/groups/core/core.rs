@@ -17,7 +17,7 @@ use super::CommandResult;
 pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
     if let Some(topic) = topic {
         // Show help for specific command
-        if let Some(cmd) = super::get_command_info(topic) {
+        if let Some(cmd) = crate::commands::get_command_info(topic) {
             let mut help = format!(
                 "{}\n\n  {}\n\n  {} {}",
                 cmd.name,
@@ -179,9 +179,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
         };
         let old_model = app.model_display_label();
         let model_changed = app.auto_model || app.model != model_id;
-        app.auto_model = false;
-        app.model = model_id.clone();
-        app.last_effective_model = None;
+        app.set_model_selection(model_id.clone());
         app.update_model_compaction_budget();
         if model_changed {
             app.clear_model_scoped_telemetry();

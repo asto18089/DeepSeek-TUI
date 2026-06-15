@@ -204,6 +204,7 @@ fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static
         }
         ApiProvider::NvidiaNim => Ok("nvidia_nim"),
         ApiProvider::Openai => Ok("openai"),
+        ApiProvider::Anthropic => Ok("anthropic"),
         ApiProvider::Atlascloud => Ok("atlascloud"),
         ApiProvider::WanjieArk => Ok("wanjie_ark"),
         ApiProvider::Volcengine => Ok("volcengine"),
@@ -220,6 +221,9 @@ fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static
         ApiProvider::Ollama => Ok("ollama"),
         ApiProvider::Together => Ok("together"),
         ApiProvider::OpenaiCodex => Ok("openai_codex"),
+        ApiProvider::Zai => Ok("zai"),
+        ApiProvider::Stepfun => Ok("stepfun"),
+        ApiProvider::Minimax => Ok("minimax"),
     }
 }
 

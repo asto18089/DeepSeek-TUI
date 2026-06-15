@@ -1,41 +1,26 @@
 //! Slash command registry and dispatch system
 //!
 //! This module provides a modular command system inspired by Codex-rs.
-//! Commands are organized by category and dispatched through a central registry.
+//! Commands are organized by category and dispatched through a central strategy
+//! registry. Built-in handlers live in group-owned areas under [`groups`]; this
+//! module keeps registry construction, user-command precedence, and the
+//! fall-through behaviour.
 
-mod anchor;
-mod attachment;
-mod balance;
-mod change;
-mod config;
-mod core;
-mod debug;
-mod feedback;
-mod goal;
-mod hf;
-mod hooks;
-mod init;
-mod jobs;
-mod mcp;
-mod memory;
-mod network;
-mod note;
-mod provider;
-mod queue;
-mod rename;
-mod restore;
-mod review;
-mod session;
-pub mod share;
-mod skills;
-mod stash;
-mod status;
-mod task;
+mod groups;
+mod plugins;
+pub mod traits;
 pub mod user_commands;
 
-use std::fmt::Write as _;
+use std::sync::OnceLock;
 
-use crate::localization::{Locale, MessageId, tr};
+pub use traits::CommandInfo;
+
+// Long-standing public paths that predate the group layout.
+pub use groups::project::share;
+
+// Voice capture plumbing shared with the hotbar and the UI event loop.
+pub use groups::core::voice;
+
 use crate::tui::app::{App, AppAction};
 
 /// Result of executing a command
@@ -96,581 +81,68 @@ impl CommandResult {
     }
 }
 
-/// Command metadata for help and autocomplete.
-///
-/// The English description lives in `localization::english` (private), keyed
-/// by `description_id`. Callers resolve a localized description through
-/// [`CommandInfo::description_for`] which delegates to
-/// [`crate::localization::tr`].
-#[derive(Debug, Clone, Copy)]
-pub struct CommandInfo {
-    pub name: &'static str,
-    pub aliases: &'static [&'static str],
-    pub usage: &'static str,
-    pub description_id: MessageId,
+static REGISTRY: OnceLock<traits::CommandRegistry> = OnceLock::new();
+
+fn build_registry() -> traits::CommandRegistry {
+    let mut registry = traits::CommandRegistry::empty();
+    for group in groups::all_command_groups() {
+        registry.register_group(group);
+    }
+    registry
 }
 
-impl CommandInfo {
-    pub fn requires_argument(&self) -> bool {
-        self.usage.contains('<') || self.usage.contains('[')
-    }
-
-    pub fn palette_command(&self) -> String {
-        if self.requires_argument() {
-            format!("/{} ", self.name)
-        } else {
-            format!("/{}", self.name)
-        }
-    }
-
-    pub fn description_for(&self, locale: Locale) -> &'static str {
-        tr(locale, self.description_id)
-    }
-
-    pub fn palette_description_for(&self, locale: Locale) -> String {
-        let desc = self.description_for(locale);
-        if self.aliases.is_empty() {
-            desc.to_string()
-        } else {
-            format!("{}  aliases: {}", desc, self.aliases.join(", "))
-        }
-    }
+pub fn registry() -> &'static traits::CommandRegistry {
+    REGISTRY.get_or_init(build_registry)
 }
 
-/// All registered commands
-pub const COMMANDS: &[CommandInfo] = &[
-    // Core commands
-    CommandInfo {
-        name: "anchor",
-        aliases: &["maodian"],
-        usage: "/anchor <text> | /anchor list | /anchor remove <n>",
-        description_id: MessageId::CmdAnchorDescription,
-    },
-    CommandInfo {
-        name: "help",
-        aliases: &["?", "bangzhu", "帮助"],
-        usage: "/help [command]",
-        description_id: MessageId::CmdHelpDescription,
-    },
-    CommandInfo {
-        name: "clear",
-        aliases: &["qingping"],
-        usage: "/clear",
-        description_id: MessageId::CmdClearDescription,
-    },
-    CommandInfo {
-        name: "exit",
-        aliases: &["quit", "q", "tuichu"],
-        usage: "/exit",
-        description_id: MessageId::CmdExitDescription,
-    },
-    CommandInfo {
-        name: "model",
-        aliases: &["moxing"],
-        usage: "/model [name]",
-        description_id: MessageId::CmdModelDescription,
-    },
-    CommandInfo {
-        name: "models",
-        aliases: &["moxingliebiao"],
-        usage: "/models",
-        description_id: MessageId::CmdModelsDescription,
-    },
-    CommandInfo {
-        name: "provider",
-        aliases: &[],
-        usage: "/provider [name] [model]",
-        description_id: MessageId::CmdProviderDescription,
-    },
-    CommandInfo {
-        name: "queue",
-        aliases: &["queued"],
-        usage: "/queue [list|edit <n>|drop <n>|clear]",
-        description_id: MessageId::CmdQueueDescription,
-    },
-    CommandInfo {
-        name: "stash",
-        aliases: &["park"],
-        usage: "/stash [list|pop|clear]",
-        description_id: MessageId::CmdStashDescription,
-    },
-    CommandInfo {
-        name: "hooks",
-        aliases: &["hook", "gouzi"],
-        usage: "/hooks [list|events]",
-        description_id: MessageId::CmdHooksDescription,
-    },
-    CommandInfo {
-        name: "subagents",
-        aliases: &["agents", "zhinengti"],
-        usage: "/subagents",
-        description_id: MessageId::CmdSubagentsDescription,
-    },
-    CommandInfo {
-        name: "agent",
-        aliases: &["daili"],
-        usage: "/agent [N] <task>",
-        description_id: MessageId::CmdAgentDescription,
-    },
-    CommandInfo {
-        name: "links",
-        aliases: &["dashboard", "api", "lianjie"],
-        usage: "/links",
-        description_id: MessageId::CmdLinksDescription,
-    },
-    CommandInfo {
-        name: "feedback",
-        aliases: &[],
-        usage: "/feedback [bug|feature|security]",
-        description_id: MessageId::CmdFeedbackDescription,
-    },
-    CommandInfo {
-        name: "hf",
-        aliases: &["huggingface"],
-        usage: "/hf [mcp <status|setup>|concepts]",
-        description_id: MessageId::CmdHfDescription,
-    },
-    CommandInfo {
-        name: "home",
-        aliases: &["stats", "overview", "zhuye", "shouye"],
-        usage: "/home",
-        description_id: MessageId::CmdHomeDescription,
-    },
-    CommandInfo {
-        name: "workspace",
-        aliases: &["cwd"],
-        usage: "/workspace [path]",
-        description_id: MessageId::CmdWorkspaceDescription,
-    },
-    CommandInfo {
-        name: "note",
-        aliases: &[],
-        usage: "/note [add|list|show|edit|remove|clear|path]",
-        description_id: MessageId::CmdNoteDescription,
-    },
-    CommandInfo {
-        name: "memory",
-        aliases: &[],
-        usage: "/memory [show|path|clear|edit|help]",
-        description_id: MessageId::CmdMemoryDescription,
-    },
-    CommandInfo {
-        name: "attach",
-        aliases: &["image", "media", "fujian"],
-        usage: "/attach <path>",
-        description_id: MessageId::CmdAttachDescription,
-    },
-    CommandInfo {
-        name: "task",
-        aliases: &["tasks"],
-        usage: "/task [add <prompt>|list|show <id>|cancel <id>]",
-        description_id: MessageId::CmdTaskDescription,
-    },
-    CommandInfo {
-        name: "jobs",
-        aliases: &["job", "zuoye"],
-        usage: "/jobs [list|show <id>|poll <id>|wait <id>|stdin <id> <input>|cancel <id>]",
-        description_id: MessageId::CmdJobsDescription,
-    },
-    CommandInfo {
-        name: "mcp",
-        aliases: &[],
-        usage: "/mcp [init|add stdio <name> <command> [args...]|add http <name> <url>|enable <name>|disable <name>|remove <name>|validate|reload]",
-        description_id: MessageId::CmdMcpDescription,
-    },
-    CommandInfo {
-        name: "network",
-        aliases: &[],
-        usage: "/network [list|allow <host>|deny <host>|remove <host>|default <allow|deny|prompt>]",
-        description_id: MessageId::CmdNetworkDescription,
-    },
-    // Session commands
-    CommandInfo {
-        name: "rename",
-        aliases: &["gaiming", "chongmingming"],
-        usage: "/rename <new title>",
-        description_id: MessageId::CmdRenameDescription,
-    },
-    CommandInfo {
-        name: "save",
-        aliases: &[],
-        usage: "/save [path]",
-        description_id: MessageId::CmdSaveDescription,
-    },
-    CommandInfo {
-        name: "fork",
-        aliases: &["branch"],
-        usage: "/fork",
-        description_id: MessageId::CmdForkDescription,
-    },
-    CommandInfo {
-        name: "new",
-        aliases: &[],
-        usage: "/new [--force]",
-        description_id: MessageId::CmdNewDescription,
-    },
-    CommandInfo {
-        name: "sessions",
-        aliases: &["resume"],
-        usage: "/sessions [show|prune <days>]",
-        description_id: MessageId::CmdSessionsDescription,
-    },
-    CommandInfo {
-        name: "load",
-        aliases: &["jiazai"],
-        usage: "/load [path]",
-        description_id: MessageId::CmdLoadDescription,
-    },
-    CommandInfo {
-        name: "compact",
-        aliases: &["yasuo"],
-        usage: "/compact",
-        description_id: MessageId::CmdCompactDescription,
-    },
-    CommandInfo {
-        name: "purge",
-        aliases: &["qingchu"],
-        usage: "/purge",
-        description_id: MessageId::CmdPurgeDescription,
-    },
-    CommandInfo {
-        name: "relay",
-        aliases: &["batonpass", "接力"],
-        usage: "/relay [focus]",
-        description_id: MessageId::CmdRelayDescription,
-    },
-    CommandInfo {
-        name: "context",
-        aliases: &["ctx"],
-        usage: "/context",
-        description_id: MessageId::CmdContextDescription,
-    },
-    CommandInfo {
-        name: "export",
-        aliases: &["daochu"],
-        usage: "/export [path]",
-        description_id: MessageId::CmdExportDescription,
-    },
-    // Config commands
-    CommandInfo {
-        name: "config",
-        aliases: &[],
-        usage: "/config",
-        description_id: MessageId::CmdConfigDescription,
-    },
-    CommandInfo {
-        name: "sidebar",
-        aliases: &[],
-        usage: "/sidebar [on|off|auto|work|tasks|agents|context] [--save]",
-        description_id: MessageId::CmdSidebarDescription,
-    },
-    CommandInfo {
-        name: "mode",
-        aliases: &["jihua", "zidong"],
-        usage: "/mode [agent|plan|yolo|1|2|3]",
-        description_id: MessageId::CmdModeDescription,
-    },
-    CommandInfo {
-        name: "theme",
-        aliases: &[],
-        usage: "/theme [name]",
-        description_id: MessageId::CmdThemeDescription,
-    },
-    CommandInfo {
-        name: "verbose",
-        aliases: &[],
-        usage: "/verbose [on|off]",
-        description_id: MessageId::CmdVerboseDescription,
-    },
-    CommandInfo {
-        name: "trust",
-        aliases: &["xinren"],
-        usage: "/trust [on|off|add <path>|remove <path>|list]",
-        description_id: MessageId::CmdTrustDescription,
-    },
-    CommandInfo {
-        name: "logout",
-        aliases: &[],
-        usage: "/logout",
-        description_id: MessageId::CmdLogoutDescription,
-    },
-    // Debug commands
-    CommandInfo {
-        name: "tokens",
-        aliases: &[],
-        usage: "/tokens",
-        description_id: MessageId::CmdTokensDescription,
-    },
-    CommandInfo {
-        name: "translate",
-        aliases: &["translation", "transale"],
-        usage: "/translate",
-        description_id: MessageId::CmdTranslateDescription,
-    },
-    CommandInfo {
-        name: "system",
-        aliases: &["xitong"],
-        usage: "/system",
-        description_id: MessageId::CmdSystemDescription,
-    },
-    CommandInfo {
-        name: "edit",
-        aliases: &[],
-        usage: "/edit",
-        description_id: MessageId::CmdEditDescription,
-    },
-    CommandInfo {
-        name: "diff",
-        aliases: &[],
-        usage: "/diff",
-        description_id: MessageId::CmdDiffDescription,
-    },
-    CommandInfo {
-        name: "change",
-        aliases: &[],
-        usage: "/change [version]",
-        description_id: MessageId::CmdChangeDescription,
-    },
-    CommandInfo {
-        name: "undo",
-        aliases: &[],
-        usage: "/undo",
-        description_id: MessageId::CmdUndoDescription,
-    },
-    CommandInfo {
-        name: "retry",
-        aliases: &["chongshi"],
-        usage: "/retry",
-        description_id: MessageId::CmdRetryDescription,
-    },
-    CommandInfo {
-        name: "init",
-        aliases: &[],
-        usage: "/init",
-        description_id: MessageId::CmdInitDescription,
-    },
-    CommandInfo {
-        name: "lsp",
-        aliases: &[],
-        usage: "/lsp [on|off|status]",
-        description_id: MessageId::CmdLspDescription,
-    },
-    CommandInfo {
-        name: "share",
-        aliases: &[],
-        usage: "/share",
-        description_id: MessageId::CmdShareDescription,
-    },
-    CommandInfo {
-        name: "hunt",
-        aliases: &["goal", "mubiao", "狩猎"],
-        usage: "/hunt [quarry] [budget: N]",
-        description_id: MessageId::CmdGoalDescription,
-    },
-    CommandInfo {
-        name: "settings",
-        aliases: &[],
-        usage: "/settings",
-        description_id: MessageId::CmdSettingsDescription,
-    },
-    CommandInfo {
-        name: "status",
-        aliases: &[],
-        usage: "/status",
-        description_id: MessageId::CmdStatusDescription,
-    },
-    CommandInfo {
-        name: "statusline",
-        aliases: &[],
-        usage: "/statusline",
-        description_id: MessageId::CmdStatuslineDescription,
-    },
-    // Skills commands
-    CommandInfo {
-        name: "skills",
-        aliases: &["jinengliebiao"],
-        usage: "/skills [--remote|sync|<prefix>]",
-        description_id: MessageId::CmdSkillsDescription,
-    },
-    CommandInfo {
-        name: "skill",
-        aliases: &["jineng"],
-        usage: "/skill <name|install <spec>|update <name>|uninstall <name>|trust <name>>",
-        description_id: MessageId::CmdSkillDescription,
-    },
-    CommandInfo {
-        name: "review",
-        aliases: &["shencha"],
-        usage: "/review <target>",
-        description_id: MessageId::CmdReviewDescription,
-    },
-    CommandInfo {
-        name: "restore",
-        aliases: &[],
-        usage: "/restore [N|list [N]]",
-        description_id: MessageId::CmdRestoreDescription,
-    },
-    // RLM command
-    CommandInfo {
-        name: "rlm",
-        aliases: &["recursive", "digui"],
-        usage: "/rlm [N] <file_or_text>",
-        description_id: MessageId::CmdRlmDescription,
-    },
-    // Debug/cost command
-    CommandInfo {
-        name: "cost",
-        aliases: &[],
-        usage: "/cost",
-        description_id: MessageId::CmdCostDescription,
-    },
-    // Balance query (#2019)
-    CommandInfo {
-        name: "balance",
-        aliases: &[],
-        usage: "/balance",
-        description_id: MessageId::CmdBalanceDescription,
-    },
-    // Profile switching (#390)
-    CommandInfo {
-        name: "profile",
-        aliases: &["dangan"],
-        usage: "/profile <name>",
-        description_id: MessageId::CmdHelpDescription, // reuse for now
-    },
-    // Cache telemetry (#263)
-    CommandInfo {
-        name: "cache",
-        aliases: &[],
-        usage: "/cache [count|inspect|stats|zones|warmup]",
-        description_id: MessageId::CmdCacheDescription,
-    },
-    // Slop Ledger (#2127)
-    CommandInfo {
-        name: "slop",
-        aliases: &["canzha"],
-        usage: "/slop [query|export]",
-        description_id: MessageId::CmdSlopDescription,
-    },
-];
+pub fn command_infos() -> Vec<&'static CommandInfo> {
+    registry().infos()
+}
+
+pub fn get_command_info(name: &str) -> Option<&'static CommandInfo> {
+    registry().get_info(name)
+}
 
 /// Execute a slash command
 pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
-    let parts: Vec<&str> = cmd.trim().splitn(2, ' ').collect();
-    let command = parts[0].to_lowercase();
-    let command = command.strip_prefix('/').unwrap_or(&command);
-    let arg = parts.get(1).map(|s| s.trim());
+    let trimmed = cmd.trim();
+    let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
+    let command = parts
+        .first()
+        .copied()
+        .unwrap_or_default()
+        .trim_start_matches('/')
+        .to_ascii_lowercase();
+    let arg = parts
+        .get(1)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
 
     // Check user-defined commands FIRST so they can override built-ins.
-    if let Some(result) = user_commands::try_dispatch_user_command(app, cmd.trim()) {
+    if let Some(result) = user_commands::try_dispatch_user_command(app, trimmed) {
         return result;
     }
 
-    // Match command or alias
-    match command {
-        // Core commands
-        "anchor" | "maodian" => anchor::anchor(app, arg),
-        "help" | "?" | "bangzhu" | "帮助" => core::help(app, arg),
-        "clear" | "qingping" => core::clear(app),
-        "exit" | "quit" | "q" | "tuichu" => core::exit(),
-        "model" | "moxing" => core::model(app, arg),
-        "models" | "moxingliebiao" => core::models(app),
-        "provider" => provider::provider(app, arg),
-        "queue" | "queued" => queue::queue(app, arg),
-        "stash" | "park" => stash::stash(app, arg),
-        "hooks" | "hook" | "gouzi" => hooks::hooks(app, arg),
-        "subagents" | "agents" | "zhinengti" => core::subagents(app),
-        "agent" | "daili" => agent(app, arg),
-        "links" | "dashboard" | "api" | "lianjie" => core::deepseek_links(app),
-        "feedback" => feedback::feedback(app, arg),
-        "hf" | "huggingface" => hf::hf(app, arg),
-        "home" | "stats" | "overview" | "zhuye" | "shouye" => core::home_dashboard(app),
-        "workspace" | "cwd" => core::workspace_switch(app, arg),
-        "note" => note::note(app, arg),
-        "memory" => memory::memory(app, arg),
-        "attach" | "image" | "media" | "fujian" => attachment::attach(app, arg),
-        "task" | "tasks" => task::task(app, arg),
-        "jobs" | "job" | "zuoye" => jobs::jobs(app, arg),
-        "mcp" => mcp::mcp(app, arg),
-        "network" => network::network(app, arg),
-
-        // Session commands
-        "rename" | "gaiming" | "chongmingming" => rename::rename(app, arg),
-        "save" => session::save(app, arg),
-        "fork" | "branch" => session::fork(app),
-        "new" => session::new_session(app, arg),
-        "sessions" | "resume" => session::sessions(app, arg),
-        "relay" | "batonpass" | "接力" => relay(app, arg),
-        "load" | "jiazai" => session::load(app, arg),
-        "compact" | "yasuo" => session::compact(app),
-        "purge" | "qingchu" => session::purge(app),
-        "export" | "daochu" => session::export(app, arg),
-
-        // Config commands
-        "config" => config::config_command(app, arg),
-        "sidebar" => config::sidebar(app, arg),
-        "settings" => config::show_settings(app),
-        "status" => status::status(app),
-        "statusline" => config::status_line(app),
-        "mode" => config::mode(app, arg),
-        "jihua" => config::mode(app, Some("plan")),
-        "zidong" => config::mode(app, Some("yolo")),
-        "theme" => config::theme(app, arg),
-        "verbose" => config::verbose(app, arg),
-        "trust" | "xinren" => config::trust(app, arg),
-        "logout" => config::logout(app),
-
-        // Debug commands
-        "translate" | "translation" | "transale" => core::translate(app),
-        "tokens" => debug::tokens(app),
-        "cost" => debug::cost(app),
-        "balance" => balance::balance(app),
-        "cache" => debug::cache(app, arg),
-
-        // Slop ledger (#2127)
-        "slop" | "canzha" => config::slop(app, arg),
-
-        // ChangeLog command
-        "change" => change::change(app, arg),
-        "system" | "xitong" => debug::system_prompt(app),
-        "context" | "ctx" => debug::context(app),
-        "edit" => debug::edit(app),
-        "diff" => debug::diff(app),
-        "undo" => {
-            // Try surgical patch-undo first; fall back to conversation undo
-            // if no snapshots are available or if the snapshot undo couldn't
-            // find anything useful.
-            let result = debug::patch_undo(app);
-            if result.message.as_deref().is_none_or(|m| {
-                m.starts_with("No snapshots found")
-                    || m.starts_with("No tool or pre-turn")
-                    || m.starts_with("Snapshot repo")
-            }) {
-                debug::undo_conversation(app)
-            } else {
-                result
-            }
+    // Compatibility aliases whose historical behavior also supplied an arg.
+    match command.as_str() {
+        "jihua" => {
+            return groups::config::dispatch(app, "jihua", arg).unwrap_or_else(|| {
+                CommandResult::error("The /jihua alias could not be dispatched.")
+            });
         }
-        "retry" | "chongshi" => debug::retry(app),
+        "zidong" => {
+            return groups::config::dispatch(app, "zidong", arg).unwrap_or_else(|| {
+                CommandResult::error("The /zidong alias could not be dispatched.")
+            });
+        }
+        _ => {}
+    }
 
-        // Project commands
-        "init" => init::init(app),
-        "lsp" => config::lsp_command(app, arg),
-        "share" => share::share(app, arg),
-        "goal" | "hunt" | "mubiao" | "狩猎" => goal::hunt(app, arg),
+    if let Some(command_object) = registry().get(command.as_str()) {
+        return command_object.execute(app, arg);
+    }
 
-        // Skills commands
-        "skills" | "jinengliebiao" => skills::list_skills(app, arg),
-        "skill" | "jineng" => skills::run_skill(app, arg),
-        "review" | "shencha" => review::review(app, arg),
-        "restore" => restore::restore(app, arg),
-
-        // Profile switch (#390)
-        "profile" | "dangan" => core::profile_switch(app, arg),
-
-        // RLM command
-        "rlm" | "recursive" | "digui" => rlm(app, arg),
-
+    match command.as_str() {
         // Legacy command migrations (kept out of registry/autocomplete intentionally).
         "set" => CommandResult::error(
             "The /set command was retired. Use /config to edit settings and /settings to inspect current values.",
@@ -682,10 +154,10 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         _ => {
             // Third source: skills (lowest precedence after native and user-config).
             // Try to run a skill whose name matches the command.
-            if let Some(result) = skills::run_skill_by_name(app, command, arg) {
+            if let Some(result) = groups::skills::run_skill_by_name(app, command.as_str(), arg) {
                 return result;
             }
-            let suggestions = suggest_command_names(command, 3);
+            let suggestions = suggest_command_names(command.as_str(), 3);
             if suggestions.is_empty() {
                 CommandResult::error(format!(
                     "Unknown command: /{command}. Type /help for available commands."
@@ -706,275 +178,11 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
 
 /// Update a configuration value programmatically (used by interactive UI views).
 pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) -> CommandResult {
-    config::set_config_value(app, key, value, persist)
+    groups::config::config::set_config_value(app, key, value, persist)
 }
 
 pub fn switch_mode(app: &mut App, mode: crate::tui::app::AppMode) -> String {
-    config::switch_mode(app, mode)
-}
-/// Execute a Recursive Language Model (RLM) turn — Algorithm 1 from
-/// Zhang et al. (arXiv:2512.24601).
-///
-/// The user's prompt text is passed as the argument. It will be stored
-/// in the REPL as the `PROMPT` variable. The root LLM will only see
-/// metadata about the REPL state, never the prompt text directly.
-pub fn rlm(app: &mut App, arg: Option<&str>) -> CommandResult {
-    let (max_depth, target) = match parse_depth_prefixed_arg(arg, 1) {
-        Ok(parsed) => parsed,
-        Err(message) => return CommandResult::error(message),
-    };
-    let target = match target {
-        Some(p) if !p.trim().is_empty() => p.trim().to_string(),
-        _ => {
-            return CommandResult::error(
-                "Usage: /rlm [N] <file_or_text>\n\n\
-                 Opens a persistent RLM context with sub_rlm depth N (0-3, default 1)."
-                    .to_string(),
-            );
-        }
-    };
-
-    let source_arg = if resolves_to_existing_file(app, &target) {
-        format!(r#"file_path: "{target}""#)
-    } else {
-        format!("content: {target:?}")
-    };
-    let message = format!(
-        "Open and use a persistent RLM session for this request. Call `rlm_open` with name `slash_rlm` and {source_arg}. Then call `rlm_configure` with `sub_rlm_max_depth: {max_depth}`. Use `rlm_eval` to inspect the context through `peek`, `search`, and `chunk`, and call `finalize(...)` from the REPL when ready. If a `var_handle` is returned, use `handle_read` for bounded slices or projections before answering."
-    );
-
-    CommandResult::with_message_and_action(
-        format!("Opening persistent RLM context at depth {max_depth}..."),
-        AppAction::SendMessage(message),
-    )
-}
-
-/// Open a persistent sub-agent session from a slash command.
-pub fn agent(_app: &mut App, arg: Option<&str>) -> CommandResult {
-    let (max_depth, task) = match parse_depth_prefixed_arg(arg, 1) {
-        Ok(parsed) => parsed,
-        Err(message) => return CommandResult::error(message),
-    };
-    let task = match task {
-        Some(task) if !task.trim().is_empty() => task.trim().to_string(),
-        _ => {
-            return CommandResult::error(
-                "Usage: /agent [N] <task>\n\n\
-                 Opens a persistent sub-agent session with recursive agent depth N (0-3, default 1).",
-            );
-        }
-    };
-    let message = format!(
-        "Open a persistent sub-agent session for this task. Call `agent_open` with name `slash_agent`, `prompt: {task:?}`, and `max_depth: {max_depth}`. Use `agent_eval` to wait for the next terminal/current projection and `handle_read` on the returned transcript_handle if you need more detail. Verify any claimed side effects before reporting success."
-    );
-    CommandResult::with_message_and_action(
-        format!("Opening persistent sub-agent at depth {max_depth}..."),
-        AppAction::SendMessage(message),
-    )
-}
-
-/// Ask the active model to write a compact relay artifact for the next thread.
-///
-/// The visible command is `/relay` (with `/接力` for Chinese users), but the
-/// durable file path remains `.deepseek/handoff.md` for compatibility with
-/// existing sessions and startup prompt loading.
-pub fn relay(app: &mut App, arg: Option<&str>) -> CommandResult {
-    let focus = arg.map(str::trim).filter(|value| !value.is_empty());
-    let message = build_relay_instruction(app, focus);
-    CommandResult::with_message_and_action(
-        "Preparing session relay at .deepseek/handoff.md...",
-        AppAction::SendMessage(message),
-    )
-}
-
-fn build_relay_instruction(app: &App, focus: Option<&str>) -> String {
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "Create a compact session relay (接力) for a future CodeWhale thread."
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(out, "Write or update `.deepseek/handoff.md`.");
-    let _ = writeln!(
-        out,
-        "Keep the existing file path for compatibility, but title the artifact `# Session relay`."
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(out, "Current session snapshot:");
-    let _ = writeln!(out, "- Workspace: {}", app.workspace.display());
-    let _ = writeln!(out, "- Mode: {}", app.mode.label());
-    let _ = writeln!(out, "- Model: {}", app.model_display_label());
-    if let Some(focus) = focus {
-        let _ = writeln!(out, "- Requested relay focus: {focus}");
-    }
-    if let Some(quarry) = app.hunt.quarry.as_deref() {
-        let _ = writeln!(out, "- Hunt quarry: {quarry}");
-    }
-    if let Some(budget) = app.hunt.token_budget {
-        let _ = writeln!(out, "- Hunt token budget: {budget}");
-    }
-    if let Ok(todos) = app.todos.try_lock() {
-        let snapshot = todos.snapshot();
-        if !snapshot.items.is_empty() {
-            let _ = writeln!(
-                out,
-                "\nWork checklist (primary progress surface, {}% complete):",
-                snapshot.completion_pct
-            );
-            for item in snapshot.items {
-                let _ = writeln!(
-                    out,
-                    "- #{} [{}] {}",
-                    item.id,
-                    item.status.as_str(),
-                    item.content
-                );
-            }
-        }
-    } else {
-        let _ = writeln!(
-            out,
-            "\nWork checklist: unavailable because the checklist is busy."
-        );
-    }
-
-    if let Ok(plan) = app.plan_state.try_lock() {
-        let snapshot = plan.snapshot();
-        if !snapshot.is_empty() {
-            let _ = writeln!(out, "\nOptional strategy metadata from update_plan:");
-            write_plan_field(&mut out, "Title", snapshot.title.as_deref());
-            write_plan_field(&mut out, "Objective", snapshot.objective.as_deref());
-            write_plan_field(&mut out, "Context", snapshot.context_summary.as_deref());
-            write_plan_field(&mut out, "Explanation", snapshot.explanation.as_deref());
-            write_plan_list(&mut out, "Source", &snapshot.sources_used);
-            write_plan_list(&mut out, "Critical file", &snapshot.critical_files);
-            write_plan_list(&mut out, "Constraint", &snapshot.constraints);
-            write_plan_field(
-                &mut out,
-                "Recommended approach",
-                snapshot.recommended_approach.as_deref(),
-            );
-            write_plan_field(
-                &mut out,
-                "Verification plan",
-                snapshot.verification_plan.as_deref(),
-            );
-            write_plan_field(
-                &mut out,
-                "Risks and unknowns",
-                snapshot.risks_and_unknowns.as_deref(),
-            );
-            write_plan_field(
-                &mut out,
-                "Handoff packet",
-                snapshot.handoff_packet.as_deref(),
-            );
-            for item in snapshot.items {
-                let _ = writeln!(out, "- [{}] {}", plan_status_label(&item.status), item.step);
-            }
-        }
-    } else {
-        let _ = writeln!(
-            out,
-            "\nStrategy metadata: unavailable because plan state is busy."
-        );
-    }
-
-    let _ = writeln!(
-        out,
-        "\nBefore writing, inspect the current transcript context and any live tool evidence you need. Do not invent test results, file changes, blockers, or decisions."
-    );
-    let _ = writeln!(
-        out,
-        "\nUse this compact structure:\n\
-         # Session relay\n\
-         \n\
-         ## Goal\n\
-         [the user's objective and any explicit constraints]\n\
-         \n\
-         ## Current work\n\
-         [the active Work checklist item, progress, and what is mid-flight]\n\
-         \n\
-         ## Files and state\n\
-         [changed files, important paths, sub-agents/RLM sessions, commands run]\n\
-         \n\
-         ## Decisions\n\
-         [why key choices were made]\n\
-         \n\
-         ## Verification\n\
-         [what passed, what failed, what was not run]\n\
-         \n\
-         ## Next action\n\
-         [one concrete action for the next thread]"
-    );
-    let _ = writeln!(
-        out,
-        "\nKeep it under about 900 words unless the session genuinely needs more. After writing, report the path and the single next action."
-    );
-    out
-}
-
-fn write_plan_field(out: &mut String, label: &str, value: Option<&str>) {
-    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
-        let _ = writeln!(out, "- {label}: {value}");
-    }
-}
-
-fn write_plan_list(out: &mut String, label: &str, values: &[String]) {
-    for value in values {
-        let value = value.trim();
-        if !value.is_empty() {
-            let _ = writeln!(out, "- {label}: {value}");
-        }
-    }
-}
-
-fn plan_status_label(status: &crate::tools::plan::StepStatus) -> &'static str {
-    match status {
-        crate::tools::plan::StepStatus::Pending => "pending",
-        crate::tools::plan::StepStatus::InProgress => "in_progress",
-        crate::tools::plan::StepStatus::Completed => "completed",
-    }
-}
-
-fn parse_depth_prefixed_arg(
-    arg: Option<&str>,
-    default_depth: u32,
-) -> Result<(u32, Option<&str>), String> {
-    let Some(raw) = arg.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return Ok((default_depth, None));
-    };
-    let mut parts = raw.splitn(2, char::is_whitespace);
-    let first = parts.next().unwrap_or_default();
-    if first.chars().all(|ch| ch.is_ascii_digit()) {
-        let depth: u32 = first
-            .parse()
-            .map_err(|_| "Depth must be an integer from 0 to 3".to_string())?;
-        if depth > 3 {
-            return Err("Depth must be between 0 and 3".to_string());
-        }
-        Ok((depth, parts.next().map(str::trim)))
-    } else {
-        Ok((default_depth, Some(raw)))
-    }
-}
-
-fn resolves_to_existing_file(app: &App, input: &str) -> bool {
-    let path = std::path::Path::new(input);
-    let candidate = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        app.workspace.join(path)
-    };
-    candidate.is_file()
-}
-
-/// Get command info by name or alias
-pub fn get_command_info(name: &str) -> Option<&'static CommandInfo> {
-    let name = name.strip_prefix('/').unwrap_or(name);
-    COMMANDS
-        .iter()
-        .find(|cmd| cmd.name == name || cmd.aliases.contains(&name))
+    groups::config::config::switch_mode(app, mode)
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
@@ -989,22 +197,22 @@ fn edit_distance(a: &str, b: &str) -> usize {
     }
 
     let b_chars: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
-    let mut curr = vec![0usize; b_chars.len() + 1];
+    let mut previous: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut current = vec![0usize; b_chars.len() + 1];
 
     for (i, a_ch) in a.chars().enumerate() {
-        curr[0] = i + 1;
+        current[0] = i + 1;
         for (j, b_ch) in b_chars.iter().enumerate() {
             let cost = if a_ch == *b_ch { 0 } else { 1 };
-            let delete = prev[j + 1] + 1;
-            let insert = curr[j] + 1;
-            let substitute = prev[j] + cost;
-            curr[j + 1] = delete.min(insert).min(substitute);
+            let delete = previous[j + 1] + 1;
+            let insert = current[j] + 1;
+            let substitute = previous[j] + cost;
+            current[j + 1] = delete.min(insert).min(substitute);
         }
-        std::mem::swap(&mut prev, &mut curr);
+        std::mem::swap(&mut previous, &mut current);
     }
 
-    prev[b_chars.len()]
+    previous[b_chars.len()]
 }
 
 fn suggest_command_names(input: &str, limit: usize) -> Vec<String> {
@@ -1014,13 +222,12 @@ fn suggest_command_names(input: &str, limit: usize) -> Vec<String> {
     }
 
     let mut scored: Vec<(u8, usize, String)> = Vec::new();
-    for command in COMMANDS {
+    for command in registry().infos() {
         let mut best: Option<(u8, usize)> = None;
         for candidate in std::iter::once(command.name).chain(command.aliases.iter().copied()) {
-            let candidate = candidate.to_ascii_lowercase();
-            let prefix_match = candidate.starts_with(&query) || query.starts_with(&candidate);
-            let contains_match = candidate.contains(&query) || query.contains(&candidate);
-            let distance = edit_distance(&candidate, &query);
+            let prefix_match = candidate.starts_with(&query) || query.starts_with(candidate);
+            let contains_match = candidate.contains(&query) || query.contains(candidate);
+            let distance = edit_distance(candidate, &query);
             let close_typo = distance <= 2;
             if !(prefix_match || contains_match || close_typo) {
                 continue;
@@ -1062,6 +269,7 @@ fn suggest_command_names(input: &str, limit: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::config::{ApiProvider, Config};
+    use crate::localization::{Locale, MessageId};
     use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
     use crate::tools::todo::TodoStatus;
     use crate::tui::app::{App, AppAction, SidebarFocus, TuiOptions};
@@ -1097,9 +305,9 @@ mod tests {
 
     #[test]
     fn command_registry_contains_config_and_links_but_not_set_or_deepseek() {
-        assert!(COMMANDS.iter().any(|cmd| cmd.name == "config"));
-        let sidebar = COMMANDS
-            .iter()
+        assert!(command_infos().iter().any(|cmd| cmd.name == "config"));
+        let sidebar = command_infos()
+            .into_iter()
             .find(|cmd| cmd.name == "sidebar")
             .expect("sidebar command should exist");
         assert_eq!(sidebar.description_id, MessageId::CmdSidebarDescription);
@@ -1108,23 +316,23 @@ mod tests {
                 .description_for(Locale::En)
                 .contains("right sidebar")
         );
-        assert!(COMMANDS.iter().any(|cmd| cmd.name == "links"));
-        let hf = COMMANDS
-            .iter()
+        assert!(command_infos().iter().any(|cmd| cmd.name == "links"));
+        let hf = command_infos()
+            .into_iter()
             .find(|cmd| cmd.name == "hf")
             .expect("hf command should exist");
         assert_eq!(hf.aliases, &["huggingface"]);
         assert_eq!(hf.description_id, MessageId::CmdHfDescription);
         assert!(hf.description_for(Locale::En).contains("Hugging Face"));
-        assert!(COMMANDS.iter().any(|cmd| cmd.name == "memory"));
-        assert!(!COMMANDS.iter().any(|cmd| cmd.name == "set"));
-        assert!(!COMMANDS.iter().any(|cmd| cmd.name == "deepseek"));
+        assert!(command_infos().iter().any(|cmd| cmd.name == "memory"));
+        assert!(!command_infos().iter().any(|cmd| cmd.name == "set"));
+        assert!(!command_infos().iter().any(|cmd| cmd.name == "deepseek"));
     }
 
     #[test]
     fn links_command_has_dashboard_and_api_aliases() {
-        let links = COMMANDS
-            .iter()
+        let links = command_infos()
+            .into_iter()
             .find(|cmd| cmd.name == "links")
             .expect("links command should exist");
         assert_eq!(links.aliases, &["dashboard", "api", "lianjie"]);
@@ -1212,8 +420,8 @@ mod tests {
         assert!(message.contains("Write or update `.deepseek/handoff.md`"));
         assert!(message.contains("# Session relay"));
         assert!(message.contains("Requested relay focus: verify install"));
-        assert!(message.contains("Hunt quarry: Unify the work surface"));
-        assert!(message.contains("Hunt token budget: 12000"));
+        assert!(message.contains("Goal objective: Unify the work surface"));
+        assert!(message.contains("Goal token budget: 12000"));
         assert!(message.contains("Work checklist (primary progress surface, 50% complete)"));
         assert!(message.contains("#1 [completed] inspect workspace"));
         assert!(message.contains("#2 [in_progress] patch relay command"));
@@ -1230,8 +438,8 @@ mod tests {
 
     #[test]
     fn relay_command_has_bilingual_aliases() {
-        let relay = COMMANDS
-            .iter()
+        let relay = command_infos()
+            .into_iter()
             .find(|cmd| cmd.name == "relay")
             .expect("relay command should exist");
         assert_eq!(relay.aliases, &["batonpass", "接力"]);
@@ -1250,7 +458,7 @@ mod tests {
     #[test]
     fn command_registry_has_unique_names_and_aliases() {
         let mut names = std::collections::BTreeSet::new();
-        for command in COMMANDS {
+        for command in command_infos() {
             assert!(
                 names.insert(command.name),
                 "duplicate command name /{}",
@@ -1259,7 +467,7 @@ mod tests {
         }
 
         let mut aliases = std::collections::BTreeSet::new();
-        for command in COMMANDS {
+        for command in command_infos() {
             for alias in command.aliases {
                 assert!(
                     !names.contains(alias),
@@ -1272,7 +480,7 @@ mod tests {
 
     #[test]
     fn command_registry_metadata_is_complete_and_palette_safe() {
-        for command in COMMANDS {
+        for command in command_infos() {
             assert!(!command.name.is_empty(), "command name must not be empty");
             assert_eq!(
                 command.name.trim(),
@@ -1340,13 +548,18 @@ mod tests {
                     "/{} alias /{alias} must not contain whitespace",
                     command.name
                 );
+                assert!(
+                    !alias.chars().any(|ch| ch.is_ascii_uppercase()),
+                    "/{} alias /{alias} must not contain uppercase ASCII",
+                    command.name
+                );
             }
         }
     }
 
     #[test]
     fn command_info_resolves_canonical_names_and_aliases() {
-        for command in COMMANDS {
+        for command in command_infos() {
             for lookup in [command.name.to_string(), format!("/{}", command.name)] {
                 let resolved = get_command_info(&lookup)
                     .unwrap_or_else(|| panic!("{lookup:?} should resolve to /{}", command.name));
@@ -1367,7 +580,7 @@ mod tests {
     #[test]
     fn every_registered_command_has_a_help_topic() {
         let mut app = create_test_app();
-        for command in COMMANDS {
+        for command in command_infos() {
             let result = execute(&format!("/help {}", command.name), &mut app);
             assert!(
                 !result.is_error,
@@ -1393,8 +606,8 @@ mod tests {
 
     #[test]
     fn context_command_opens_inspector_and_keeps_ctx_alias() {
-        let context = COMMANDS
-            .iter()
+        let context = command_infos()
+            .into_iter()
             .find(|cmd| cmd.name == "context")
             .expect("context command should exist");
         assert_eq!(context.aliases, &["ctx"]);
@@ -1406,6 +619,10 @@ mod tests {
             result.action,
             Some(AppAction::OpenContextInspector)
         ));
+
+        let report = execute("/context report", &mut app);
+        let message = report.message.expect("context report should return text");
+        assert!(message.contains("Context Source Map"));
     }
 
     #[test]
@@ -1449,6 +666,49 @@ mod tests {
         assert!(!result.is_error);
         assert!(!app.verbose_transcript);
         assert!(result.message.unwrap().contains("off"));
+    }
+
+    #[test]
+    fn voice_send_and_voice_control_commands_toggle_state() {
+        let mut app = create_test_app();
+        assert!(!app.voice_send_enabled);
+        assert!(!app.voice_control_enabled);
+
+        for invocation in ["/voicesend", "/voice-send", "/yuyinsend", "/语音发送"] {
+            let result = execute(invocation, &mut app);
+            assert!(!result.is_error, "{invocation} should toggle cleanly");
+            assert!(result.action.is_none());
+            assert!(result.message.is_some());
+        }
+        // Four toggles land back at disabled.
+        assert!(!app.voice_send_enabled);
+
+        let result = execute("/voicecontrol", &mut app);
+        assert!(!result.is_error);
+        assert!(app.voice_control_enabled);
+        let result = execute("/voice-control", &mut app);
+        assert!(!result.is_error);
+        assert!(!app.voice_control_enabled);
+    }
+
+    /// `/voice` defers the actual capture to the UI event loop via
+    /// `AppAction::VoiceCapture`, so executing it never records audio.
+    /// On hosts without a recorder it must fail gracefully instead.
+    #[test]
+    fn voice_command_toggles_on_and_off_or_fails_gracefully() {
+        let mut app = create_test_app();
+        let result = execute("/voice", &mut app);
+        if app.voice_enabled {
+            assert!(!result.is_error);
+            assert!(matches!(result.action, Some(AppAction::VoiceCapture)));
+            let off = execute("/voice", &mut app);
+            assert!(!off.is_error);
+            assert!(off.action.is_none());
+            assert!(!app.voice_enabled);
+        } else {
+            assert!(result.is_error);
+            assert!(result.action.is_none());
+        }
     }
 
     #[test]
@@ -1626,10 +886,10 @@ mod tests {
         (app, tmpdir, guard)
     }
 
-    /// Smoke test: every entry in `COMMANDS` must dispatch to a real handler.
+    /// Smoke test: every entry in `command_infos()` must dispatch to a real handler.
     /// A dispatch miss surfaces as the fall-through `Unknown command:` error
     /// message in `execute`. This catches the case where a new command is
-    /// added to `COMMANDS` (so it shows up in `/help` and the palette) but
+    /// added to `command_infos()` (so it shows up in `/help` and the palette) but
     /// the matching arm in `execute` is forgotten — the user would type the
     /// command, see it autocomplete, and then get an unhelpful "did you
     /// mean" suggestion. Also catches panics in handlers because the test
@@ -1735,17 +995,17 @@ mod tests {
         assert!(tokens.contains("deepseek-v4-pro"));
     }
 
-    /// Smoke test: every entry in `COMMANDS` must dispatch to a real handler.
+    /// Smoke test: every entry in `command_infos()` must dispatch to a real handler.
     /// A dispatch miss surfaces as the fall-through `Unknown command:` error
     /// message in `execute`. This catches the case where a new command is
-    /// added to `COMMANDS` (so it shows up in `/help` and the palette) but
+    /// added to `command_infos()` (so it shows up in `/help` and the palette) but
     /// the matching arm in `execute` is forgotten — the user would type the
     /// command, see it autocomplete, and then get an unhelpful "did you
     /// mean" suggestion. Also catches panics in handlers because the test
     /// runner unwinds the panic and reports the offending command.
     #[test]
     fn every_registered_command_dispatches_to_a_handler() {
-        for command in COMMANDS {
+        for command in command_infos() {
             if skip_in_dispatch_smoke(command.name) {
                 continue;
             }
@@ -1766,7 +1026,7 @@ mod tests {
     /// just because the registry lists it as an alias of `/exit`.
     #[test]
     fn every_command_alias_dispatches_to_a_handler() {
-        for command in COMMANDS {
+        for command in command_infos() {
             if skip_in_dispatch_smoke(command.name) {
                 continue;
             }

@@ -638,7 +638,7 @@ pub fn history_cells_from_message(msg: &Message) -> Vec<HistoryCell> {
                     _ => {}
                 }
             }
-            ContentBlock::Thinking { thinking } => {
+            ContentBlock::Thinking { thinking, .. } => {
                 if let Some(HistoryCell::Thinking { content, .. }) = cells.last_mut() {
                     if !content.is_empty() {
                         content.push('\n');
@@ -787,33 +787,95 @@ pub struct ToolRun {
     pub count: usize,
     /// Dominant tool names, deduplicated and capped for summary rendering.
     pub tool_families: Vec<String>,
+    /// Human-facing activity buckets for Cursor-style metadata rows.
+    pub activity: ToolRunActivitySummary,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ToolRunActivitySummary {
+    pub files: usize,
+    pub searches: usize,
+    pub commands: usize,
+    pub edits: usize,
+    pub delegates: usize,
+    pub metadata: usize,
+    pub other: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolRunActivity {
+    File,
+    Search,
+    Command,
+    Edit,
+    Delegate,
+    Metadata,
+    Other,
+}
+
+impl ToolRunActivitySummary {
+    fn record(&mut self, tool: &ToolCell) {
+        match classify_tool_run_activity(tool) {
+            ToolRunActivity::File => self.files += 1,
+            ToolRunActivity::Search => self.searches += 1,
+            ToolRunActivity::Command => self.commands += 1,
+            ToolRunActivity::Edit => self.edits += 1,
+            ToolRunActivity::Delegate => self.delegates += 1,
+            ToolRunActivity::Metadata => self.metadata += 1,
+            ToolRunActivity::Other => self.other += 1,
+        }
+    }
 }
 
 /// Detect contiguous runs of successful, low-risk tool cells.
 ///
-/// Failed, running, shell, patch, review, diff, and plan-update cells split
-/// runs so important state never disappears into a summary row.
+/// Failed, running, patch, review, diff, and plan-update cells split runs so
+/// important state never disappears into a summary row. Successful command
+/// cells can join dense runs; Alt+V / expansion keeps their raw details
+/// available without making routine verifier/shell work dominate the default
+/// transcript.
 pub fn detect_tool_runs(history: &[HistoryCell], min_size: usize) -> Vec<ToolRun> {
+    detect_tool_runs_from_slices(history, &[], min_size)
+}
+
+/// Detect contiguous runs across committed history plus the active in-flight
+/// tail. `ToolRun::start` is always the virtual transcript index:
+/// `history.len() + active_offset` for active entries.
+pub fn detect_tool_runs_from_slices(
+    history: &[HistoryCell],
+    active_entries: &[HistoryCell],
+    min_size: usize,
+) -> Vec<ToolRun> {
     if min_size == 0 {
         return Vec::new();
     }
 
     let mut runs = Vec::new();
     let mut index = 0;
-    while index < history.len() {
-        if !is_collapsible_tool_cell(&history[index]) {
+    let total_len = history.len().saturating_add(active_entries.len());
+    while index < total_len {
+        if !cell_at_virtual_index(history, active_entries, index)
+            .is_some_and(is_collapsible_tool_cell)
+        {
             index += 1;
             continue;
         }
 
         let start = index;
         let mut names: Vec<String> = Vec::new();
-        while index < history.len() && is_collapsible_tool_cell(&history[index]) {
-            if let HistoryCell::Tool(tool) = &history[index] {
+        let mut activity = ToolRunActivitySummary::default();
+        while index < total_len
+            && cell_at_virtual_index(history, active_entries, index)
+                .is_some_and(is_collapsible_tool_cell)
+        {
+            if let Some(HistoryCell::Tool(tool)) =
+                cell_at_virtual_index(history, active_entries, index)
+            {
                 let name = tool_display_name(tool);
                 if !names.iter().any(|existing| existing == name) {
                     names.push(name.to_string());
                 }
+                activity.record(tool);
             }
             index += 1;
         }
@@ -825,11 +887,22 @@ pub fn detect_tool_runs(history: &[HistoryCell], min_size: usize) -> Vec<ToolRun
                 start,
                 count,
                 tool_families: names,
+                activity,
             });
         }
     }
 
     runs
+}
+
+fn cell_at_virtual_index<'a>(
+    history: &'a [HistoryCell],
+    active_entries: &'a [HistoryCell],
+    index: usize,
+) -> Option<&'a HistoryCell> {
+    history
+        .get(index)
+        .or_else(|| active_entries.get(index.checked_sub(history.len())?))
 }
 
 fn is_collapsible_tool_cell(cell: &HistoryCell) -> bool {
@@ -838,6 +911,10 @@ fn is_collapsible_tool_cell(cell: &HistoryCell) -> bool {
 
 fn generic_tool_name_is_collapse_guard(name: &str) -> bool {
     let normalized = name.trim().to_ascii_lowercase();
+    if is_metadata_tool_name(&normalized) {
+        return false;
+    }
+
     normalized.contains("patch")
         || normalized.contains("write")
         || normalized.contains("edit")
@@ -845,9 +922,21 @@ fn generic_tool_name_is_collapse_guard(name: &str) -> bool {
         || normalized.contains("remove")
         || normalized.contains("commit")
         || normalized.contains("push")
-        || normalized.contains("shell")
-        || normalized.contains("exec")
         || normalized.contains("review")
+}
+
+fn is_metadata_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "update_plan"
+            | "todo_write"
+            | "todo_add"
+            | "todo_update"
+            | "checklist_write"
+            | "checklist_add"
+            | "checklist_update"
+            | "checklist_list"
+    )
 }
 
 fn tool_display_name(tool: &ToolCell) -> &str {
@@ -865,14 +954,157 @@ fn tool_display_name(tool: &ToolCell) -> &str {
     }
 }
 
+fn classify_tool_run_activity(tool: &ToolCell) -> ToolRunActivity {
+    let name = tool_display_name(tool);
+    classify_tool_name_activity(name)
+}
+
+fn classify_tool_name_activity(name: &str) -> ToolRunActivity {
+    let normalized = name.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "read_file" | "list_dir" | "view_image" | "explore" => ToolRunActivity::File,
+        "grep_files" | "file_search" | "web_search" | "fetch_url" => ToolRunActivity::Search,
+        "shell"
+        | "exec_shell"
+        | "exec_shell_wait"
+        | "exec_shell_interact"
+        | "exec_shell_cancel"
+        | "task_shell_start"
+        | "task_shell_wait"
+        | "run_tests"
+        | "run_verifiers"
+        | "task_gate_run"
+        | "validate_data" => ToolRunActivity::Command,
+        "edit_file" | "apply_patch" | "write_file" | "diff" => ToolRunActivity::Edit,
+        "agent_open" | "agent_eval" | "agent_close" | "agent_spawn" | "tool_agent" | "rlm_open"
+        | "rlm_eval" | "rlm_configure" | "rlm_close" | "rlm" => ToolRunActivity::Delegate,
+        _ if is_metadata_tool_name(&normalized) => ToolRunActivity::Metadata,
+        _ if normalized.contains("search")
+            || normalized.contains("grep")
+            || normalized.contains("find") =>
+        {
+            ToolRunActivity::Search
+        }
+        _ if normalized.contains("read")
+            || normalized.contains("list")
+            || normalized.contains("view")
+            || normalized.contains("open") =>
+        {
+            ToolRunActivity::File
+        }
+        _ if normalized.contains("patch")
+            || normalized.contains("write")
+            || normalized.contains("edit")
+            || normalized.contains("diff") =>
+        {
+            ToolRunActivity::Edit
+        }
+        _ if normalized.contains("run")
+            || normalized.contains("exec")
+            || normalized.contains("shell")
+            || normalized.contains("test")
+            || normalized.contains("check") =>
+        {
+            ToolRunActivity::Command
+        }
+        _ if normalized.contains("agent")
+            || normalized.contains("delegate")
+            || normalized.contains("fanout")
+            || normalized.contains("rlm") =>
+        {
+            ToolRunActivity::Delegate
+        }
+        _ if normalized.contains("metadata")
+            || normalized.contains("session")
+            || normalized.contains("context")
+            || normalized.contains("plan")
+            || normalized.contains("todo") =>
+        {
+            ToolRunActivity::Metadata
+        }
+        _ => ToolRunActivity::Other,
+    }
+}
+
 #[must_use]
 pub fn tool_run_summary(run: &ToolRun) -> String {
-    let tools = if run.tool_families.is_empty() {
-        "tools".to_string()
-    } else {
-        run.tool_families.join(", ")
+    let activity = &run.activity;
+    let mut parts = Vec::new();
+    if activity.files > 0 {
+        parts.push(counted(activity.files, "file", "files"));
+    }
+    if activity.searches > 0 {
+        parts.push(counted(activity.searches, "search", "searches"));
+    }
+
+    let mut clauses = Vec::new();
+    if !parts.is_empty() {
+        clauses.push(format!("Explored {}", parts.join(", ")));
+    }
+    if activity.commands > 0 {
+        let mut command_clause =
+            format!("ran {}", counted(activity.commands, "command", "commands"));
+        if let Some(families) = command_family_summary(run) {
+            command_clause.push_str(": ");
+            command_clause.push_str(&families);
+        }
+        clauses.push(command_clause);
+    }
+    if activity.edits > 0 {
+        clauses.push(format!(
+            "edited {}",
+            counted(activity.edits, "file", "files")
+        ));
+    }
+    if activity.delegates > 0 {
+        clauses.push(format!(
+            "delegated {}",
+            counted(activity.delegates, "task", "tasks")
+        ));
+    }
+    if activity.metadata > 0 || activity.other > 0 {
+        clauses.push("updated metadata".to_string());
+    }
+
+    if clauses.is_empty() {
+        return "Updated metadata".to_string();
+    }
+
+    let summary = clauses.join(", ");
+    sentence_case_activity(summary)
+}
+
+fn command_family_summary(run: &ToolRun) -> Option<String> {
+    if run.activity.commands == 0 {
+        return None;
+    }
+
+    let mut families = Vec::new();
+    for family in &run.tool_families {
+        if classify_tool_name_activity(family) == ToolRunActivity::Command
+            && !families.iter().any(|existing| existing == family)
+        {
+            families.push(family.as_str());
+        }
+    }
+
+    (!families.is_empty()).then(|| families.join(", "))
+}
+
+fn counted(count: usize, singular: &str, plural: &str) -> String {
+    let noun = if count == 1 { singular } else { plural };
+    format!("{count} {noun}")
+}
+
+fn sentence_case_activity(text: String) -> String {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return text;
     };
-    format!("{} tools ({tools}) · all ok", run.count)
+    let mut out = String::new();
+    out.extend(first.to_uppercase());
+    out.push_str(chars.as_str());
+    out
 }
 
 /// Overall status for a tool execution.
@@ -957,11 +1189,14 @@ impl ExecCell {
                 ));
             } else if self.status == ToolStatus::Running && self.source == ExecSource::Assistant {
                 lines.extend(wrap_plain_line(
-                    "  Ctrl+B opens shell controls.",
+                    "  Ctrl+B backgrounds this command.",
                     Style::default().fg(palette::TEXT_MUTED),
                     width,
                 ));
-            } else if self.status != ToolStatus::Running {
+            } else if self.status != ToolStatus::Running && mode == RenderMode::Transcript {
+                // #3031: Suppress "(no output)" in compact/Live mode;
+                // the success header is enough signal. Transcript still
+                // records it for exports/clipboard/pager.
                 lines.push(Line::from(Span::styled(
                     "  (no output)",
                     Style::default().fg(palette::TEXT_MUTED).italic(),
@@ -970,13 +1205,17 @@ impl ExecCell {
         }
 
         if let Some(duration_ms) = self.duration_ms {
-            let seconds = f64::from(u32::try_from(duration_ms).unwrap_or(u32::MAX)) / 1000.0;
-            lines.extend(render_compact_kv(
-                "time",
-                &format!("{seconds:.2}s"),
-                Style::default().fg(palette::TEXT_DIM),
-                width,
-            ));
+            // #3031: Suppress sub-second timing in compact mode.
+            // Transcript mode always shows exact timing.
+            if mode == RenderMode::Transcript || duration_ms >= 1000 {
+                let seconds = f64::from(u32::try_from(duration_ms).unwrap_or(u32::MAX)) / 1000.0;
+                lines.extend(render_compact_kv(
+                    "time",
+                    &format!("{seconds:.2}s"),
+                    Style::default().fg(palette::TEXT_DIM),
+                    width,
+                ));
+            }
         }
 
         wrap_card_rail(lines)
@@ -1522,6 +1761,10 @@ impl GenericToolCell {
         low_motion: bool,
         mode: RenderMode,
     ) -> Vec<Line<'static>> {
+        if self.name == "activity_group" {
+            return self.render_activity_group(width);
+        }
+
         // Issue #241: when the underlying tool is a checklist/todo update and
         // the output is parseable, render a purpose-built progress card
         // instead of dumping the JSON into the generic tool block.
@@ -1653,6 +1896,15 @@ impl GenericToolCell {
             None,
             low_motion,
         )]
+    }
+
+    fn render_activity_group(&self, width: u16) -> Vec<Line<'static>> {
+        let summary = self.input_summary.as_deref().unwrap_or("Updated metadata");
+        let budget = usize::from(width).max(1);
+        vec![Line::from(Span::styled(
+            truncate_text(summary, budget),
+            Style::default().fg(palette::TEXT_MUTED),
+        ))]
     }
 
     /// If this cell is a checklist/todo write/add/update and the output is
@@ -2377,13 +2629,13 @@ fn render_thinking(
     let mut lines = Vec::new();
 
     // Header: `…` opener (replaces the spinner; reasoning isn't a tool, it's
-    // a slow exhale) followed by the `thinking` label and live status.
+    // a slow exhale) followed by the reasoning label and live status.
     let mut header_spans = vec![
         Span::styled(
             format!("{REASONING_OPENER} "),
             Style::default().fg(thinking_state_accent(state)),
         ),
-        Span::styled("thinking", thinking_title_style()),
+        Span::styled("reasoning", thinking_title_style()),
     ];
     header_spans.push(Span::styled(" ", Style::default()));
     header_spans.push(Span::styled(
@@ -2449,7 +2701,7 @@ fn render_thinking(
 
     if rendered.is_empty() && streaming {
         let mut spans = vec![Span::styled(REASONING_RAIL.to_string(), rail_style)];
-        spans.push(Span::styled("thinking...", body_style.italic()));
+        spans.push(Span::styled("reasoning...", body_style.italic()));
         if !low_motion {
             spans.push(Span::styled(format!(" {REASONING_CURSOR}"), cursor_style));
         }
@@ -2507,7 +2759,7 @@ fn render_hidden_thinking_activity(
             format!("{REASONING_OPENER} "),
             Style::default().fg(thinking_state_accent(state)),
         ),
-        Span::styled("thinking", thinking_title_style()),
+        Span::styled("reasoning", thinking_title_style()),
         Span::styled(" ", Style::default()),
         Span::styled(thinking_status_label(state), thinking_status_style(state)),
     ];
@@ -2840,10 +3092,15 @@ fn render_preserved_output_mode(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if output.trim().is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no output)",
-            Style::default().fg(palette::TEXT_MUTED).italic(),
-        )));
+        // #3031: In compact/Live mode, suppress "(no output)" — the tool
+        // header already carries the success/failure status.  Transcript
+        // mode still records it for exports/clipboard/pager.
+        if mode == RenderMode::Transcript {
+            lines.push(Line::from(Span::styled(
+                "  (no output)",
+                Style::default().fg(palette::TEXT_MUTED).italic(),
+            )));
+        }
         return lines;
     }
 
@@ -3787,6 +4044,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn activity_group_renders_as_single_metadata_line() {
+        let cell = GenericToolCell {
+            name: "activity_group".to_string(),
+            status: ToolStatus::Success,
+            input_summary: Some("Explored 2 files, 1 search".to_string()),
+            output: None,
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        };
+
+        let lines = cell.lines_with_mode(120, true, super::RenderMode::Live);
+        let joined: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(joined, "Explored 2 files, 1 search");
+        assert!(!joined.contains("activity_group"));
+    }
+
     // ---- #409 compact agent_spawn rendering ----
     //
     // The DelegateCard owns live state for spawned sub-agents; the
@@ -4185,7 +4466,26 @@ mod tests {
             .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
             .collect::<String>();
         assert!(text.contains("Full reasoning in Ctrl+O"));
-        assert!(text.contains("thinking"));
+        // Pin the actual header shape ("… reasoning done") — a bare
+        // `contains("reasoning")` is already satisfied by the Ctrl+O
+        // affordance line above and would never fail on its own.
+        let header = lines
+            .first()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        assert!(
+            header.starts_with(REASONING_OPENER),
+            "header opens with the dotted opener: {header:?}"
+        );
+        assert!(
+            header.contains("reasoning done"),
+            "header carries the reasoning title and done status: {header:?}"
+        );
     }
 
     #[test]
@@ -5075,7 +5375,7 @@ mod tests {
 
         assert!(text.contains("running line 1"));
         assert!(text.contains("running line 2"));
-        assert!(!text.contains("Ctrl+B opens shell controls"));
+        assert!(!text.contains("Ctrl+B backgrounds this command"));
     }
 
     #[test]
@@ -5702,6 +6002,8 @@ mod tests {
             runs[0].tool_families,
             vec!["read_file", "list_dir", "web_search"]
         );
+        assert_eq!(runs[0].activity.files, 2);
+        assert_eq!(runs[0].activity.searches, 1);
     }
 
     #[test]
@@ -5749,18 +6051,82 @@ mod tests {
     }
 
     #[test]
+    fn detect_tool_runs_summarizes_safe_command_tools() {
+        let history = vec![
+            success_generic_tool("run_tests"),
+            success_generic_tool("run_verifiers"),
+            success_generic_tool("validate_data"),
+        ];
+
+        let runs = super::detect_tool_runs(&history, 3);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].start, 0);
+        assert_eq!(runs[0].count, 3);
+        assert_eq!(runs[0].activity.commands, 3);
+        assert_eq!(
+            runs[0].tool_families,
+            vec!["run_tests", "run_verifiers", "validate_data"]
+        );
+        assert_eq!(
+            super::tool_run_summary(&runs[0]),
+            "Ran 3 commands: run_tests, run_verifiers, validate_data"
+        );
+    }
+
+    #[test]
     fn tool_run_summary_reports_compact_success_group() {
         let run = super::ToolRun {
             start: 4,
             count: 5,
             tool_families: vec!["read_file".to_string(), "list_dir".to_string()],
+            activity: super::ToolRunActivitySummary {
+                files: 4,
+                searches: 1,
+                ..Default::default()
+            },
         };
 
         let summary = super::tool_run_summary(&run);
 
-        assert!(summary.contains("5 tools"));
-        assert!(summary.contains("read_file"));
-        assert!(summary.contains("list_dir"));
-        assert!(summary.contains("all ok"));
+        assert_eq!(summary, "Explored 4 files, 1 search");
+    }
+
+    #[test]
+    fn tool_run_summary_lists_only_command_families_for_command_clause() {
+        let run = super::ToolRun {
+            start: 4,
+            count: 4,
+            tool_families: vec![
+                "read_file".to_string(),
+                "run_tests".to_string(),
+                "validate_data".to_string(),
+            ],
+            activity: super::ToolRunActivitySummary {
+                files: 2,
+                commands: 2,
+                ..Default::default()
+            },
+        };
+
+        assert_eq!(
+            super::tool_run_summary(&run),
+            "Explored 2 files, ran 2 commands: run_tests, validate_data"
+        );
+    }
+
+    #[test]
+    fn tool_run_summary_uses_metadata_fallback_for_unknown_groups() {
+        let run = super::ToolRun {
+            start: 4,
+            count: 2,
+            tool_families: vec!["session_sync".to_string()],
+            activity: super::ToolRunActivitySummary {
+                other: 2,
+                ..Default::default()
+            },
+        };
+
+        assert_eq!(super::tool_run_summary(&run), "Updated metadata");
     }
 }

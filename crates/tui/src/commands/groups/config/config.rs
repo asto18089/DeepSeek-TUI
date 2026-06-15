@@ -247,7 +247,11 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
                 .default_model
                 .unwrap_or_else(|| "(default)".to_string())
         }),
-        "reasoning_effort" | "effort" => Some(app.reasoning_effort.as_setting().to_string()),
+        "reasoning_effort" | "effort" => Some(
+            app.reasoning_effort
+                .as_setting_for_provider(app.api_provider)
+                .to_string(),
+        ),
         "prefer_external_pdftotext" | "external_pdftotext" | "pdftotext" => Settings::load()
             .ok()
             .map(|settings| settings.prefer_external_pdftotext.to_string()),
@@ -654,6 +658,7 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
     if let Err(e) = settings.set(&key, value) {
         return CommandResult::error(format!("{e}"));
     }
+    settings.apply_env_overrides();
 
     let mut action = None;
     match key.as_str() {
@@ -791,7 +796,9 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                 settings
                     .reasoning_effort
                     .as_deref()
-                    .map_or_else(ReasoningEffort::default, ReasoningEffort::from_setting)
+                    .map_or_else(ReasoningEffort::default, |value| {
+                        ReasoningEffort::from_setting_for_provider(value, app.api_provider)
+                    })
             };
             app.last_effective_reasoning_effort = None;
             app.update_model_compaction_budget();
@@ -820,11 +827,17 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             .background_color
             .clone()
             .unwrap_or_else(|| "default".to_string()),
-        "reasoning_effort" | "effort" => settings
-            .reasoning_effort
-            .clone()
-            .unwrap_or_else(|| "config/default".to_string()),
+        "reasoning_effort" | "effort" => settings.reasoning_effort.as_deref().map_or_else(
+            || "config/default".to_string(),
+            |value| {
+                ReasoningEffort::from_setting_for_provider(value, app.api_provider)
+                    .as_setting_for_provider(app.api_provider)
+                    .to_string()
+            },
+        ),
         "composer_vim_mode" | "vim_mode" | "vim" => settings.composer_vim_mode.clone(),
+        "low_motion" | "motion" => settings.low_motion.to_string(),
+        "fancy_animations" | "fancy" | "animations" => settings.fancy_animations.to_string(),
         _ => value.to_string(),
     };
 
@@ -1356,6 +1369,73 @@ mod tests {
     }
 
     #[test]
+    fn config_reasoning_effort_uses_codex_provider_labels() {
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-codex-effort-config-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let mut app = create_test_app();
+        app.api_provider = ApiProvider::OpenaiCodex;
+        app.reasoning_effort = ReasoningEffort::High;
+
+        let result = set_config_value(&mut app, "reasoning_effort", "off", false);
+
+        assert_eq!(app.reasoning_effort, ReasoningEffort::Low);
+        assert_eq!(
+            result.message.as_deref(),
+            Some("reasoning_effort = low (session only, add --save to persist)")
+        );
+
+        let result = set_config_value(&mut app, "reasoning_effort", "xhigh", false);
+
+        assert_eq!(app.reasoning_effort, ReasoningEffort::Max);
+        assert_eq!(
+            result.message.as_deref(),
+            Some("reasoning_effort = xhigh (session only, add --save to persist)")
+        );
+    }
+
+    #[test]
+    fn config_fancy_animations_obeys_ghostty_override() {
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-ghostty-fancy-config-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let prev_term_program = env::var_os("TERM_PROGRAM");
+        // Safety: test-only environment mutation guarded by EnvGuard's lock.
+        unsafe {
+            env::set_var("TERM_PROGRAM", "Ghostty");
+        }
+
+        let mut app = create_test_app();
+        assert!(!app.fancy_animations);
+
+        let result = set_config_value(&mut app, "fancy_animations", "true", false);
+
+        assert!(!result.is_error);
+        assert!(
+            !app.fancy_animations,
+            "Ghostty compatibility override must keep the water strip disabled"
+        );
+        assert_eq!(
+            result.message.as_deref(),
+            Some("fancy_animations = false (session only, add --save to persist)")
+        );
+
+        // Safety: cleanup under EnvGuard's lock.
+        unsafe {
+            match prev_term_program {
+                Some(v) => env::set_var("TERM_PROGRAM", v),
+                None => env::remove_var("TERM_PROGRAM"),
+            }
+        }
+    }
+
+    #[test]
     fn config_model_accepts_future_deepseek_model_id() {
         let mut app = create_test_app();
         let result = config_command(&mut app, Some("model deepseek-v4"));
@@ -1477,10 +1557,12 @@ mod tests {
     #[test]
     fn config_command_provider_rejects_unknown_provider() {
         let mut app = create_test_app();
-        let result = config_command(&mut app, Some("provider anthropic"));
+        // "anthropic" became a real provider in #3014; probe with an id that
+        // stays unknown.
+        let result = config_command(&mut app, Some("provider not-a-provider"));
         assert!(result.is_error);
         let msg = result.message.unwrap();
-        assert!(msg.contains("Unknown provider 'anthropic'"));
+        assert!(msg.contains("Unknown provider 'not-a-provider'"));
         assert!(msg.contains("openrouter"));
         assert!(msg.contains("xiaomi-mimo"));
     }

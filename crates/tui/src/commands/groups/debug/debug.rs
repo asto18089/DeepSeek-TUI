@@ -129,9 +129,25 @@ pub fn system_prompt(app: &mut App) -> CommandResult {
     ))
 }
 
-/// Show context window usage
-pub fn context(_app: &mut App) -> CommandResult {
-    CommandResult::action(AppAction::OpenContextInspector)
+/// Show context window usage.
+///
+/// `/context` keeps opening the interactive inspector. `/context report`,
+/// `/context json`, and `/context summary` expose the diagnostic source map
+/// from #3143 without replacing the inspector surface.
+pub fn context(app: &mut App, arg: Option<&str>) -> CommandResult {
+    let Some(subcommand) = arg.map(str::trim).filter(|arg| !arg.is_empty()) else {
+        return CommandResult::action(AppAction::OpenContextInspector);
+    };
+
+    let report = crate::context_report::build_context_report(app);
+    match subcommand {
+        "report" => CommandResult::message(crate::context_report::format_context_report(&report)),
+        "json" => CommandResult::message(crate::context_report::context_report_json(&report)),
+        "summary" => CommandResult::message(crate::context_report::format_context_summary(&report)),
+        other => CommandResult::error(format!(
+            "Unknown /context subcommand: {other}. Use report, json, or summary."
+        )),
+    }
 }
 
 /// Show per-turn DeepSeek prefix-cache telemetry for the last N turns (#263).
@@ -176,10 +192,12 @@ fn format_cache_inspect(app: &mut App, verbose: bool, json_mode: bool) -> String
 
     let reasoning_effort = if app.reasoning_effort == crate::tui::app::ReasoningEffort::Auto {
         app.last_effective_reasoning_effort
-            .and_then(crate::tui::app::ReasoningEffort::api_value)
+            .and_then(|effort| effort.api_value_for_provider(app.api_provider))
             .map(str::to_string)
     } else {
-        app.reasoning_effort.api_value().map(str::to_string)
+        app.reasoning_effort
+            .api_value_for_provider(app.api_provider)
+            .map(str::to_string)
     };
     let request = MessageRequest {
         model: app.model.clone(),
@@ -1422,12 +1440,40 @@ mod tests {
             content: "Hello".to_string(),
         });
 
-        let result = context(&mut app);
+        let result = context(&mut app, None);
         assert!(matches!(
             result.action,
             Some(AppAction::OpenContextInspector)
         ));
         assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn test_context_report_subcommands_return_source_map() {
+        let mut app = create_test_app();
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "Hello".to_string(),
+                cache_control: None,
+            }],
+        });
+        app.session.last_tool_catalog = Some(vec![test_tool("read_file")]);
+
+        let report = context(&mut app, Some("report"))
+            .message
+            .expect("report text");
+        assert!(report.contains("Context Source Map"));
+        assert!(report.contains("Tool schemas"));
+
+        let summary = context(&mut app, Some("summary"))
+            .message
+            .expect("summary text");
+        assert!(summary.contains("Context Summary"));
+
+        let json = context(&mut app, Some("json")).message.expect("json text");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid context json");
+        assert!(!parsed["entries"].as_array().unwrap().is_empty());
     }
 
     #[test]

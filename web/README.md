@@ -94,7 +94,7 @@ web/
 
 "Yamen tech": Qing memorial document × WeChat news feed × Bloomberg terminal.
 
-- **Palette**: cream paper `#FAF6EE`, ink `#0A2540`, cinnabar red `#C8102E`, aged gold, jade green, cobalt blue.
+- **Palette**: white paper `#FFFFFF`, cool gray `#F4F6FB`, ink `#0E0E10`, indigo `#4D6BFE`, jade green, cobalt blue.
 - **Type**: Fraunces (display), IBM Plex Sans (body), JetBrains Mono (UI/code), Noto Serif SC (decorative CJK anchors).
 - **Structure**: hairline 1px dividers, multi-column grids, big tabular numbers, surgical use of red for "hot" markers, decorative Chinese-seal squares as section anchors.
 

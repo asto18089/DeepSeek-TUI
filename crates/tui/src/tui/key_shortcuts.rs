@@ -9,6 +9,18 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+pub(super) fn has_control_like_modifier(modifiers: KeyModifiers) -> bool {
+    has_control_like_modifier_for_platform(modifiers, cfg!(target_os = "macos"))
+}
+
+pub(super) fn has_control_like_modifier_for_platform(
+    modifiers: KeyModifiers,
+    is_macos: bool,
+) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL)
+        || (is_macos && modifiers.contains(KeyModifiers::SUPER))
+}
+
 /// Copy-to-clipboard: `Cmd+C` on macOS or `Ctrl+Shift+C` elsewhere.
 pub(super) fn is_copy_shortcut(key: &KeyEvent) -> bool {
     let is_c = matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));

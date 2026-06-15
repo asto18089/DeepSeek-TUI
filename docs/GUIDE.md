@@ -404,8 +404,9 @@ work. Read the local guidance before editing, and keep any contribution within
 the repository's conventions.
 
 Next: see [SKILL_INVOCATION_DESIGN.md](SKILL_INVOCATION_DESIGN.md) for skill
-activation behavior and [CONFIGURATION.md](CONFIGURATION.md) for config paths
-and project authority.
+activation behavior, [CLAUDE_PLUGIN_COMPAT.md](CLAUDE_PLUGIN_COMPAT.md) for
+Claude Code skill/plugin compatibility, and [CONFIGURATION.md](CONFIGURATION.md)
+for config paths and project authority.
 
 ## 10. Getting Help
 

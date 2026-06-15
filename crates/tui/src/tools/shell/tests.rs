@@ -149,6 +149,58 @@ fn wait_for_completed_shell(manager: &mut ShellManager, task_id: &str) -> ShellR
 }
 
 #[test]
+fn exec_shell_parallel_flags_are_input_aware() {
+    let tool = ExecShellTool;
+    let readonly = json!({"command": "git status -s"});
+    assert!(tool.supports_parallel_for(&readonly));
+    assert!(tool.is_read_only_for(&readonly));
+    assert_eq!(
+        tool.approval_requirement_for(&readonly),
+        ApprovalRequirement::Auto
+    );
+
+    let bash_readonly = json!({"command": "bash -lc 'rg TODO crates/tui/src/tools'"});
+    assert!(tool.supports_parallel_for(&bash_readonly));
+    assert!(tool.is_read_only_for(&bash_readonly));
+    assert_eq!(
+        tool.approval_requirement_for(&bash_readonly),
+        ApprovalRequirement::Auto
+    );
+
+    for input in [
+        json!({"command": "git status -s", "background": true}),
+        json!({"command": "git status -s", "stdin": ""}),
+        json!({"command": "cargo build"}),
+        json!({"command": "bash -lc 'rg TODO crates | head'"}),
+    ] {
+        assert!(!tool.supports_parallel_for(&input), "{input:?}");
+        assert!(!tool.is_read_only_for(&input), "{input:?}");
+        assert_eq!(
+            tool.approval_requirement_for(&input),
+            ApprovalRequirement::Required,
+            "{input:?}"
+        );
+    }
+
+    assert!(tool.starts_detached_for(&json!({
+        "command": "cargo check --workspace",
+        "background": true
+    })));
+    assert!(tool.starts_detached_for(&json!({
+        "command": "cargo test -p codewhale-tui --bins",
+        "tty": true
+    })));
+    assert!(!tool.starts_detached_for(&json!({
+        "command": "cargo check --workspace"
+    })));
+    assert!(!tool.starts_detached_for(&json!({
+        "command": "cargo check --workspace",
+        "background": true,
+        "interactive": true
+    })));
+}
+
+#[test]
 #[cfg(unix)]
 fn shell_execution_scrubs_parent_env_and_keeps_explicit_env() {
     let _guard = env_lock().lock().expect("env lock");

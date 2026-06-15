@@ -11,9 +11,10 @@ Bindings are not (yet) user-configurable — tracked for a future release (#436,
 | `F1` or `Ctrl-/`     | Toggle the help overlay                                       |
 | `Ctrl-K`             | Open the command palette (slash-command finder)                |
 | `Ctrl-C`             | Cancel current turn / dismiss modal / arm-then-confirm quit    |
+| `Ctrl-B`             | Background the running foreground shell command (turn continues; the command becomes a `/jobs` background job) |
 | `Ctrl-D`             | Quit (only when the composer is empty)                         |
 | `Tab`                | Cycle TUI mode: Plan → Agent → YOLO → Plan                     |
-| `Shift-Tab`          | Cycle reasoning effort: off → high → max → off                 |
+| `Shift-Tab`          | Cycle reasoning effort for the active provider. DeepSeek-style providers cycle off → high → max → off; OpenAI Codex cycles low → medium → high → xhigh → low. |
 | `Ctrl-R`             | Open the resume-session picker                                 |
 | `Ctrl-L`             | Refresh / clear the screen                                     |
 | `Ctrl-O`             | Open Activity Detail for selected/live/recent tool work, or the full reasoning timeline for thinking blocks when the composer is empty |
@@ -79,11 +80,11 @@ When `[memory] enabled = true`, typing `# foo` and pressing `Enter` appends `foo
 
 ## Slash-command palette (after `Ctrl-K` or typing `/`)
 
-| Chord                | Action                                              |
-|----------------------|-----------------------------------------------------|
-| `↑` / `↓`            | Move selection                                     |
-| `Enter` / `Tab`      | Run / complete the highlighted command             |
-| `Esc`                | Dismiss palette                                     |
+| Chord                          | Action                                              |
+|--------------------------------|-----------------------------------------------------|
+| `↑` / `↓` / `Ctrl+P` / `Ctrl+N`| Move selection                                     |
+| `Enter` / `Tab`                | Run / complete the highlighted command             |
+| `Esc`                          | Dismiss palette                                     |
 
 ## Session Picker (`Ctrl-R` or `/sessions`)
 

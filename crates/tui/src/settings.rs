@@ -456,18 +456,23 @@ impl Settings {
             self.low_motion = true;
             self.fancy_animations = false;
         }
-        // VS Code (TERM_PROGRAM=vscode, #1356), Ghostty (TERM_PROGRAM=ghostty,
-        // #1445), and a few VTE terminals (#1470) produce visible flicker at
-        // 120 FPS. Drop to the 30 FPS low-motion cap for them automatically.
+        // VS Code (TERM_PROGRAM=vscode, #1356), Ghostty (#1445), and a few
+        // VTE terminals (#1470) produce visible flicker at 120 FPS. Drop to
+        // the 30 FPS low-motion cap for them automatically. Ghostty may report
+        // either TERM_PROGRAM=Ghostty/ghostty or TERM=xterm-ghostty.
         // Like NO_ANIMATIONS above, this unconditionally overrides any
         // disk-loaded value — consistent precedence: env signals always win.
+        let term_program = std::env::var("TERM_PROGRAM")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let term = std::env::var("TERM")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let term_forces_low_motion =
+            matches!(term_program.as_str(), "vscode" | "ghostty") || term.contains("ghostty");
         let vte_env_forces_low_motion = std::env::var_os("TILIX_ID").is_some_and(|v| !v.is_empty())
             || std::env::var_os("TERMINATOR_UUID").is_some_and(|v| !v.is_empty());
-        if matches!(
-            std::env::var("TERM_PROGRAM").as_deref(),
-            Ok("vscode") | Ok("ghostty")
-        ) || vte_env_forces_low_motion
-        {
+        if term_forces_low_motion || vte_env_forces_low_motion {
             self.low_motion = true;
             self.fancy_animations = false;
         }
@@ -1111,10 +1116,10 @@ fn normalize_reasoning_effort_setting(value: &str) -> Result<Option<String>> {
         "medium" | "mid" => "medium",
         "high" => "high",
         "auto" | "automatic" => "auto",
-        "max" | "maximum" | "xhigh" => "max",
+        "max" | "maximum" | "xhigh" | "ultracode" => "max",
         _ => {
             anyhow::bail!(
-                "Failed to update setting: invalid reasoning_effort '{value}'. Expected: auto, off, low, medium, high, max, or default."
+                "Failed to update setting: invalid reasoning_effort '{value}'. Expected: auto, off, low, medium, high, max, xhigh, ultracode, or default."
             );
         }
     };
@@ -1382,6 +1387,10 @@ mod tests {
         settings
             .set("reasoning_effort", "xhigh")
             .expect("normalize xhigh");
+        assert_eq!(settings.reasoning_effort.as_deref(), Some("max"));
+        settings
+            .set("reasoning_effort", "ultracode")
+            .expect("normalize ultracode");
         assert_eq!(settings.reasoning_effort.as_deref(), Some("max"));
         settings
             .set("reasoning_effort", "default")
@@ -1673,6 +1682,7 @@ mod tests {
         let prev_tmux = std::env::var_os("TMUX");
         let prev_sty = std::env::var_os("STY");
         let prev_term_program = std::env::var_os("TERM_PROGRAM");
+        let prev_term = std::env::var_os("TERM");
         let prev_ssh_client = std::env::var_os("SSH_CLIENT");
         let prev_ssh_tty = std::env::var_os("SSH_TTY");
         let prev_tilix_id = std::env::var_os("TILIX_ID");
@@ -1690,6 +1700,7 @@ mod tests {
             std::env::remove_var("TMUX");
             std::env::remove_var("STY");
             std::env::remove_var("TERM_PROGRAM");
+            std::env::remove_var("TERM");
             std::env::remove_var("SSH_CLIENT");
             std::env::remove_var("SSH_TTY");
             std::env::remove_var("TILIX_ID");
@@ -1735,6 +1746,10 @@ mod tests {
             match prev_term_program {
                 Some(v) => std::env::set_var("TERM_PROGRAM", v),
                 None => std::env::remove_var("TERM_PROGRAM"),
+            }
+            match prev_term {
+                Some(v) => std::env::set_var("TERM", v),
+                None => std::env::remove_var("TERM"),
             }
             match prev_ssh_client {
                 Some(v) => std::env::set_var("SSH_CLIENT", v),
@@ -1799,18 +1814,18 @@ mod tests {
         let prev = std::env::var_os("TERM_PROGRAM");
         // SAFETY: serialised by the guard.
         unsafe {
-            std::env::set_var("TERM_PROGRAM", "ghostty");
+            std::env::set_var("TERM_PROGRAM", "Ghostty");
         }
         let mut settings = Settings::default();
         assert!(!settings.low_motion, "default is animated");
         settings.apply_env_overrides();
         assert!(
             settings.low_motion,
-            "TERM_PROGRAM=ghostty must enable low_motion to prevent flickering (#1445)"
+            "TERM_PROGRAM=Ghostty must enable low_motion to prevent flickering (#1445)"
         );
         assert!(
             !settings.fancy_animations,
-            "TERM_PROGRAM=ghostty must disable fancy_animations"
+            "TERM_PROGRAM=Ghostty must disable fancy_animations"
         );
         // SAFETY: cleanup under the guard.
         unsafe {
@@ -1822,9 +1837,43 @@ mod tests {
     }
 
     #[test]
+    fn ghostty_term_fallback_forces_low_motion_on() {
+        let _g = term_program_test_guard();
+        let prev_program = std::env::var_os("TERM_PROGRAM");
+        let prev_term = std::env::var_os("TERM");
+        // SAFETY: serialised by the guard.
+        unsafe {
+            std::env::remove_var("TERM_PROGRAM");
+            std::env::set_var("TERM", "xterm-ghostty");
+        }
+        let mut settings = Settings::default();
+        settings.apply_env_overrides();
+        assert!(
+            settings.low_motion,
+            "TERM=xterm-ghostty must enable low_motion when TERM_PROGRAM is absent"
+        );
+        assert!(
+            !settings.fancy_animations,
+            "TERM=xterm-ghostty must disable fancy_animations"
+        );
+        // SAFETY: cleanup under the guard.
+        unsafe {
+            match prev_program {
+                Some(v) => std::env::set_var("TERM_PROGRAM", v),
+                None => std::env::remove_var("TERM_PROGRAM"),
+            }
+            match prev_term {
+                Some(v) => std::env::set_var("TERM", v),
+                None => std::env::remove_var("TERM"),
+            }
+        }
+    }
+
+    #[test]
     fn non_vscode_term_program_does_not_force_low_motion() {
         let _g = term_program_test_guard();
         let prev = std::env::var_os("TERM_PROGRAM");
+        let prev_term = std::env::var_os("TERM");
         let prev_ssh_client = std::env::var_os("SSH_CLIENT");
         let prev_ssh_tty = std::env::var_os("SSH_TTY");
         let prev_tilix_id = std::env::var_os("TILIX_ID");
@@ -1838,6 +1887,7 @@ mod tests {
         unsafe {
             std::env::remove_var("SSH_CLIENT");
             std::env::remove_var("SSH_TTY");
+            std::env::remove_var("TERM");
             std::env::remove_var("TILIX_ID");
             std::env::remove_var("TERMINATOR_UUID");
             std::env::remove_var("TMUX");
@@ -1860,6 +1910,10 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("TERM_PROGRAM", v),
                 None => std::env::remove_var("TERM_PROGRAM"),
+            }
+            match prev_term {
+                Some(v) => std::env::set_var("TERM", v),
+                None => std::env::remove_var("TERM"),
             }
             if let Some(v) = prev_ssh_client {
                 std::env::set_var("SSH_CLIENT", v);

@@ -43,7 +43,7 @@ use crate::commands;
 use crate::compaction::estimate_input_tokens_conservative;
 use crate::config::{
     ApiProvider, Config, DEFAULT_NVIDIA_NIM_BASE_URL, ProviderConfig, ProvidersConfig, StatusItem,
-    UpdateConfig, save_provider_auth_mode_for,
+    UpdateConfig, provider_capability, save_provider_auth_mode_for,
 };
 use crate::config_ui::{self, ConfigUiMode, WebConfigSession, WebConfigSessionEvent};
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
@@ -52,9 +52,7 @@ use crate::core::ops::{Op, USER_SHELL_TOOL_ID_PREFIX};
 use crate::hooks::{HookEvent, HookExecutor, TurnEndPayloadInput, TurnEndTotals};
 use crate::llm_client::LlmClient;
 use crate::localization::{MessageId, tr};
-use crate::models::{
-    ContentBlock, Message, MessageRequest, SystemPrompt, Usage, context_window_for_model,
-};
+use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt, Usage};
 use crate::palette;
 use crate::prompts;
 use crate::session_manager::{
@@ -65,10 +63,10 @@ use crate::settings::Settings;
 use crate::task_manager::{
     NewTaskRequest, SharedTaskManager, TaskManager, TaskManagerConfig, TaskStatus, TaskSummary,
 };
+use crate::tools::goal::{GoalSnapshot, GoalStatus};
 use crate::tools::shell::{ShellJobSnapshot, ShellStatus};
 use crate::tools::spec::{RuntimeToolServices, ToolResult};
 use crate::tools::subagent::SubAgentStatus;
-use crate::tui::app::HuntVerdict;
 use crate::tui::auto_router;
 use crate::tui::color_compat::ColorCompatBackend;
 use crate::tui::command_palette::{
@@ -82,6 +80,7 @@ use crate::tui::footer_ui::{
     friendly_subagent_progress, is_noisy_subagent_progress, one_line_summary, render_footer,
 };
 use crate::tui::format_helpers;
+use crate::tui::hotbar::actions::HotbarDispatch;
 use crate::tui::key_shortcuts;
 use crate::tui::live_transcript::LiveTranscriptOverlay;
 use crate::tui::mcp_routing::{add_mcp_message, open_mcp_manager_pager};
@@ -119,9 +118,9 @@ use crate::tui::workspace_context;
 use super::key_actions;
 
 use super::app::{
-    App, AppAction, AppMode, OnboardingState, PendingProviderSwitch, QueuedMessage,
-    ReasoningEffort, SidebarFocus, StatusToastLevel, SubmitDisposition, TaskPanelEntry, TuiOptions,
-    looks_like_slash_command_input, shell_command_from_bang_input,
+    App, AppAction, AppMode, HuntVerdict, OnboardingState, PendingProviderSwitch, QueuedMessage,
+    ReasoningEffort, SidebarFocus, StatusToastLevel, SubmitDisposition, TaskPanelEntry,
+    TaskPanelEntryKind, TuiOptions, looks_like_slash_command_input, shell_command_from_bang_input,
 };
 use super::approval::{
     ApprovalMode, ApprovalRequest, ApprovalView, ElevationRequest, ElevationView, ReviewDecision,
@@ -134,7 +133,7 @@ use super::slash_menu::{
     apply_slash_menu_selection, partial_inline_skill_mention_at_cursor,
     try_autocomplete_slash_command, visible_slash_menu_entries,
 };
-use super::views::{ConfigView, HelpView, ModalKind, ShellControlView, ViewEvent};
+use super::views::{ConfigView, ContextMenuAction, HelpView, ModalKind, ViewEvent};
 use super::widgets::pending_input_preview::{ContextPreviewItem, PendingInputPreview};
 use super::widgets::{ChatWidget, ComposerWidget, HeaderData, HeaderWidget, Renderable};
 
@@ -874,6 +873,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         project_context_pack_enabled: config.project_context_pack_enabled(),
         translation_enabled: app.translation_enabled,
         show_thinking: app.show_thinking,
+        verbosity: app.verbosity.clone(),
         // Effectively unlimited. V4 has a 1M context window and the user
         // wants the model running until it's actually done. The previous cap
         // of 100 hit the ceiling on long multi-step plans (wide refactors,
@@ -884,18 +884,20 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         // human-noticeable; we trust the operator over a hard step cap.
         max_steps: u32::MAX,
         max_subagents: app.max_subagents,
+        interactive_launch_limit: config.interactive_launch_limit(),
         features: config.features(),
         compaction: app.compaction_config(),
         capacity: crate::core::capacity::CapacityControllerConfig::from_app_config(config),
         todos: app.todos.clone(),
         plan_state: app.plan_state.clone(),
-        goal_state: crate::tools::goal::new_shared_goal_state_from_host(
+        goal_state: crate::tools::goal::new_shared_goal_state_from_host_status(
             app.hunt.quarry.clone(),
             app.hunt.token_budget,
-            app.hunt.verdict == HuntVerdict::Hunted,
+            app.hunt.verdict.goal_status(),
         ),
         max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
         allowed_tools: app.active_allowed_tools.clone(),
+        disallowed_tools: None,
         hook_executor: app.runtime_services.hook_executor.clone(),
         network_policy: config.network.clone().map(|toml_cfg| {
             crate::network_policy::NetworkPolicyDecider::with_default_audit(toml_cfg.into_runtime())
@@ -921,6 +923,8 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         vision_config: config.vision_model_config(),
         strict_tool_mode: config.strict_tool_mode.unwrap_or(false),
         goal_objective: app.hunt.quarry.clone(),
+        goal_token_budget: app.hunt.token_budget,
+        goal_status: app.hunt.verdict.goal_status(),
         locale_tag: app.ui_locale.tag().to_string(),
         workshop: config.workshop.clone(),
         search_provider: config.search_provider(),
@@ -1010,6 +1014,7 @@ async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManag
                 status: "running".to_string(),
                 prompt_summary: format!("shell: {}", job.command),
                 duration_ms: Some(job.elapsed_ms),
+                kind: TaskPanelEntryKind::Background,
             });
         }
     }
@@ -1120,6 +1125,7 @@ fn active_reasoning_task_entries(app: &App) -> Vec<TaskPanelEntry> {
                 status: "running".to_string(),
                 prompt_summary: "model reasoning".to_string(),
                 duration_ms,
+                kind: TaskPanelEntryKind::ModelReasoning,
             }),
             _ => None,
         })
@@ -1158,6 +1164,7 @@ fn active_rlm_task_entries(app: &App) -> Vec<TaskPanelEntry> {
                 status: "running".to_string(),
                 prompt_summary: format!("RLM: {summary}"),
                 duration_ms,
+                kind: TaskPanelEntryKind::Background,
             })
         })
         .collect()
@@ -1418,6 +1425,7 @@ async fn run_event_loop(
         let mut transcript_batch_updated = false;
         let mut queued_to_send: Option<QueuedMessage> = None;
         let mut respawn_after_provider_rollback: Option<String> = None;
+        let mut fallback_after_engine_error: Option<ApiProvider> = None;
         {
             let mut rx = engine_handle.rx_event.write().await;
             loop {
@@ -1432,6 +1440,11 @@ async fn run_event_loop(
                         break;
                     }
                 };
+                // #3033: remember whether an EARLIER event in this drain batch
+                // already requested a redraw. The AgentProgress throttle below
+                // may opt the current event out of repainting, but it must not
+                // cancel redraws owed to other events in the same batch.
+                let redraw_requested_before_event = received_engine_event;
                 received_engine_event = true;
                 if app.suppress_stream_events_until_turn_complete {
                     if matches!(event, EngineEvent::TurnStarted { .. }) {
@@ -1781,6 +1794,7 @@ async fn run_event_loop(
                         let now = Instant::now();
                         app.turn_started_at = Some(now);
                         app.turn_last_activity_at = Some(now);
+                        app.provider_wait_incident_logged = false;
                         // Discoverability hint for users who don't know how
                         // to interrupt a long-running turn (#1367). Only
                         // surface when the status_message slot is empty so
@@ -1793,6 +1807,7 @@ async fn run_event_loop(
                         }
                         app.runtime_turn_id = Some(turn_id);
                         app.runtime_turn_status = Some("in_progress".to_string());
+                        app.turn_counter = app.turn_counter.saturating_add(1);
                         app.reasoning_buffer.clear();
                         app.reasoning_header = None;
                         app.last_reasoning = None;
@@ -2140,12 +2155,16 @@ async fn run_event_loop(
                         envelope,
                         recoverable: _,
                     } => {
+                        let provider_before_error = app.api_provider;
                         let rollback_after_auth_failure =
                             matches!(
                                 envelope.category,
                                 crate::error_taxonomy::ErrorCategory::Authentication
                             ) && app.pending_provider_switch.is_some();
                         apply_engine_error_to_app(app, envelope);
+                        if app.api_provider != provider_before_error && app.is_fallback_active() {
+                            fallback_after_engine_error = Some(provider_before_error);
+                        }
                         if rollback_after_auth_failure
                             && let Some(rollback_warning) =
                                 rollback_provider_after_auth_failure(app, config)
@@ -2155,6 +2174,11 @@ async fn run_event_loop(
                     }
                     EngineEvent::Status { message } => {
                         app.status_message = Some(message);
+                    }
+                    EngineEvent::GoalUpdated { snapshot } => {
+                        if apply_goal_snapshot_to_app(app, &snapshot) {
+                            transcript_batch_updated = true;
+                        }
                     }
                     EngineEvent::SessionUpdated {
                         session_id,
@@ -2303,8 +2327,10 @@ async fn run_event_loop(
                         if app.agent_activity_started_at.is_none() {
                             app.agent_activity_started_at = Some(Instant::now());
                         }
-                        app.status_message =
-                            Some(format!("Sub-agent {id} starting: {prompt_summary}"));
+                        // #3030: Assign a stable user-facing label for this
+                        // agent and keep the raw id out of the status bar.
+                        let label = app.ensure_agent_label(&id);
+                        app.status_message = Some(format!("{label} starting: {prompt_summary}"));
                         let _ = engine_handle.send(Op::ListSubAgents).await;
                     }
                     EngineEvent::AgentProgress { id, status } => {
@@ -2319,7 +2345,27 @@ async fn run_event_loop(
                         if app.agent_activity_started_at.is_none() {
                             app.agent_activity_started_at = Some(Instant::now());
                         }
-                        app.status_message = Some(format!("Sub-agent {id}: {display}"));
+                        // #3030: progress can arrive before AgentSpawned is
+                        // observed — assign the stable label on first sight.
+                        let label = app.ensure_agent_label(&id);
+                        app.status_message = Some(format!("{label}: {display}"));
+                        // #3033: Throttle redraws from rapid AgentProgress events.
+                        // When 4+ sub-agents are running concurrently, each firing
+                        // progress events, the per-event `needs_redraw = true` saturates
+                        // the render loop and starves terminal input.  Limit
+                        // progress-driven repaints to at most one per 100ms; the
+                        // status-animation timer (80ms cadence) provides a guaranteed
+                        // floor for sidebar updates.  Data is still recorded immediately;
+                        // the sidebar picks it up on the next permitted redraw.
+                        if !agent_progress_redraw_permitted(
+                            &mut app.last_agent_progress_redraw,
+                            Instant::now(),
+                        ) {
+                            // Restore the pre-event accumulator value: a
+                            // throttled progress event contributes no redraw of
+                            // its own, but earlier events' redraws survive.
+                            received_engine_event = redraw_requested_before_event;
+                        }
                     }
                     EngineEvent::AgentComplete { id, result, .. } => {
                         execute_subagent_observer_hook(
@@ -2341,8 +2387,10 @@ async fn run_event_loop(
                                         && matches!(agent.status, SubAgentStatus::Running)
                                 });
                         app.agent_progress.remove(&id);
+                        // #3030: stable label with raw-id fallback.
+                        let label = app.agent_display_label(&id);
                         app.status_message = Some(format!(
-                            "Sub-agent {id} completed: {}",
+                            "{label} completed: {}",
                             summarize_tool_output(&result)
                         ));
                         let should_recapture_terminal =
@@ -2353,6 +2401,7 @@ async fn run_event_loop(
                         {
                             let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
                             let msg = notifications::subagent_completion_message(
+                                app.ui_locale,
                                 &id,
                                 &result,
                                 include_summary,
@@ -2556,7 +2605,8 @@ async fn run_event_loop(
                                 blocked_network,
                                 blocked_write,
                             );
-                            app.view_stack.push(ElevationView::new(request));
+                            app.view_stack
+                                .push(ElevationView::new(request, app.ui_locale));
                             if let Some((method, _, _)) =
                                 crate::tui::notifications::settings(config)
                             {
@@ -2575,6 +2625,10 @@ async fn run_event_loop(
                     }
                 }
             }
+        }
+        if let Some(previous_provider) = fallback_after_engine_error {
+            apply_provider_fallback_switch(app, &mut engine_handle, config, previous_provider)
+                .await;
         }
         if let Some(rollback_warning) = respawn_after_provider_rollback {
             let _ = engine_handle.send(Op::Shutdown).await;
@@ -2724,6 +2778,7 @@ async fn run_event_loop(
         // window. Triggers a redraw if the prompt was visible.
         app.tick_quit_armed();
         app.tick_receipt();
+        crate::tui::footer_ui::maybe_log_provider_wait_incident(app);
         // While the user is drag-selecting past the transcript edge, advance
         // the viewport on a fixed cadence and extend the selection head so a
         // long passage can be selected in one drag (#1163).
@@ -2893,6 +2948,17 @@ async fn run_event_loop(
                     }
                 }
 
+                if final_w == 0 || final_h == 0 {
+                    tracing::debug!(
+                        final_w,
+                        final_h,
+                        "zero-size Resize event ignored while terminal is hidden/minimized"
+                    );
+                    force_terminal_repaint = true;
+                    app.needs_redraw = true;
+                    continue;
+                }
+
                 // #582: commit the event-reported size to ratatui's
                 // viewport explicitly before the redraw, instead of
                 // relying on `crossterm::terminal::size()` which gets
@@ -2963,27 +3029,27 @@ async fn run_event_loop(
                 {
                     return Ok(());
                 }
-                // Persist sidebar width when the user finishes a drag-to-resize.
-                if app.sidebar_width_dirty {
-                    app.sidebar_width_dirty = false;
-                    if let Ok(mut settings) = Settings::load() {
-                        settings.update_sidebar_width(app.sidebar_width_percent);
-                        let _ = settings.save();
-                    }
-                }
+                persist_sidebar_settings_if_dirty(app);
                 continue;
             }
 
             // User interaction — clear the ✅ completion marker from the title.
             crate::tui::notifications::reset_title_on_interaction();
 
-            let Event::Key(key) = evt else {
+            let Event::Key(mut key) = evt else {
                 continue;
             };
 
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+
+            // Normalize macOS modifiers: map SUPER (Cmd) to CONTROL so that
+            // keyboard shortcuts work consistently across terminal emulators
+            // (Terminal.app, iTerm2, Kitty, etc.) that may report different
+            // modifier flags (#2938).
+            let mapped = crate::tui::composer_ui::normalize_macos_modifiers(key.modifiers);
+            key.modifiers = mapped;
 
             // Decision card keyboard routing (v0.8.43 truth-surface).
             // When a card is active, number keys 1-9 select options,
@@ -3158,6 +3224,15 @@ async fn run_event_loop(
                         match onboarding::mark_trusted(&app.workspace) {
                             Ok(_) => {
                                 app.trust_mode = true;
+                                app.hooks = HookExecutor::new(
+                                    crate::hooks::HooksConfig::load_with_project(
+                                        config.hooks_config(),
+                                        &app.workspace,
+                                    ),
+                                    app.workspace.clone(),
+                                );
+                                app.runtime_services.hook_executor =
+                                    Some(std::sync::Arc::new(app.hooks.clone()));
                                 app.status_message = None;
                                 if app.onboarding_workspace_trust_gate {
                                     app.onboarding_workspace_trust_gate = false;
@@ -3311,10 +3386,11 @@ async fn run_event_loop(
             }
 
             // Ctrl+P opens the fuzzy file-picker overlay. Bound only when the
-            // composer is focused (no other modal on top of the stack) and the
+            // composer is focused (no other modal or inline popup on top) and the
             // engine is not actively streaming a turn.
             if key.code == KeyCode::Char('p')
                 && key.modifiers.contains(KeyModifiers::CONTROL)
+                && visible_slash_menu_entries(app, SLASH_MENU_LIMIT).is_empty()
                 && app.view_stack.is_empty()
                 && !app.is_loading
             {
@@ -3339,10 +3415,15 @@ async fn run_event_loop(
             }
 
             if matches!(key.code, KeyCode::Char('b') | KeyCode::Char('B'))
-                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && key_shortcuts::has_control_like_modifier(key.modifiers)
                 && app.view_stack.is_empty()
             {
-                open_shell_control(app);
+                // #3032: Ctrl+B directly backgrounds the active foreground
+                // shell command instead of opening a two-step shell-control
+                // menu.  When nothing is backgroundable, the status message
+                // tells the user what's going on.
+                request_foreground_shell_background(app);
+                app.needs_redraw = true;
                 continue;
             }
 
@@ -3372,12 +3453,32 @@ async fn run_event_loop(
                 {
                     return Ok(());
                 }
-                // Persist sidebar width when the user finishes a drag-to-resize.
-                if app.sidebar_width_dirty {
-                    app.sidebar_width_dirty = false;
-                    if let Ok(mut settings) = Settings::load() {
-                        settings.update_sidebar_width(app.sidebar_width_percent);
-                        let _ = settings.save();
+                persist_sidebar_settings_if_dirty(app);
+                continue;
+            }
+
+            if let Some(slot) = hotbar_slot_from_key(app, &key) {
+                if let Some(dispatch) = dispatch_hotbar_slot(app, config, slot)? {
+                    match dispatch {
+                        HotbarDispatch::Handled => {
+                            app.needs_redraw = true;
+                        }
+                        HotbarDispatch::AppAction(action) => {
+                            if apply_command_result(
+                                terminal,
+                                app,
+                                &mut engine_handle,
+                                &task_manager,
+                                config,
+                                &mut web_config_session,
+                                commands::CommandResult::action(action),
+                            )
+                            .await?
+                            {
+                                return Ok(());
+                            }
+                            app.needs_redraw = true;
+                        }
                     }
                 }
                 continue;
@@ -3533,34 +3634,34 @@ async fn run_event_loop(
                     toggle_live_transcript_overlay(app);
                     continue;
                 }
-                KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    if key.modifiers.contains(KeyModifiers::CONTROL) {
-                        app.set_sidebar_focus(SidebarFocus::Work);
-                        app.status_message = Some("Sidebar focus: work".to_string());
-                    } else {
-                        apply_mode_update(app, &engine_handle, AppMode::Plan).await;
-                    }
+                KeyCode::Char('1')
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        && key_shortcuts::has_control_like_modifier(key.modifiers) =>
+                {
+                    app.set_sidebar_focus(SidebarFocus::Work);
+                    app.status_message = Some("Sidebar focus: work".to_string());
                     continue;
                 }
-                KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    if key.modifiers.contains(KeyModifiers::CONTROL) {
-                        app.set_sidebar_focus(SidebarFocus::Tasks);
-                        app.status_message = Some("Sidebar focus: tasks".to_string());
-                    } else {
-                        apply_mode_update(app, &engine_handle, AppMode::Agent).await;
-                    }
+                KeyCode::Char('2')
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        && key_shortcuts::has_control_like_modifier(key.modifiers) =>
+                {
+                    app.set_sidebar_focus(SidebarFocus::Tasks);
+                    app.status_message = Some("Sidebar focus: tasks".to_string());
                     continue;
                 }
-                KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    if key.modifiers.contains(KeyModifiers::CONTROL) {
-                        app.set_sidebar_focus(SidebarFocus::Agents);
-                        app.status_message = Some("Sidebar focus: agents".to_string());
-                    } else {
-                        apply_mode_update(app, &engine_handle, AppMode::Yolo).await;
-                    }
+                KeyCode::Char('3')
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        && key_shortcuts::has_control_like_modifier(key.modifiers) =>
+                {
+                    app.set_sidebar_focus(SidebarFocus::Agents);
+                    app.status_message = Some("Sidebar focus: agents".to_string());
                     continue;
                 }
-                KeyCode::Char('4') if key.modifiers.contains(KeyModifiers::ALT) => {
+                KeyCode::Char('4')
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        && key_shortcuts::has_control_like_modifier(key.modifiers) =>
+                {
                     apply_alt_4_shortcut(app, key.modifiers);
                     continue;
                 }
@@ -3801,6 +3902,11 @@ async fn run_event_loop(
                 KeyCode::Up if key.modifiers.is_empty() && slash_menu_open => {
                     select_previous_slash_menu_entry(app, slash_menu_entries.len());
                 }
+                KeyCode::Char('p')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) && slash_menu_open =>
+                {
+                    select_previous_slash_menu_entry(app, slash_menu_entries.len());
+                }
                 KeyCode::Up
                     if key.modifiers.is_empty()
                         && app.selected_composer_attachment_index().is_some() =>
@@ -3845,6 +3951,11 @@ async fn run_event_loop(
                         .min(mention_menu_entries.len().saturating_sub(1));
                 }
                 KeyCode::Down if key.modifiers.is_empty() && slash_menu_open => {
+                    select_next_slash_menu_entry(app, slash_menu_entries.len());
+                }
+                KeyCode::Char('n')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) && slash_menu_open =>
+                {
                     select_next_slash_menu_entry(app, slash_menu_entries.len());
                 }
                 KeyCode::Down
@@ -4322,20 +4433,25 @@ async fn run_event_loop(
                     app.delete_word_backward();
                 }
                 KeyCode::Char('s') | KeyCode::Char('S')
-                    if key.modifiers == KeyModifiers::CONTROL && !app.input.is_empty() =>
+                    if key.modifiers == KeyModifiers::CONTROL =>
                 {
+                    if send_ctrl_s_queued_message_now(app, config, &engine_handle).await? {
+                        continue;
+                    }
                     // #440: park the current draft to the persistent
                     // stash and clear the composer. Empty composers
                     // are a no-op so a stray Ctrl+S can't pollute the
                     // file. Surface a toast so the user sees the
                     // confirmation (no-op feels broken otherwise).
-                    crate::composer_stash::push_stash(&app.input);
-                    app.clear_input_recoverable();
-                    app.push_status_toast(
-                        "Draft stashed — `/stash pop` to restore",
-                        StatusToastLevel::Info,
-                        Some(3_000),
-                    );
+                    if !app.input.is_empty() {
+                        crate::composer_stash::push_stash(&app.input);
+                        app.clear_input_recoverable();
+                        app.push_status_toast(
+                            "Draft stashed — `/stash pop` to restore",
+                            StatusToastLevel::Info,
+                            Some(3_000),
+                        );
+                    }
                 }
                 KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     // #379: context-sensitive Ctrl+Y.
@@ -4444,9 +4560,87 @@ async fn run_event_loop(
     }
 }
 
+fn hotbar_slot_from_key(app: &App, key: &event::KeyEvent) -> Option<u8> {
+    if app.onboarding != OnboardingState::None || !app.view_stack.is_empty() {
+        return None;
+    }
+
+    let KeyCode::Char(c) = key.code else {
+        return None;
+    };
+    if !('1'..='8').contains(&c) {
+        return None;
+    }
+    let slot = c.to_digit(10).and_then(|digit| u8::try_from(digit).ok())?;
+
+    if key.modifiers == KeyModifiers::NONE {
+        return app.input.is_empty().then_some(slot);
+    }
+
+    if key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+    {
+        return Some(slot);
+    }
+
+    None
+}
+
+fn dispatch_hotbar_slot(
+    app: &mut App,
+    config: &Config,
+    slot: u8,
+) -> Result<Option<HotbarDispatch>> {
+    let known_action_ids = app
+        .hotbar_actions
+        .iter()
+        .map(|action| action.id())
+        .collect::<Vec<_>>();
+    let bindings = config.resolve_hotbar_bindings(&known_action_ids).bindings;
+    let Some(action_id) = bindings
+        .iter()
+        .find(|binding| binding.slot == slot)
+        .map(|binding| binding.action.clone())
+    else {
+        return Ok(None);
+    };
+
+    let Some(action) = app.hotbar_actions.get(&action_id) else {
+        app.status_message = Some(format!(
+            "Hotbar slot {slot} action is not available: {action_id}"
+        ));
+        app.needs_redraw = true;
+        return Ok(Some(HotbarDispatch::Handled));
+    };
+
+    action.dispatch(app).map(Some)
+}
+
 fn apply_alt_4_shortcut(app: &mut App, _modifiers: KeyModifiers) {
     app.set_sidebar_focus(SidebarFocus::Agents);
     app.status_message = Some("Sidebar focus: agents".to_string());
+}
+
+fn persist_sidebar_settings_if_dirty(app: &mut App) {
+    if !app.sidebar_width_dirty && !app.sidebar_focus_dirty {
+        return;
+    }
+
+    let width_dirty = app.sidebar_width_dirty;
+    let focus_dirty = app.sidebar_focus_dirty;
+    app.sidebar_width_dirty = false;
+    app.sidebar_focus_dirty = false;
+
+    if let Ok(mut settings) = Settings::load() {
+        if width_dirty {
+            settings.update_sidebar_width(app.sidebar_width_percent);
+        }
+        if focus_dirty {
+            let _ = settings.set("sidebar_focus", app.sidebar_focus.as_setting());
+        }
+        let _ = settings.save();
+    }
 }
 
 fn apply_alt_0_shortcut(app: &mut App, modifiers: KeyModifiers) {
@@ -4480,10 +4674,12 @@ async fn run_cache_warmup(app: &App, config: &Config) -> Result<(Usage, String, 
     let base_url = client.base_url().to_string();
     let reasoning_effort = if app.reasoning_effort == ReasoningEffort::Auto {
         app.last_effective_reasoning_effort
-            .and_then(ReasoningEffort::api_value)
+            .and_then(|effort| effort.api_value_for_provider(app.api_provider))
             .map(str::to_string)
     } else {
-        app.reasoning_effort.api_value().map(str::to_string)
+        app.reasoning_effort
+            .api_value_for_provider(app.api_provider)
+            .map(str::to_string)
     };
     let request = MessageRequest {
         model: app.model.clone(),
@@ -4652,6 +4848,21 @@ fn reconcile_turn_liveness(app: &mut App, now: Instant, has_running_agents: bool
     false
 }
 
+/// #3033: gate progress-driven repaints to at most one per 100ms.
+///
+/// Returns whether the current `AgentProgress` event may request a redraw,
+/// updating the last-redraw timestamp when it may. Data updates are never
+/// throttled — only the repaint request is.
+fn agent_progress_redraw_permitted(last_redraw: &mut Option<Instant>, now: Instant) -> bool {
+    match *last_redraw {
+        Some(last) if now.duration_since(last) < Duration::from_millis(100) => false,
+        _ => {
+            *last_redraw = Some(now);
+            true
+        }
+    }
+}
+
 fn recover_engine_event_disconnect(app: &mut App) -> bool {
     let had_live_work = app.is_loading
         || app.is_compacting
@@ -4802,6 +5013,24 @@ pub(crate) fn apply_engine_error_to_app(
         );
         return;
     }
+    if recoverable
+        && matches!(
+            envelope.category,
+            crate::error_taxonomy::ErrorCategory::Network
+                | crate::error_taxonomy::ErrorCategory::RateLimit
+                | crate::error_taxonomy::ErrorCategory::Timeout
+        )
+        && app.advance_fallback(message.clone()).is_some()
+    {
+        let position = app.fallback_chain_position().unwrap_or(0);
+        let total = app.fallback_chain_len();
+        app.status_message = Some(format!(
+            "Switched to {} (fallback {position}/{}) after recoverable provider error.",
+            app.api_provider.as_str(),
+            total.saturating_sub(1)
+        ));
+        return;
+    }
     if !recoverable {
         app.offline_mode = true;
     }
@@ -4945,7 +5174,10 @@ fn push_assistant_message(
 ) {
     let mut blocks = Vec::new();
     if let Some(thinking) = thinking {
-        blocks.push(ContentBlock::Thinking { thinking });
+        blocks.push(ContentBlock::Thinking {
+            thinking,
+            signature: None,
+        });
     }
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
@@ -5130,6 +5362,65 @@ fn queue_current_draft_for_next_turn(app: &mut App) -> bool {
         app.queued_message_count()
     ));
     true
+}
+
+fn take_ctrl_s_queued_message(app: &mut App) -> Option<QueuedMessage> {
+    if let Some(mut draft) = app.queued_draft.take() {
+        if let Some(input) = app.submit_input() {
+            draft.display = input;
+        }
+        return Some(draft);
+    }
+    if app.input.is_empty() {
+        return app.pop_queued_message();
+    }
+    None
+}
+
+async fn send_ctrl_s_queued_message_now(
+    app: &mut App,
+    config: &Config,
+    engine_handle: &EngineHandle,
+) -> Result<bool> {
+    let Some(message) = take_ctrl_s_queued_message(app) else {
+        return Ok(false);
+    };
+    if app.offline_mode {
+        app.queue_message(message);
+        app.status_message = Some(format!(
+            "Offline: {} queued — ↑ to edit, /queue list",
+            app.queued_message_count()
+        ));
+        return Ok(true);
+    }
+
+    let display = message.display.clone();
+    if app.is_loading {
+        if let Err(err) = steer_user_message(app, engine_handle, message.clone()).await {
+            app.queue_message(message);
+            app.status_message = Some(format!(
+                "Steer failed ({err}); {} queued — ↑ to edit, /queue list",
+                app.queued_message_count()
+            ));
+        } else {
+            app.push_status_toast(
+                "Sent queued message into current turn",
+                StatusToastLevel::Info,
+                Some(1_500),
+            );
+        }
+    } else if let Err(err) =
+        dispatch_user_message(app, config, engine_handle, message.clone()).await
+    {
+        app.queue_message(message);
+        app.status_message = Some(format!(
+            "Dispatch failed ({err}); kept {} queued message(s)",
+            app.queued_message_count()
+        ));
+    } else {
+        app.status_message = Some(format!("Sent queued message: {display}"));
+    }
+    Ok(true)
 }
 
 fn queued_message_content_for_app(
@@ -5368,7 +5659,11 @@ async fn dispatch_user_message(
                 locale_tag: app.ui_locale.tag(),
                 translation_enabled: app.translation_enabled,
                 model_id: &app.model,
+                context_window_override: Some(
+                    provider_capability(app.api_provider, &app.model).context_window,
+                ),
                 show_thinking: app.show_thinking,
+                verbosity: app.verbosity.as_deref(),
             },
         ),
     );
@@ -5432,10 +5727,14 @@ async fn dispatch_user_message(
                 ))
             });
         app.last_effective_reasoning_effort = Some(effort);
-        Some(effort.as_setting().to_string())
+        effort
+            .api_value_for_provider(app.api_provider)
+            .map(str::to_string)
     } else {
         app.last_effective_reasoning_effort = None;
-        app.reasoning_effort.api_value().map(str::to_string)
+        app.reasoning_effort
+            .api_value_for_provider(app.api_provider)
+            .map(str::to_string)
     };
 
     if let Some(selection) = auto_selection.as_ref() {
@@ -5446,7 +5745,10 @@ async fn dispatch_user_message(
                 selection.source.label()
             );
             if let Some(effort) = app.last_effective_reasoning_effort {
-                status.push_str(&format!("; thinking auto: {}", effort.as_setting()));
+                status.push_str(&format!(
+                    "; thinking auto: {}",
+                    effort.display_label_for_provider(app.api_provider)
+                ));
             }
             app.status_message = Some(status);
         }
@@ -5460,6 +5762,8 @@ async fn dispatch_user_message(
             mode: app.mode,
             model: effective_model,
             goal_objective: app.hunt.quarry.clone(),
+            goal_token_budget: app.hunt.token_budget,
+            goal_status: app.hunt.verdict.goal_status(),
             reasoning_effort: effective_reasoning_effort,
             reasoning_effort_auto: auto_controls_reasoning,
             auto_model: app.auto_model,
@@ -5471,6 +5775,7 @@ async fn dispatch_user_message(
             show_thinking: app.show_thinking,
             allowed_tools: app.active_allowed_tools.clone(),
             hook_executor: app.runtime_services.hook_executor.clone(),
+            verbosity: app.verbosity.clone(),
         })
         .await
     {
@@ -5481,6 +5786,47 @@ async fn dispatch_user_message(
     }
 
     Ok(())
+}
+
+fn goal_status_from_snapshot(snapshot: &GoalSnapshot) -> Option<GoalStatus> {
+    match snapshot.status.trim() {
+        "active" => Some(GoalStatus::Active),
+        "paused" => Some(GoalStatus::Paused),
+        "complete" => Some(GoalStatus::Complete),
+        "blocked" => Some(GoalStatus::Blocked),
+        _ => None,
+    }
+}
+
+pub(crate) fn apply_goal_snapshot_to_app(app: &mut App, snapshot: &GoalSnapshot) -> bool {
+    let Some(objective) = snapshot
+        .objective
+        .as_deref()
+        .map(str::trim)
+        .filter(|objective| !objective.is_empty())
+    else {
+        return false;
+    };
+    let Some(status) = goal_status_from_snapshot(snapshot) else {
+        tracing::warn!("ignoring unknown runtime goal status: {}", snapshot.status);
+        return false;
+    };
+    let verdict = HuntVerdict::from_goal_status(status);
+    let objective_changed = app.hunt.quarry.as_deref() != Some(objective);
+    let changed = objective_changed
+        || app.hunt.token_budget != snapshot.token_budget
+        || app.hunt.verdict != verdict;
+    if !changed {
+        return false;
+    }
+
+    app.hunt.quarry = Some(objective.to_string());
+    app.hunt.token_budget = snapshot.token_budget;
+    app.hunt.verdict = verdict;
+    if objective_changed || app.hunt.started_at.is_none() {
+        app.hunt.started_at = Some(Instant::now());
+    }
+    true
 }
 
 async fn sync_mode_update(engine_handle: &EngineHandle, mode: AppMode) {
@@ -5618,7 +5964,7 @@ async fn drain_web_config_events(
 
 /// Apply the choice made in the `/model` picker (#39): mutate App state so
 /// the next turn uses the new model/effort, persist the selection to
-/// `~/.deepseek/settings.toml` so it survives a restart, push the change to
+/// `~/.codewhale/settings.toml` (legacy: `~/.deepseek/settings.toml`) so it survives a restart, push the change to
 /// the running engine via `Op::SetModel`/`Op::SetCompaction`, and surface
 /// a one-line status describing what changed.
 // The model/effort transition needs both the previous and next model+effort
@@ -5638,6 +5984,8 @@ async fn apply_model_picker_choice(
     let model_is_auto = model.trim().eq_ignore_ascii_case("auto");
     if model_is_auto {
         effort = ReasoningEffort::Auto;
+    } else {
+        effort = effort.normalize_for_provider(target_provider.unwrap_or(app.api_provider));
     }
     if let Some(target_provider) = target_provider
         && target_provider != app.api_provider
@@ -5663,7 +6011,7 @@ async fn apply_model_picker_choice(
     if !model_changed && !effort_changed {
         app.status_message = Some(format!(
             "Model unchanged: {model} · thinking {}",
-            effort.short_label()
+            effort.display_label_for_provider(app.api_provider)
         ));
         return;
     }
@@ -5697,7 +6045,10 @@ async fn apply_model_picker_choice(
             settings.set_model_for_provider(app.api_provider.as_str(), &model);
         }
         if effort_changed {
-            settings.set("reasoning_effort", effort.as_setting())?;
+            settings.set(
+                "reasoning_effort",
+                effort.as_setting_for_provider(app.api_provider),
+            )?;
         }
         settings.save()
     })();
@@ -5714,11 +6065,13 @@ async fn apply_model_picker_choice(
     } else {
         model.clone()
     };
-    let previous_effort_summary = previous_effort.short_label();
+    let previous_effort_summary = previous_effort.display_label_for_provider(app.api_provider);
     let effort_summary = if effort == ReasoningEffort::Auto {
         "auto (per-turn thinking)".to_string()
     } else {
-        effort.short_label().to_string()
+        effort
+            .display_label_for_provider(app.api_provider)
+            .to_string()
     };
 
     let mut summary = match (model_changed, effort_changed) {
@@ -5743,9 +6096,10 @@ async fn apply_model_picker_choice(
 async fn apply_picker_effort_choice(
     app: &mut App,
     engine_handle: &EngineHandle,
-    effort: ReasoningEffort,
+    mut effort: ReasoningEffort,
     previous_effort: ReasoningEffort,
 ) {
+    effort = effort.normalize_for_provider(app.api_provider);
     if effort == previous_effort {
         return;
     }
@@ -5756,7 +6110,10 @@ async fn apply_picker_effort_choice(
 
     let persist_warning = (|| -> anyhow::Result<()> {
         let mut settings = crate::settings::Settings::load()?;
-        settings.set("reasoning_effort", effort.as_setting())?;
+        settings.set(
+            "reasoning_effort",
+            effort.as_setting_for_provider(app.api_provider),
+        )?;
         settings.save()
     })()
     .err()
@@ -5766,8 +6123,8 @@ async fn apply_picker_effort_choice(
 
     let mut summary = format!(
         "Thinking: {} → {} · model {}",
-        previous_effort.short_label(),
-        effort.short_label(),
+        previous_effort.display_label_for_provider(app.api_provider),
+        effort.display_label_for_provider(app.api_provider),
         app.model_display_label()
     );
     if let Some(warning) = persist_warning {
@@ -5843,7 +6200,13 @@ async fn switch_provider(
     let new_endpoint = display_base_url_host(&new_base_url);
     let cache_scope_changed = previous_provider != target || previous_model != new_model;
     app.api_provider = target;
+    app.provider_chain = target
+        .kind()
+        .map(|kind| codewhale_config::ProviderChain::new(kind, &config.fallback_providers))
+        .filter(|chain| chain.providers().len() > 1);
+    app.last_fallback_reason = None;
     app.model_ids_passthrough = config.model_ids_pass_through();
+    app.reasoning_effort = app.reasoning_effort.normalize_for_provider(target);
     app.set_model_selection(new_model.clone());
     if model_override.is_some() {
         app.provider_models
@@ -5922,6 +6285,105 @@ async fn switch_provider(
         status_message.push_str(" (not fully persisted)");
     }
     app.status_message = Some(status_message);
+}
+
+async fn apply_provider_fallback_switch(
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    config: &mut Config,
+    previous_provider: ApiProvider,
+) {
+    let target = app.api_provider;
+    let previous_config = config.clone();
+    let previous_model = app.model.clone();
+
+    config.provider = Some(target.as_str().to_string());
+    if matches!(target, ApiProvider::NvidiaNim)
+        && config
+            .base_url
+            .as_deref()
+            .map(|base| !base.contains("integrate.api.nvidia.com"))
+            .unwrap_or(true)
+    {
+        config.base_url = Some(DEFAULT_NVIDIA_NIM_BASE_URL.to_string());
+    }
+    if matches!(target, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
+        && config
+            .base_url
+            .as_deref()
+            .map(root_base_url_belongs_to_non_deepseek_provider)
+            .unwrap_or(false)
+    {
+        config.base_url = None;
+    }
+
+    if let Err(err) = DeepSeekClient::new(config) {
+        *config = previous_config;
+        app.api_provider = previous_provider;
+        app.last_fallback_reason = Some(format!(
+            "Fallback provider {} was unavailable: {err}",
+            target.as_str()
+        ));
+        app.status_message = Some(format!(
+            "Fallback provider {} unavailable; provider remains {}.",
+            target.as_str(),
+            previous_provider.as_str()
+        ));
+        return;
+    }
+
+    let new_model = config.default_model();
+    let new_base_url = config.deepseek_base_url();
+    let new_endpoint = display_base_url_host(&new_base_url);
+    let cache_scope_changed = previous_provider != target || previous_model != new_model;
+    app.model_ids_passthrough = config.model_ids_pass_through();
+    app.reasoning_effort = app.reasoning_effort.normalize_for_provider(target);
+    app.set_model_selection(new_model.clone());
+    app.update_model_compaction_budget();
+    if cache_scope_changed {
+        app.clear_model_scoped_telemetry();
+    } else {
+        app.session.last_prompt_tokens = None;
+        app.session.last_completion_tokens = None;
+    }
+
+    let _ = engine_handle.send(Op::Shutdown).await;
+    let engine_config = build_engine_config(app, config);
+    *engine_handle = spawn_engine(engine_config, config);
+
+    if !app.api_messages.is_empty() {
+        let _ = engine_handle
+            .send(Op::SyncSession {
+                session_id: app.current_session_id.clone(),
+                messages: app.api_messages.clone(),
+                system_prompt: app.system_prompt.clone(),
+                system_prompt_override: false,
+                model: app.model.clone(),
+                workspace: app.workspace.clone(),
+            })
+            .await;
+    }
+    let _ = engine_handle
+        .send(Op::SetCompaction {
+            config: app.compaction_config(),
+        })
+        .await;
+
+    app.add_message(HistoryCell::System {
+        content: format!(
+            "Provider fallback: {} -> {}\nModel: {} -> {}\nEndpoint: {}",
+            previous_provider.as_str(),
+            target.as_str(),
+            previous_model,
+            new_model,
+            new_endpoint
+        ),
+    });
+    app.status_message = Some(format!(
+        "Fallback provider: {} via {}",
+        target.as_str(),
+        new_endpoint
+    ));
 }
 
 fn root_base_url_belongs_to_non_deepseek_provider(base_url: &str) -> bool {
@@ -6065,6 +6527,28 @@ async fn apply_command_result(
             AppAction::SendMessage(content) => {
                 let queued = build_queued_message(app, content);
                 submit_or_steer_message(app, config, engine_handle, queued).await?;
+            }
+            AppAction::VoiceCapture => {
+                use commands::voice::VoiceCaptureOutcome;
+                match commands::voice::capture_and_transcribe(app, config).await {
+                    Ok(VoiceCaptureOutcome::Insert(text)) => {
+                        app.insert_str(&text);
+                        app.status_message = Some(format!(
+                            "{}: {text}",
+                            tr(app.ui_locale, MessageId::VoiceTranscribed)
+                        ));
+                    }
+                    Ok(VoiceCaptureOutcome::Send(content)) => {
+                        app.status_message =
+                            Some(tr(app.ui_locale, MessageId::VoiceTranscribed).to_string());
+                        let queued = build_queued_message(app, content);
+                        submit_or_steer_message(app, config, engine_handle, queued).await?;
+                    }
+                    Err(err) => {
+                        app.voice_enabled = false;
+                        app.status_message = Some(err);
+                    }
+                }
             }
             AppAction::ListSubAgents => {
                 let _ = engine_handle.send(Op::ListSubAgents).await;
@@ -6471,7 +6955,10 @@ fn spawn_external_url_command(mut command: Command) -> Result<()> {
 
 fn apply_workspace_runtime_state(app: &mut App, config: &Config, workspace: PathBuf) {
     app.workspace = workspace.clone();
-    app.hooks = HookExecutor::new(config.hooks_config(), workspace.clone());
+    app.hooks = HookExecutor::new(
+        crate::hooks::HooksConfig::load_with_project(config.hooks_config(), &workspace),
+        workspace.clone(),
+    );
     app.skills_dir = crate::tui::app::resolve_skills_dir(&workspace, &config.skills_dir(), config);
     app.refresh_skill_cache();
     app.workspace_context = None;
@@ -7165,6 +7652,7 @@ fn render(f: &mut Frame, app: &mut App) {
             crate::config::ApiProvider::DeepseekCN => None,
             crate::config::ApiProvider::NvidiaNim => Some("NIM"),
             crate::config::ApiProvider::Openai => Some("OpenAI"),
+            crate::config::ApiProvider::Anthropic => Some("Claude"),
             crate::config::ApiProvider::Atlascloud => Some("Atlas"),
             crate::config::ApiProvider::WanjieArk => Some("Wanjie"),
             crate::config::ApiProvider::Volcengine => Some("Volc"),
@@ -7183,6 +7671,9 @@ fn render(f: &mut Frame, app: &mut App) {
             crate::config::ApiProvider::Huggingface => Some("HF"),
             crate::config::ApiProvider::Together => Some("Together"),
             crate::config::ApiProvider::OpenaiCodex => Some("Codex"),
+            crate::config::ApiProvider::Zai => Some("Z.ai"),
+            crate::config::ApiProvider::Stepfun => Some("StepFun"),
+            crate::config::ApiProvider::Minimax => Some("MiniMax"),
         };
         let status_indicator_started_at = if app.low_motion {
             None
@@ -7262,6 +7753,15 @@ fn render(f: &mut Frame, app: &mut App) {
         // Record the sidebar rect (or its absence) every frame so mouse
         // hit-testing can route scroll events correctly.
         app.viewport.last_sidebar_area = sidebar_area;
+
+        // When the sidebar is hidden or doesn't fit, drop its stale mouse
+        // hit areas and any in-flight resize so clicks on those columns
+        // don't keep routing to an invisible handle (#3063).
+        if sidebar_area.is_none() {
+            app.last_sidebar_area = None;
+            app.last_sidebar_handle_area = None;
+            app.sidebar_resizing = false;
+        }
 
         let chat_widget = ChatWidget::new(app, chat_area);
         let buf = f.buffer_mut();
@@ -7918,18 +8418,24 @@ async fn handle_view_events(
                 app.status_message = Some("Backtrack canceled".to_string());
                 app.needs_redraw = true;
             }
-            ViewEvent::ContextMenuSelected { action } => {
-                handle_context_menu_action(app, action);
+            ViewEvent::ContextMenuSelected {
+                action: ContextMenuAction::ExecuteCommand { command },
+            } => {
+                if execute_command_input(
+                    terminal,
+                    app,
+                    engine_handle,
+                    task_manager,
+                    config,
+                    &mut *web_config_session,
+                    &command,
+                )
+                .await?
+                {
+                    return Ok(true);
+                }
             }
-            ViewEvent::ShellControlBackground => {
-                request_foreground_shell_background(app);
-            }
-            ViewEvent::ShellControlCancel => {
-                app.backtrack.reset();
-                engine_handle.cancel();
-                mark_active_turn_cancelled_locally(app);
-                app.status_message = Some("Request cancelled".to_string());
-            }
+            ViewEvent::ContextMenuSelected { action } => handle_context_menu_action(app, action),
         }
     }
 
@@ -8225,6 +8731,10 @@ async fn apply_provider_picker_api_key(
             ApiProvider::Huggingface => &mut providers.huggingface,
             ApiProvider::Together => &mut providers.together,
             ApiProvider::OpenaiCodex => &mut providers.openai_codex,
+            ApiProvider::Anthropic => &mut providers.anthropic,
+            ApiProvider::Zai => &mut providers.zai,
+            ApiProvider::Stepfun => &mut providers.stepfun,
+            ApiProvider::Minimax => &mut providers.minimax,
         };
         entry.api_key = Some(api_key);
     }
@@ -8284,6 +8794,10 @@ fn set_provider_auth_mode_in_memory(config: &mut Config, provider: ApiProvider, 
         ApiProvider::Huggingface => &mut providers.huggingface,
         ApiProvider::Together => &mut providers.together,
         ApiProvider::OpenaiCodex => &mut providers.openai_codex,
+        ApiProvider::Anthropic => &mut providers.anthropic,
+        ApiProvider::Zai => &mut providers.zai,
+        ApiProvider::Stepfun => &mut providers.stepfun,
+        ApiProvider::Minimax => &mut providers.minimax,
     };
     entry.auth_mode = Some(auth_mode);
 }
@@ -8679,12 +9193,6 @@ fn enable_windows_ime_console_mode() {
 /// across focus events and are only re-established by `resume_terminal`
 /// after a suspension, which always runs a separate path.
 ///
-/// Note: calling this on every FocusGained event pushes one extra Kitty
-/// keyboard mode level onto the terminal's stack without a preceding pop.
-/// After N focus cycles the stack reaches depth N; at shutdown only one
-/// level is popped. On terminals with a finite stack this is benign because
-/// the terminal clears the stack on process exit. A future improvement is
-/// to pop-then-push here so the stack stays at depth ≤1.
 fn recover_terminal_modes<W: Write>(
     writer: &mut W,
     use_mouse_capture: bool,
@@ -8693,6 +9201,7 @@ fn recover_terminal_modes<W: Write>(
     #[cfg(target_os = "windows")]
     enable_windows_ime_console_mode();
 
+    pop_keyboard_enhancement_flags(writer);
     push_keyboard_enhancement_flags(writer);
     if use_mouse_capture && let Err(err) = execute!(writer, EnableMouseCapture) {
         tracing::debug!(?err, "EnableMouseCapture ignored");
@@ -8776,19 +9285,29 @@ fn render_toast_stack_overlay(
     }
 }
 
-pub(crate) fn open_shell_control(app: &mut App) {
-    if !app.is_loading || !active_foreground_shell_running(app) {
-        app.status_message = Some("No foreground shell command to control".to_string());
+pub(crate) fn request_foreground_shell_background(app: &mut App) {
+    if !app.is_loading {
+        app.status_message = Some("No foreground shell command to background".to_string());
         return;
     }
-
-    app.view_stack.push(ShellControlView::new());
-    app.status_message = Some("Shell control opened".to_string());
-}
-
-pub(crate) fn request_foreground_shell_background(app: &mut App) {
-    if !app.is_loading || !active_foreground_shell_running(app) {
-        app.status_message = Some("No foreground shell command to background".to_string());
+    if !active_foreground_shell_running(app) {
+        // #3032 AC3: name the reason backgrounding is unavailable —
+        // interactive execs and non-shell blocking tools are visibly running
+        // but cannot be detached, and a generic shrug reads like a bug.
+        let reason = if terminal_pause_has_live_owner(app) {
+            "the running command is interactive"
+        } else if app
+            .active_cell
+            .as_ref()
+            .is_some_and(|active| !active.is_empty())
+        {
+            "the running tool is not a foreground shell command"
+        } else {
+            "no foreground shell command is running"
+        };
+        app.status_message = Some(format!(
+            "Cannot background: {reason}. Press Ctrl+C to cancel the turn, or wait for completion."
+        ));
         return;
     }
 
@@ -8909,7 +9428,8 @@ fn estimated_context_tokens(app: &App) -> Option<i64> {
 }
 
 pub(crate) fn context_usage_snapshot(app: &App) -> Option<(i64, u32, f64)> {
-    let max = context_window_for_model(app.effective_model_for_budget())?;
+    let max =
+        provider_capability(app.api_provider, app.effective_model_for_budget()).context_window;
     let max_i64 = i64::from(max);
     let reported = app
         .session
@@ -9367,7 +9887,10 @@ fn activity_cell_label(app: &App, cell_index: usize, cell: &HistoryCell) -> Stri
         HistoryCell::Error { .. } => "error".to_string(),
         HistoryCell::SubAgent(_) => "sub-agent".to_string(),
         HistoryCell::Tool(ToolCell::Generic(generic)) => {
-            crate::tui::widgets::tool_card::tool_activity_label_for_name(&generic.name)
+            crate::tui::widgets::tool_card::tool_activity_label_for_name(
+                &generic.name,
+                app.ui_locale,
+            )
         }
         HistoryCell::Tool(_) => {
             detail_target_label(app, cell_index).unwrap_or_else(|| "tool activity".to_string())
@@ -9802,9 +10325,12 @@ pub(crate) fn detail_target_label(app: &App, cell_index: usize) -> Option<String
             Some(format!("image {}", image.path.display()))
         }
         HistoryCell::Tool(ToolCell::WebSearch(search)) => Some(format!("search {}", search.query)),
-        HistoryCell::Tool(ToolCell::Generic(generic)) => {
-            Some(crate::tui::widgets::tool_card::tool_activity_label_for_name(&generic.name))
-        }
+        HistoryCell::Tool(ToolCell::Generic(generic)) => Some(
+            crate::tui::widgets::tool_card::tool_activity_label_for_name(
+                &generic.name,
+                app.ui_locale,
+            ),
+        ),
         HistoryCell::SubAgent(_) => Some("sub-agent".to_string()),
         _ => None,
     }

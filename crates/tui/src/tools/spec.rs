@@ -643,6 +643,11 @@ pub trait ToolSpec: Send + Sync {
         }
     }
 
+    /// Returns the approval requirement for this concrete tool input.
+    fn approval_requirement_for(&self, _input: &Value) -> ApprovalRequirement {
+        self.approval_requirement()
+    }
+
     /// Returns whether this tool is sandboxable.
     #[allow(dead_code)]
     fn is_sandboxable(&self) -> bool {
@@ -657,8 +662,25 @@ pub trait ToolSpec: Send + Sync {
             && !caps.contains(&ToolCapability::ExecutesCode)
     }
 
+    /// Returns whether this concrete tool input is read-only.
+    fn is_read_only_for(&self, _input: &Value) -> bool {
+        self.is_read_only()
+    }
+
     /// Returns whether this tool can be executed in parallel with others.
     fn supports_parallel(&self) -> bool {
+        false
+    }
+
+    /// Returns whether this concrete tool input can run in parallel.
+    fn supports_parallel_for(&self, _input: &Value) -> bool {
+        self.supports_parallel()
+    }
+
+    /// Returns whether this input starts durable/detached work and returns
+    /// immediately. Detached starts are not read-only, but in auto-approved
+    /// turns they do not need to block neighboring read-only inspections.
+    fn starts_detached_for(&self, _input: &Value) -> bool {
         false
     }
 

@@ -39,7 +39,7 @@ use crate::models::{
 use crate::prompts;
 use crate::purge::{emit_purge_completed, emit_purge_failed, emit_purge_started, run_purge};
 use crate::seam_manager::{SeamConfig, SeamManager};
-use crate::tools::goal::{SharedGoalState, new_shared_goal_state};
+use crate::tools::goal::{GoalSnapshot, GoalStatus, SharedGoalState, new_shared_goal_state};
 use crate::tools::plan::{PlanSnapshot, SharedPlanState, new_shared_plan_state};
 use crate::tools::shell::{SharedShellManager, new_shared_shell_manager};
 use crate::tools::spec::RuntimeToolServices;
@@ -287,10 +287,15 @@ pub struct EngineConfig {
     /// Whether user-visible transcript rendering shows thinking blocks.
     /// Prompt assembly uses this to avoid localizing hidden reasoning.
     pub show_thinking: bool,
+    pub verbosity: Option<String>,
     /// Maximum number of assistant steps before stopping.
     pub max_steps: u32,
     /// Maximum number of concurrently active subagents.
     pub max_subagents: usize,
+    /// Number of direct (depth-1) sub-agents that may execute concurrently
+    /// before further interactive fanout launches queue for a slot (#3095).
+    /// Resolved from `[subagents] interactive_max_launch`.
+    pub interactive_launch_limit: usize,
     /// Feature flags controlling tool availability.
     pub features: Features,
     /// Auto-compaction settings for long conversations.
@@ -335,9 +340,14 @@ pub struct EngineConfig {
     pub speech_output_dir: Option<PathBuf>,
     pub vision_config: Option<crate::config::VisionModelConfig>,
     pub goal_objective: Option<String>,
+    pub goal_token_budget: Option<u32>,
+    pub goal_status: GoalStatus,
     /// Tool restriction from custom slash command frontmatter.
     /// `None` means the current turn may use the normal tool set.
     pub allowed_tools: Option<Vec<String>>,
+    /// Tool deny-list.  Deny always wins over allow (#3027).
+    /// `None` means no tools are explicitly denied.
+    pub disallowed_tools: Option<Vec<String>>,
     /// Hook executor for control-plane hooks.
     /// `ToolCallBefore` hooks may deny a tool call with exit code 2.
     pub hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
@@ -403,6 +413,7 @@ impl Default for EngineConfig {
             show_thinking: true,
             max_steps: 100,
             max_subagents: DEFAULT_MAX_SUBAGENTS,
+            interactive_launch_limit: crate::config::DEFAULT_INTERACTIVE_LAUNCH_LIMIT,
             features: Features::with_defaults(),
             compaction: CompactionConfig::default(),
             capacity: CapacityControllerConfig::default(),
@@ -423,7 +434,10 @@ impl Default for EngineConfig {
             vision_config: None,
             strict_tool_mode: false,
             goal_objective: None,
+            goal_token_budget: None,
+            goal_status: GoalStatus::Active,
             allowed_tools: None,
+            disallowed_tools: None,
             hook_executor: None,
             locale_tag: "en".to_string(),
             workshop: None,
@@ -441,6 +455,7 @@ impl Default for EngineConfig {
             ),
             tools_always_load: HashSet::new(),
             prefer_bwrap: false,
+            verbosity: None,
             tools: None,
         }
     }
@@ -518,6 +533,7 @@ pub struct Engine {
     subagent_manager: SharedSubAgentManager,
     shell_manager: SharedShellManager,
     mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
+    api_provider: ApiProvider,
     rx_op: mpsc::Receiver<Op>,
     rx_approval: mpsc::Receiver<ApprovalDecision>,
     rx_user_input: broadcast::Receiver<UserInputDecision>,
@@ -618,6 +634,9 @@ impl Engine {
             ApiProvider::Deepseek | ApiProvider::DeepseekCN => "DEEPSEEK_API_KEY",
             ApiProvider::NvidiaNim => "NVIDIA_API_KEY/NVIDIA_NIM_API_KEY",
             ApiProvider::Openai => "OPENAI_API_KEY",
+            ApiProvider::Zai => "ZAI_API_KEY/Z_AI_API_KEY",
+            ApiProvider::Stepfun => "STEPFUN_API_KEY/STEP_API_KEY",
+            ApiProvider::Anthropic => "ANTHROPIC_API_KEY",
             ApiProvider::Atlascloud => "ATLASCLOUD_API_KEY",
             ApiProvider::WanjieArk => "WANJIE_ARK_API_KEY/WANJIE_API_KEY/WANJIE_MAAS_API_KEY",
             ApiProvider::Volcengine => "VOLCENGINE_API_KEY/VOLCENGINE_ARK_API_KEY/ARK_API_KEY",
@@ -634,6 +653,7 @@ impl Engine {
             ApiProvider::Huggingface => "HUGGINGFACE_API_KEY/HF_TOKEN",
             ApiProvider::Together => "TOGETHER_API_KEY",
             ApiProvider::OpenaiCodex => "OPENAI_CODEX_ACCESS_TOKEN/CODEX_ACCESS_TOKEN",
+            ApiProvider::Minimax => "MINIMAX_API_KEY",
         };
 
         Some(format!(
@@ -662,7 +682,12 @@ impl Engine {
         crate::tls::ensure_rustls_crypto_provider();
 
         if let Some(objective) = normalized_goal_objective(config.goal_objective.as_deref()) {
-            sync_goal_state_from_host(&config.goal_state, Some(&objective), None, false);
+            sync_goal_state_from_host(
+                &config.goal_state,
+                Some(&objective),
+                config.goal_token_budget,
+                config.goal_status,
+            );
         }
 
         let (tx_op, rx_op) = mpsc::channel(32);
@@ -685,6 +710,7 @@ impl Engine {
             Ok(client) => (Some(client), None),
             Err(err) => (None, Some(err.to_string())),
         };
+        let api_provider = api_config.api_provider();
         let api_key_env_only_recovery = Self::env_only_api_key_recovery_hint(api_config);
 
         let mut session = Session::new(
@@ -718,7 +744,12 @@ impl Engine {
                     locale_tag: &config.locale_tag,
                     translation_enabled: config.translation_enabled,
                     model_id: &config.model,
+                    context_window_override: Some(
+                        crate::config::provider_capability(api_provider, &config.model)
+                            .context_window,
+                    ),
                     show_thinking: config.show_thinking,
+                    verbosity: config.verbosity.as_deref(),
                 },
             );
         let stable_prompt = Some(system_prompt);
@@ -741,6 +772,7 @@ impl Engine {
             config.workspace.clone(),
             config.max_subagents,
             config.subagent_heartbeat_timeout,
+            config.interactive_launch_limit,
         );
         let shell_manager = config
             .runtime_services
@@ -819,6 +851,7 @@ impl Engine {
             subagent_manager,
             shell_manager,
             mcp_pool: None,
+            api_provider,
             rx_op,
             rx_approval,
             rx_user_input,
@@ -1113,6 +1146,8 @@ impl Engine {
                     mode,
                     model,
                     goal_objective,
+                    goal_token_budget,
+                    goal_status,
                     reasoning_effort,
                     reasoning_effort_auto,
                     auto_model,
@@ -1124,12 +1159,15 @@ impl Engine {
                     show_thinking,
                     allowed_tools,
                     hook_executor,
+                    verbosity,
                 } => {
                     self.handle_send_message(
                         content,
                         mode,
                         model,
                         goal_objective,
+                        goal_token_budget,
+                        goal_status,
                         reasoning_effort,
                         reasoning_effort_auto,
                         auto_model,
@@ -1141,6 +1179,7 @@ impl Engine {
                         show_thinking,
                         allowed_tools,
                         hook_executor,
+                        verbosity,
                     )
                     .await;
                 }
@@ -1412,7 +1451,7 @@ impl Engine {
                     } else if messages.is_empty() && system_prompt.is_none() {
                         self.session.id = uuid::Uuid::new_v4().to_string();
                     }
-                    self.session.messages = messages;
+                    self.session.messages = messages.into();
                     self.session.compaction_summary_prompt =
                         extract_compaction_summary_prompt(system_prompt.clone());
                     self.session.system_prompt = system_prompt;
@@ -1461,7 +1500,7 @@ impl Engine {
                         }
                     }
                     if let Some(idx) = cut {
-                        self.session.messages.truncate(idx);
+                        self.session.messages.truncate_to(idx);
                         self.session.bump_messages_revision();
                     }
                     // Now dispatch the new message as a normal send,
@@ -1472,6 +1511,8 @@ impl Engine {
                         mode,
                         self.session.model.clone(),
                         self.config.goal_objective.clone(),
+                        self.config.goal_token_budget,
+                        self.config.goal_status,
                         self.session.reasoning_effort.clone(),
                         self.session.reasoning_effort_auto,
                         self.session.auto_model,
@@ -1483,6 +1524,7 @@ impl Engine {
                         self.config.show_thinking,
                         self.config.allowed_tools.clone(),
                         self.config.hook_executor.clone(),
+                        self.config.verbosity.clone(),
                     )
                     .await;
                 }
@@ -1508,12 +1550,31 @@ impl Engine {
             .tx_event
             .send(Event::SessionUpdated {
                 session_id: self.session.id.clone(),
-                messages: self.session.messages.clone(),
+                messages: self.session.messages.clone().into(),
                 system_prompt: self.session.system_prompt.clone(),
                 model: self.session.model.clone(),
                 workspace: self.session.workspace.clone(),
             })
             .await;
+    }
+
+    fn goal_snapshot_for_event(&self) -> Option<GoalSnapshot> {
+        match self.config.goal_state.lock() {
+            Ok(state) => {
+                let snapshot = state.snapshot();
+                snapshot.objective.is_some().then_some(snapshot)
+            }
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned while emitting goal update: {err}");
+                None
+            }
+        }
+    }
+
+    async fn emit_goal_updated(&self) {
+        if let Some(snapshot) = self.goal_snapshot_for_event() {
+            let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+        }
     }
 
     async fn add_session_message(&mut self, message: Message) {
@@ -1524,13 +1585,11 @@ impl Engine {
     fn turn_metadata_block(
         &self,
         routed_model: &str,
-        mode: AppMode,
         auto_model: bool,
         reasoning_effort: Option<&str>,
         reasoning_effort_auto: bool,
     ) -> ContentBlock {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let mode_label = mode.description();
         let working_set_summary = self
             .session
             .working_set
@@ -1540,7 +1599,6 @@ impl Engine {
 
         let mut lines = vec![
             format!("Current local date: {today}"),
-            format!("Current mode: {mode_label}"),
             format!("Current model: {routed_model}"),
         ];
         if auto_model {
@@ -1575,7 +1633,6 @@ impl Engine {
     fn user_text_message_with_turn_metadata(&self, text: String) -> Message {
         self.user_text_message_with_turn_metadata_for_route(
             text,
-            self.current_mode,
             &self.session.model,
             self.session.auto_model,
             self.session.reasoning_effort.as_deref(),
@@ -1586,7 +1643,6 @@ impl Engine {
     fn user_text_message_with_turn_metadata_for_route(
         &self,
         text: String,
-        mode: AppMode,
         routed_model: &str,
         auto_model: bool,
         reasoning_effort: Option<&str>,
@@ -1609,7 +1665,6 @@ impl Engine {
                 },
                 self.turn_metadata_block(
                     routed_model,
-                    mode,
                     auto_model,
                     reasoning_effort,
                     reasoning_effort_auto,
@@ -1626,6 +1681,8 @@ impl Engine {
         mode: AppMode,
         model: String,
         goal_objective: Option<String>,
+        goal_token_budget: Option<u32>,
+        goal_status: GoalStatus,
         reasoning_effort: Option<String>,
         reasoning_effort_auto: bool,
         auto_model: bool,
@@ -1637,6 +1694,7 @@ impl Engine {
         show_thinking: bool,
         allowed_tools: Option<Vec<String>>,
         hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
+        verbosity: Option<String>,
     ) {
         // Reset cancel token for fresh turn (in case previous was cancelled)
         self.reset_cancel_token();
@@ -1731,7 +1789,6 @@ impl Engine {
         // Add user message to session
         let user_msg = self.user_text_message_with_turn_metadata_for_route(
             content,
-            mode,
             &model,
             auto_model,
             reasoning_effort.as_deref(),
@@ -1740,18 +1797,24 @@ impl Engine {
         self.session.add_message(user_msg);
 
         let previous_goal_objective = self.config.goal_objective.clone();
+        let previous_goal_token_budget = self.config.goal_token_budget;
+        let previous_goal_status = self.config.goal_status;
 
         self.session.model = model;
         self.config.model.clone_from(&self.session.model);
         self.config.goal_objective = goal_objective.clone();
+        self.config.goal_token_budget = goal_token_budget;
+        self.config.goal_status = goal_status;
         if normalized_goal_objective(previous_goal_objective.as_deref())
             != normalized_goal_objective(goal_objective.as_deref())
+            || previous_goal_token_budget != goal_token_budget
+            || previous_goal_status != goal_status
         {
             sync_goal_state_from_host(
                 &self.config.goal_state,
                 normalized_goal_objective(goal_objective.as_deref()).as_deref(),
-                None,
-                false,
+                goal_token_budget,
+                goal_status,
             );
         }
         self.config.allowed_tools = allowed_tools;
@@ -1765,6 +1828,7 @@ impl Engine {
         self.config.trust_mode = trust_mode;
         self.config.translation_enabled = translation_enabled;
         self.config.show_thinking = show_thinking;
+        self.config.verbosity = verbosity;
 
         // Refresh stable prompt context. Current mode is carried by the
         // request-time runtime prompt projection.
@@ -1919,6 +1983,11 @@ impl Engine {
                     tool.defer_loading = Some(false);
                 }
             }
+            filter_tool_catalog_for_gates(
+                &mut catalog,
+                self.config.allowed_tools.as_deref(),
+                self.config.disallowed_tools.as_deref(),
+            );
             catalog
         });
         let tool_catalog_for_event = tools.clone();
@@ -1962,6 +2031,7 @@ impl Engine {
 
         // Emit turn complete event — after all post-turn bookkeeping so
         // the terminal is immediately responsive when the UI receives it.
+        self.emit_goal_updated().await;
         let _ = self
             .tx_event
             .send(Event::TurnComplete {
@@ -2048,7 +2118,7 @@ impl Engine {
             Ok(result) => {
                 if !result.messages.is_empty() || self.session.messages.is_empty() {
                     let messages_after = result.messages.len();
-                    self.session.messages = result.messages;
+                    self.session.messages = result.messages.into();
                     self.merge_compaction_summary(result.summary_prompt);
                     self.emit_session_updated().await;
                     let removed = messages_before.saturating_sub(messages_after);
@@ -2144,7 +2214,7 @@ impl Engine {
         {
             Ok(result) => {
                 let messages_after = result.messages.len();
-                self.session.messages = result.messages;
+                self.session.messages = result.messages.into();
                 self.emit_session_updated().await;
 
                 let summary = format!(
@@ -2198,7 +2268,7 @@ impl Engine {
         while self.session.messages.len() > MIN_RECENT_MESSAGES_TO_KEEP
             && self.estimated_input_tokens() > target_input_budget
         {
-            self.session.messages.remove(0);
+            self.session.messages.trim_front(1);
             self.session.bump_messages_revision();
             removed = removed.saturating_add(1);
         }
@@ -2206,7 +2276,9 @@ impl Engine {
     }
 
     async fn recover_context_overflow(&mut self, client: &DeepSeekClient, reason: &str) -> bool {
-        let Some(target_budget) = context_input_budget(&self.session.model) else {
+        let Some(target_budget) =
+            context_input_budget_for_provider(self.api_provider, &self.session.model)
+        else {
             return false;
         };
 
@@ -2220,7 +2292,7 @@ impl Engine {
 
         let mut retries_used = 0u32;
         let mut summary_prompt = None;
-        let mut compacted_messages = self.session.messages.clone();
+        let mut compacted_messages: Vec<Message> = self.session.messages.clone().into();
 
         let mut forced_config = self.config.compaction.clone();
         forced_config.enabled = true;
@@ -2255,7 +2327,7 @@ impl Engine {
         }
 
         if !compacted_messages.is_empty() || self.session.messages.is_empty() {
-            self.session.messages = compacted_messages;
+            self.session.messages = compacted_messages.into();
         }
         self.merge_compaction_summary(summary_prompt);
 
@@ -2329,7 +2401,7 @@ impl Engine {
             self.session.model.clone(),
             self.session.workspace.clone(),
             self.session.system_prompt.clone(),
-            self.session.messages.clone(),
+            self.session.messages.clone().into(),
         ))
         .with_cancel_token(self.cancel_token.clone())
         .with_trusted_external_paths(trusted_external_paths);
@@ -2547,7 +2619,12 @@ impl Engine {
                 locale_tag: &self.config.locale_tag,
                 translation_enabled: self.config.translation_enabled,
                 model_id: &self.config.model,
+                context_window_override: Some(
+                    crate::config::provider_capability(self.api_provider, &self.config.model)
+                        .context_window,
+                ),
                 show_thinking: self.config.show_thinking,
+                verbosity: self.config.verbosity.as_deref(),
             },
         );
         let mut stable_prompt =
@@ -2699,10 +2776,10 @@ fn sync_goal_state_from_host(
     goal_state: &SharedGoalState,
     objective: Option<&str>,
     token_budget: Option<u32>,
-    completed: bool,
+    status: GoalStatus,
 ) {
     match goal_state.lock() {
-        Ok(mut state) => state.sync_from_host(objective, token_budget, completed),
+        Ok(mut state) => state.sync_from_host_status(objective, token_budget, status),
         Err(err) => tracing::warn!("goal state lock poisoned while syncing host goal: {err}"),
     }
 }
@@ -2874,8 +2951,8 @@ mod handle;
 pub(crate) use context::compact_tool_result_for_context;
 use context::{
     COMPACTION_SUMMARY_MARKER, MAX_CONTEXT_RECOVERY_ATTEMPTS, MIN_RECENT_MESSAGES_TO_KEEP,
-    context_input_budget, effective_max_output_tokens, extract_compaction_summary_prompt,
-    is_context_length_error_message, summarize_text,
+    context_input_budget_for_provider, effective_max_output_tokens,
+    extract_compaction_summary_prompt, is_context_length_error_message, summarize_text,
 };
 mod dispatch;
 mod loop_guard;
@@ -2888,8 +2965,23 @@ mod tool_setup;
 mod turn_loop;
 pub(crate) use token_estimate_cache::TokenEstimateCache;
 
+pub(super) const MAX_PARALLEL_SHELL_EXEC: usize = 4;
+
 pub(crate) fn default_active_native_tool_names() -> &'static [&'static str] {
     tool_catalog::DEFAULT_ACTIVE_NATIVE_TOOLS
+}
+
+/// Drop catalog entries the execution gates would reject (#3027): the model
+/// should never be advertised a tool it cannot call. Deny wins over allow.
+fn filter_tool_catalog_for_gates(
+    catalog: &mut Vec<Tool>,
+    allowed_tools: Option<&[String]>,
+    disallowed_tools: Option<&[String]>,
+) {
+    catalog.retain(|tool| {
+        !turn_loop::command_denies_tool(disallowed_tools, &tool.name)
+            && turn_loop::command_allows_tool(allowed_tools, &tool.name)
+    });
 }
 
 use self::approval::{ApprovalDecision, ApprovalResult, UserInputDecision};

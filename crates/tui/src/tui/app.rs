@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use codewhale_config::ProviderChain;
+
 use crate::artifacts::ArtifactRecord;
 use crate::client::{CacheWarmupKey, PromptInspection};
 use crate::compaction::CompactionConfig;
@@ -174,13 +176,15 @@ pub struct TurnCacheRecord {
     pub recorded_at: Instant,
 }
 
-/// DeepSeek reasoning-effort tier, mirrored on ChatGPT/Claude effort pickers.
+/// Reasoning-effort tier, mirrored across DeepSeek and Codex effort pickers.
 ///
 /// The config file accepts all five string values for forward-compat with
 /// providers that expose the full spectrum; DeepSeek currently collapses
-/// `Low`/`Medium` → `high` and `Max` → `max` at the API boundary. The
-/// keyboard cycler (Shift+Tab) walks only the three behaviorally distinct
-/// tiers: `Off` → `High` → `Max` → `Off`.
+/// `Low`/`Medium` → `high`. OpenAI Codex normalizes inherited DeepSeek-only
+/// `Off` to `Low` and displays/sends `Max` as `xhigh` at the provider
+/// boundary. The default keyboard cycler walks the three DeepSeek-distinct
+/// tiers: `Off` → `High` → `Max` → `Off`; provider-aware callers should use
+/// [`ReasoningEffort::cycle_next_for_provider`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
     Off,
@@ -203,9 +207,14 @@ impl ReasoningEffort {
             "medium" | "mid" => Self::Medium,
             "high" => Self::High,
             "auto" | "automatic" => Self::Auto,
-            "max" | "maximum" | "xhigh" => Self::Max,
+            "max" | "maximum" | "xhigh" | "ultracode" => Self::Max,
             _ => Self::default(),
         }
+    }
+
+    #[must_use]
+    pub fn from_setting_for_provider(value: &str, provider: ApiProvider) -> Self {
+        Self::from_setting(value).normalize_for_provider(provider)
     }
 
     /// Canonical lowercase label used for config storage and UI hints.
@@ -234,12 +243,57 @@ impl ReasoningEffort {
         }
     }
 
+    /// Provider-facing label for user-visible surfaces.
+    #[must_use]
+    pub fn display_label_for_provider(self, provider: ApiProvider) -> &'static str {
+        match (provider, self.normalize_for_provider(provider)) {
+            (ApiProvider::OpenaiCodex, Self::Low) => "low",
+            (ApiProvider::OpenaiCodex, Self::Medium) => "medium",
+            (ApiProvider::OpenaiCodex, Self::High) => "high",
+            (ApiProvider::OpenaiCodex, Self::Max) => "xhigh",
+            (_, effort) => effort.short_label(),
+        }
+    }
+
     /// Value forwarded to the engine/client. `None` means "provider default"
     /// (for `Off` we still emit `"off"` so the client can inject
     /// `thinking = {"type": "disabled"}`).
     #[must_use]
     pub fn api_value(self) -> Option<&'static str> {
         Some(self.as_setting())
+    }
+
+    #[must_use]
+    pub fn normalize_for_provider(self, provider: ApiProvider) -> Self {
+        if provider != ApiProvider::OpenaiCodex {
+            return self;
+        }
+        match self {
+            Self::Off => Self::Low,
+            Self::Auto => Self::Medium,
+            other => other,
+        }
+    }
+
+    #[must_use]
+    pub fn api_value_for_provider(self, provider: ApiProvider) -> Option<&'static str> {
+        if provider != ApiProvider::OpenaiCodex {
+            return self.api_value();
+        }
+        Some(match self.normalize_for_provider(provider) {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "xhigh",
+            Self::Off => "low",
+            Self::Auto => "medium",
+        })
+    }
+
+    #[must_use]
+    pub fn as_setting_for_provider(self, provider: ApiProvider) -> &'static str {
+        self.api_value_for_provider(provider)
+            .unwrap_or_else(|| self.as_setting())
     }
 
     /// Cycle through the three behaviorally distinct tiers.
@@ -250,6 +304,20 @@ impl ReasoningEffort {
             Self::Auto => Self::Off,
             Self::Low | Self::Medium | Self::High => Self::Max,
             Self::Max => Self::Off,
+        }
+    }
+
+    #[must_use]
+    pub fn cycle_next_for_provider(self, provider: ApiProvider) -> Self {
+        if provider != ApiProvider::OpenaiCodex {
+            return self.cycle_next();
+        }
+        match self.normalize_for_provider(provider) {
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Max,
+            Self::Max => Self::Low,
+            Self::Off | Self::Auto => Self::Low,
         }
     }
 }
@@ -1094,6 +1162,28 @@ pub enum HuntVerdict {
     Escaped,
 }
 
+impl HuntVerdict {
+    #[must_use]
+    pub fn goal_status(self) -> crate::tools::goal::GoalStatus {
+        match self {
+            Self::Hunting => crate::tools::goal::GoalStatus::Active,
+            Self::Hunted => crate::tools::goal::GoalStatus::Complete,
+            Self::Wounded => crate::tools::goal::GoalStatus::Paused,
+            Self::Escaped => crate::tools::goal::GoalStatus::Blocked,
+        }
+    }
+
+    #[must_use]
+    pub fn from_goal_status(status: crate::tools::goal::GoalStatus) -> Self {
+        match status {
+            crate::tools::goal::GoalStatus::Active => Self::Hunting,
+            crate::tools::goal::GoalStatus::Paused => Self::Wounded,
+            crate::tools::goal::GoalStatus::Complete => Self::Hunted,
+            crate::tools::goal::GoalStatus::Blocked => Self::Escaped,
+        }
+    }
+}
+
 /// Hunt tracking state (#2092 — was GoalState).
 #[derive(Debug, Clone, Default)]
 pub struct HuntState {
@@ -1157,6 +1247,11 @@ pub struct SidebarHoverRow {
     pub detail: Option<String>,
     /// Whether the compact row lost information.
     pub is_truncated: bool,
+    /// Slash command to execute when this row is clicked (#3028).
+    /// `shell_*` job ids route through `/jobs` (e.g. `/jobs cancel
+    /// shell_abc123`); task-manager ids route through `/task` (e.g.
+    /// `/task show task_abc123`).
+    pub click_action: Option<String>,
 }
 
 /// Per-section metadata for sidebar hover detection.
@@ -1260,6 +1355,9 @@ pub struct App {
     pub next_history_revision: u64,
     pub api_messages: Vec<Message>,
     pub is_loading: bool,
+    /// Whether the once-per-turn provider-wait incident (#3095) has already
+    /// been logged for the current turn.
+    pub provider_wait_incident_logged: bool,
     /// Ghost-text follow-up suggestion shown in the composer when empty.
     /// Generated asynchronously after each completed turn; cleared on new input.
     pub prompt_suggestion: Option<String>,
@@ -1297,6 +1395,10 @@ pub struct App {
     /// Updated by `/provider` switches so the UI/commands can read the
     /// active backend without re-deriving it from the live config.
     pub api_provider: ApiProvider,
+    /// Primary provider plus configured fallback providers for this session.
+    pub provider_chain: Option<ProviderChain>,
+    /// Human-readable description of the last provider fallback event.
+    pub last_fallback_reason: Option<String>,
     /// True when the active provider/base URL accepts arbitrary model IDs
     /// verbatim rather than DeepSeek-only aliases.
     pub model_ids_passthrough: bool,
@@ -1379,6 +1481,14 @@ pub struct App {
     pub cost_currency: CostCurrency,
     pub composer_density: ComposerDensity,
     pub composer_border: bool,
+    /// Voice input state — toggled by `/voice` and the voice hotbar action.
+    pub voice_enabled: bool,
+    /// Auto-send after transcription when the transcript ends with an
+    /// explicit send instruction ("send it" / "发送"). Toggled by `/voice-send`.
+    pub voice_send_enabled: bool,
+    /// AI-assisted dictation that sees the current composer text.
+    /// Toggled by `/voice-control`.
+    pub voice_control_enabled: bool,
     pub transcript_spacing: TranscriptSpacing,
     pub sidebar_width_percent: u16,
     pub sidebar_focus: SidebarFocus,
@@ -1406,6 +1516,8 @@ pub struct App {
     pub sidebar_resize_total_width: u16,
     /// Sidebar width changed during this drag and needs persistence.
     pub sidebar_width_dirty: bool,
+    /// Sidebar focus/hidden state changed and needs persistence.
+    pub sidebar_focus_dirty: bool,
     /// Whether the session-context panel is enabled (#504).
     pub context_panel: bool,
     /// Minimum number of consecutive safe tool cells needed for auto-collapse.
@@ -1423,6 +1535,7 @@ pub struct App {
     pub compact_threshold: usize,
     pub max_input_history: usize,
     pub allow_shell: bool,
+    pub verbosity: Option<String>,
     pub max_subagents: usize,
     /// Per-SSE-chunk idle timeout for streamed turns, in seconds.
     pub stream_chunk_timeout_secs: u64,
@@ -1445,6 +1558,16 @@ pub struct App {
     pub pending_subagent_dispatch: Option<String>,
     /// Animation anchor for status-strip active sub-agent spinner.
     pub agent_activity_started_at: Option<Instant>,
+    /// Monotonic counter for stable agent labels (#3030).
+    /// Incremented each time a sub-agent is spawned; used to generate
+    /// "Agent 1", "Agent 2", etc.
+    pub agent_counter: u64,
+    /// Maps raw agent_id to a stable user-facing label (#3030).
+    /// Populated when `AgentSpawned` fires; read by sidebar rendering.
+    pub agent_label_map: HashMap<String, String>,
+    /// Last time a sub-agent progress event triggered a redraw.
+    /// Used to throttle redraws under high sub-agent concurrency (#3033).
+    pub last_agent_progress_redraw: Option<Instant>,
     pub ui_theme: UiTheme,
     /// Active named theme. Drives the cell-level color remap in
     /// `tui::color_compat::ColorCompatBackend` so community presets
@@ -1628,6 +1751,9 @@ pub struct App {
     pub runtime_turn_id: Option<String>,
     /// Current runtime turn status (if known).
     pub runtime_turn_status: Option<String>,
+    /// Monotonic turn counter for stable user-facing labels (#3030).
+    /// Incremented each time a new turn starts; displayed as "Turn N".
+    pub turn_counter: u64,
     /// When the UI accepted a user message but has not observed `TurnStarted` yet.
     pub dispatch_started_at: Option<Instant>,
 
@@ -1769,6 +1895,13 @@ pub struct TaskPanelEntry {
     pub status: String,
     pub prompt_summary: String,
     pub duration_ms: Option<u64>,
+    pub kind: TaskPanelEntryKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskPanelEntryKind {
+    Background,
+    ModelReasoning,
 }
 
 impl QueuedMessage {
@@ -1901,6 +2034,10 @@ impl App {
         let mut effective_auth_config = config.clone();
         effective_auth_config.provider = Some(provider.as_str().to_string());
         let model_ids_passthrough = effective_auth_config.model_ids_pass_through();
+        let provider_chain = provider
+            .kind()
+            .map(|kind| ProviderChain::new(kind, &config.fallback_providers))
+            .filter(|chain| chain.providers().len() > 1);
 
         // Check if the effective provider has an API key. This must happen
         // after settings.default_provider is applied; otherwise a saved
@@ -1985,7 +2122,7 @@ impl App {
             ReasoningEffort::Auto
         } else {
             configured_reasoning_effort.map_or_else(ReasoningEffort::default, |s| {
-                ReasoningEffort::from_setting(s)
+                ReasoningEffort::from_setting_for_provider(s, provider)
             })
         };
 
@@ -2029,8 +2166,10 @@ impl App {
         let allow_shell = allow_shell || initial_mode == AppMode::Yolo;
         let shell_manager = new_shared_shell_manager(workspace.clone());
 
-        // Initialize hooks executor from config
-        let hooks_config = config.hooks_config();
+        // Initialize hooks executor from config, merged with project-local
+        // `.codewhale/hooks.toml` (#3026).
+        let hooks_config =
+            crate::hooks::HooksConfig::load_with_project(config.hooks_config(), &workspace);
         let hooks = HookExecutor::new(hooks_config, workspace.clone());
 
         // Initialize plan state
@@ -2098,6 +2237,7 @@ impl App {
             next_history_revision: 1,
             api_messages: Vec::new(),
             is_loading: false,
+            provider_wait_incident_logged: false,
             prompt_suggestion: None,
             prompt_suggestion_gen: std::sync::atomic::AtomicU64::new(0),
             offline_mode: false,
@@ -2111,6 +2251,8 @@ impl App {
             auto_model,
             last_effective_model: None,
             api_provider: provider,
+            provider_chain,
+            last_fallback_reason: None,
             model_ids_passthrough,
             pending_provider_switch: None,
             reasoning_effort,
@@ -2143,6 +2285,9 @@ impl App {
             cost_currency,
             composer_density,
             composer_border,
+            voice_enabled: false,
+            voice_send_enabled: false,
+            voice_control_enabled: false,
             transcript_spacing,
             sidebar_width_percent,
             sidebar_focus,
@@ -2157,6 +2302,7 @@ impl App {
             last_sidebar_handle_area: None,
             sidebar_resize_total_width: 0,
             sidebar_width_dirty: false,
+            sidebar_focus_dirty: false,
             context_panel: settings.context_panel,
             tool_collapse_threshold: 3,
             expanded_tool_runs: HashSet::new(),
@@ -2166,6 +2312,7 @@ impl App {
             compact_threshold,
             max_input_history,
             allow_shell,
+            verbosity: config.verbosity.clone(),
             max_subagents,
             stream_chunk_timeout_secs: config.stream_chunk_timeout_secs(),
             subagent_cache: Vec::new(),
@@ -2174,6 +2321,9 @@ impl App {
             last_fanout_card_index: None,
             pending_subagent_dispatch: None,
             agent_activity_started_at: None,
+            agent_counter: 0,
+            agent_label_map: HashMap::new(),
+            last_agent_progress_redraw: None,
             ui_theme,
             theme_id,
             onboarding,
@@ -2262,6 +2412,7 @@ impl App {
             last_balance_fetch: None,
             runtime_turn_id: None,
             runtime_turn_status: None,
+            turn_counter: 0,
             dispatch_started_at: None,
             workspace_context: None,
             workspace_context_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -2415,8 +2566,30 @@ impl App {
         true
     }
 
+    /// Whether mode/thinking selection is locked because a turn is in flight.
+    ///
+    /// While `is_loading`, the model/permission surface the engine is acting on
+    /// must not shift underneath it, so user-initiated mode and thinking changes
+    /// are refused (#2982). Returns true (and posts a concise status message) if
+    /// the change should be rejected — the caller leaves the selection unchanged
+    /// so the chip "twitches" back instead of moving.
+    fn reject_setting_change_while_busy(&mut self, what: &str) -> bool {
+        if self.is_loading {
+            self.status_message = Some(format!(
+                "{what} is locked while a turn is running — press Esc to interrupt first"
+            ));
+            self.needs_redraw = true;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Cycle through modes: Plan → Agent → YOLO → Plan.
     pub fn cycle_mode(&mut self) {
+        if self.reject_setting_change_while_busy("Mode") {
+            return;
+        }
         let next = match self.mode {
             AppMode::Plan => AppMode::Agent,
             AppMode::Agent => AppMode::Yolo,
@@ -2428,6 +2601,9 @@ impl App {
     /// Cycle through modes in reverse.
     #[allow(dead_code)]
     pub fn cycle_mode_reverse(&mut self) {
+        if self.reject_setting_change_while_busy("Mode") {
+            return;
+        }
         let next = match self.mode {
             AppMode::Agent => AppMode::Plan,
             AppMode::Yolo => AppMode::Agent,
@@ -2436,14 +2612,22 @@ impl App {
         let _ = self.set_mode(next);
     }
 
-    /// Cycle reasoning-effort through the three behaviorally distinct tiers:
-    /// `Off` → `High` → `Max` → `Off`.
+    /// Cycle reasoning-effort through the active provider's distinct tiers.
     pub fn cycle_effort(&mut self) {
-        self.reasoning_effort = self.reasoning_effort.cycle_next();
+        if self.reject_setting_change_while_busy("Thinking") {
+            return;
+        }
+        self.reasoning_effort = self
+            .reasoning_effort
+            .cycle_next_for_provider(self.api_provider);
         self.last_effective_reasoning_effort = None;
         self.needs_redraw = true;
         self.push_status_toast(
-            format!("Thinking: {}", self.reasoning_effort.short_label()),
+            format!(
+                "Thinking: {}",
+                self.reasoning_effort
+                    .display_label_for_provider(self.api_provider)
+            ),
             StatusToastLevel::Info,
             Some(1_500),
         );
@@ -2725,6 +2909,28 @@ impl App {
             .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
             .collect();
         self.collapsed_cell_map.clear();
+    }
+
+    /// #3030: return the stable user-facing label for an agent id
+    /// ("Agent 3"), assigning the next sequential label on first sight.
+    pub(crate) fn ensure_agent_label(&mut self, agent_id: &str) -> String {
+        if let Some(label) = self.agent_label_map.get(agent_id) {
+            return label.clone();
+        }
+        self.agent_counter = self.agent_counter.saturating_add(1);
+        let label = format!("Agent {}", self.agent_counter);
+        self.agent_label_map
+            .insert(agent_id.to_string(), label.clone());
+        label
+    }
+
+    /// #3030: read-only label lookup with raw-id fallback for agents the
+    /// label map has never seen.
+    pub(crate) fn agent_display_label(&self, agent_id: &str) -> String {
+        self.agent_label_map
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_else(|| agent_id.to_string())
     }
 
     pub fn mark_history_updated(&mut self) {
@@ -3277,7 +3483,10 @@ impl App {
     }
 
     pub fn set_sidebar_focus(&mut self, focus: SidebarFocus) {
-        self.sidebar_focus = focus;
+        if self.sidebar_focus != focus {
+            self.sidebar_focus = focus;
+            self.sidebar_focus_dirty = true;
+        }
         self.needs_redraw = true;
     }
 
@@ -3750,9 +3959,6 @@ impl App {
     }
 
     fn strip_raw_mouse_reports_from_input(&mut self) {
-        if !self.use_mouse_capture {
-            return;
-        }
         if let Some((input, cursor_position)) =
             strip_raw_mouse_report_runs(&self.input, self.cursor_position)
         {
@@ -4953,6 +5159,10 @@ impl App {
         self.last_effective_reasoning_effort = None;
         if auto_model {
             self.reasoning_effort = ReasoningEffort::Auto;
+        } else {
+            self.reasoning_effort = self
+                .reasoning_effort
+                .normalize_for_provider(self.api_provider);
         }
     }
 
@@ -4995,11 +5205,16 @@ impl App {
     pub fn reasoning_effort_display_label(&self) -> String {
         if self.auto_model || self.reasoning_effort == ReasoningEffort::Auto {
             if let Some(effective) = self.last_effective_reasoning_effort {
-                return format!("auto: {}", effective.short_label());
+                return format!(
+                    "auto: {}",
+                    effective.display_label_for_provider(self.api_provider)
+                );
             }
             return "auto".to_string();
         }
-        self.reasoning_effort.short_label().to_string()
+        self.reasoning_effort
+            .display_label_for_provider(self.api_provider)
+            .to_string()
     }
 
     pub fn compaction_config(&self) -> CompactionConfig {
@@ -5009,6 +5224,54 @@ impl App {
             model: self.effective_model_for_budget().to_string(),
             ..Default::default()
         }
+    }
+
+    pub fn fallback_chain_entries(&self) -> Vec<(usize, ApiProvider, bool)> {
+        let Some(chain) = &self.provider_chain else {
+            return Vec::new();
+        };
+        let position = chain.position();
+        chain
+            .providers()
+            .iter()
+            .enumerate()
+            .map(|(index, provider)| (index, ApiProvider::from_kind(*provider), index == position))
+            .collect()
+    }
+
+    pub fn fallback_chain_position(&self) -> Option<usize> {
+        self.provider_chain.as_ref().map(ProviderChain::position)
+    }
+
+    pub fn fallback_chain_len(&self) -> usize {
+        self.provider_chain
+            .as_ref()
+            .map_or(0, |chain| chain.providers().len())
+    }
+
+    pub fn advance_fallback(&mut self, reason: impl Into<String>) -> Option<ApiProvider> {
+        let reason = reason.into();
+        let chain = self.provider_chain.as_mut()?;
+        let Some(next_kind) = chain.advance() else {
+            self.last_fallback_reason = Some(format!(
+                "Fallback chain exhausted after {} provider(s): {reason}",
+                chain.providers().len()
+            ));
+            return None;
+        };
+        let next_provider = ApiProvider::from_kind(next_kind);
+        self.api_provider = next_provider;
+        self.last_fallback_reason = Some(format!(
+            "Fell back to {} after recoverable provider error: {reason}",
+            next_provider.as_str()
+        ));
+        Some(next_provider)
+    }
+
+    pub fn is_fallback_active(&self) -> bool {
+        self.provider_chain
+            .as_ref()
+            .is_some_and(ProviderChain::is_fallback_active)
     }
 }
 
@@ -5103,6 +5366,11 @@ pub enum AppAction {
     SwitchWorkspace {
         workspace: PathBuf,
     },
+    /// Record from the microphone and route the transcription into the
+    /// composer (or auto-send it). Emitted by `/voice` and the voice hotbar
+    /// action; handled in the UI event loop where the live `Config` supplies
+    /// provider credentials.
+    VoiceCapture,
     /// Export and share the current session as a web URL.
     ShareSession {
         history_len: usize,
@@ -5304,6 +5572,153 @@ mod tests {
     fn test_trust_mode_follows_yolo_on_startup() {
         let app = App::new(test_options(true), &Config::default());
         assert!(app.trust_mode);
+    }
+
+    #[test]
+    fn reasoning_effort_display_label_uses_codex_xhigh() {
+        assert_eq!(
+            ReasoningEffort::Off.display_label_for_provider(ApiProvider::OpenaiCodex),
+            "low"
+        );
+        assert_eq!(
+            ReasoningEffort::Medium.display_label_for_provider(ApiProvider::OpenaiCodex),
+            "medium"
+        );
+        assert_eq!(
+            ReasoningEffort::Max.display_label_for_provider(ApiProvider::OpenaiCodex),
+            "xhigh"
+        );
+        assert_eq!(
+            ReasoningEffort::Max.display_label_for_provider(ApiProvider::Deepseek),
+            "max"
+        );
+        assert_eq!(
+            ReasoningEffort::High.display_label_for_provider(ApiProvider::OpenaiCodex),
+            "high"
+        );
+
+        let mut app = App::new(test_options(false), &Config::default());
+        app.api_provider = ApiProvider::OpenaiCodex;
+        app.reasoning_effort = ReasoningEffort::Max;
+        app.auto_model = false;
+        assert_eq!(app.reasoning_effort_display_label(), "xhigh");
+
+        app.reasoning_effort = ReasoningEffort::Auto;
+        app.last_effective_reasoning_effort = Some(ReasoningEffort::Max);
+        assert_eq!(app.reasoning_effort_display_label(), "auto: xhigh");
+    }
+
+    #[test]
+    fn mode_and_thinking_are_locked_while_a_turn_is_running() {
+        // #2982: while a turn is in flight, user-initiated mode/thinking changes
+        // are refused with a concise message instead of shifting the surface the
+        // engine is acting on.
+        let mut app = App::new(test_options(false), &Config::default());
+        app.mode = AppMode::Agent;
+        app.reasoning_effort = ReasoningEffort::Max;
+        app.is_loading = true;
+
+        app.cycle_mode();
+        assert_eq!(app.mode, AppMode::Agent, "mode must not change while busy");
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("locked"),
+            "expected a 'locked' status message, got {:?}",
+            app.status_message
+        );
+
+        let before_effort = app.reasoning_effort;
+        app.cycle_effort();
+        assert_eq!(
+            app.reasoning_effort, before_effort,
+            "thinking must not change while busy"
+        );
+
+        // Once the turn finishes, the same gesture works again.
+        app.is_loading = false;
+        app.cycle_mode();
+        assert_ne!(app.mode, AppMode::Agent, "mode should change when idle");
+    }
+
+    #[test]
+    fn reasoning_effort_api_values_are_provider_aware_for_codex() {
+        assert_eq!(
+            ReasoningEffort::Off.normalize_for_provider(ApiProvider::OpenaiCodex),
+            ReasoningEffort::Low
+        );
+        assert_eq!(
+            ReasoningEffort::Auto.normalize_for_provider(ApiProvider::OpenaiCodex),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            ReasoningEffort::Max.api_value_for_provider(ApiProvider::OpenaiCodex),
+            Some("xhigh")
+        );
+        assert_eq!(
+            ReasoningEffort::Off.api_value_for_provider(ApiProvider::OpenaiCodex),
+            Some("low")
+        );
+        assert_eq!(
+            ReasoningEffort::Max.api_value_for_provider(ApiProvider::Deepseek),
+            Some("max")
+        );
+        assert_eq!(
+            ReasoningEffort::from_setting("ultracode"),
+            ReasoningEffort::Max
+        );
+    }
+
+    #[test]
+    fn set_model_selection_normalizes_codex_fixed_model_effort() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.api_provider = ApiProvider::OpenaiCodex;
+        app.reasoning_effort = ReasoningEffort::Off;
+
+        app.set_model_selection("gpt-5.5-codex".to_string());
+
+        assert_eq!(app.reasoning_effort, ReasoningEffort::Low);
+        assert!(!app.auto_model);
+        assert_eq!(app.reasoning_effort_display_label(), "low");
+    }
+
+    #[test]
+    fn app_new_normalizes_saved_codex_reasoning_effort() {
+        let _lock = lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+        let _token = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-codex-startup-token");
+        let config = Config {
+            provider: Some("openai-codex".to_string()),
+            providers: Some(ProvidersConfig {
+                openai_codex: ProviderConfig {
+                    model: Some(crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        for (raw, expected, display) in [
+            ("off", ReasoningEffort::Low, "low"),
+            ("auto", ReasoningEffort::Medium, "medium"),
+            ("max", ReasoningEffort::Max, "xhigh"),
+        ] {
+            std::fs::write(
+                tmp.path().join("settings.toml"),
+                format!("reasoning_effort = \"{raw}\"\n"),
+            )
+            .expect("settings");
+
+            let app = App::new(test_options(false), &config);
+
+            assert_eq!(app.api_provider, ApiProvider::OpenaiCodex);
+            assert_eq!(app.reasoning_effort, expected, "raw setting {raw}");
+            assert_eq!(app.reasoning_effort_display_label(), display);
+        }
     }
 
     #[test]
@@ -5551,12 +5966,34 @@ mod tests {
     }
 
     #[test]
-    fn composer_keeps_mouse_like_text_when_mouse_capture_is_disabled() {
+    fn composer_strips_raw_sgr_mouse_report_when_mouse_capture_is_disabled() {
         let mut app = App::new(test_options(false), &Config::default());
 
         app.insert_str("[<35;44;18M");
 
-        assert_eq!(app.input, "[<35;44;18M");
+        assert_eq!(app.input, "");
+        assert_eq!(app.cursor_position, 0);
+    }
+
+    #[test]
+    fn composer_strips_tail_only_mouse_report_burst_when_mouse_capture_is_disabled() {
+        let mut app = App::new(test_options(false), &Config::default());
+        app.insert_str("draft ");
+
+        app.insert_str(";76;20M35;74;22M35;73;23M");
+
+        assert_eq!(app.input, "draft ");
+        assert_eq!(app.cursor_position, "draft ".chars().count());
+    }
+
+    #[test]
+    fn composer_keeps_coordinate_like_text_when_mouse_capture_is_disabled() {
+        let mut app = App::new(test_options(false), &Config::default());
+
+        app.insert_str("Size 12;34M");
+
+        assert_eq!(app.input, "Size 12;34M");
+        assert_eq!(app.cursor_position, "Size 12;34M".chars().count());
     }
 
     #[test]

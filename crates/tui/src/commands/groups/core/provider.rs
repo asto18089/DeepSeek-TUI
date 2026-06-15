@@ -28,6 +28,10 @@ pub fn provider(app: &mut App, args: Option<&str>) -> CommandResult {
     let name = parts.next().unwrap_or("");
     let model_arg = parts.next();
 
+    if name.eq_ignore_ascii_case("fallback") {
+        return provider_fallback(app, model_arg);
+    }
+
     let Some(target) = ApiProvider::parse(name) else {
         return CommandResult::error(format!(
             "Unknown provider '{name}'. Expected: {}.",
@@ -68,6 +72,57 @@ pub fn provider(app: &mut App, args: Option<&str>) -> CommandResult {
         provider: target,
         model,
     })
+}
+
+fn provider_fallback(app: &mut App, subcommand: Option<&str>) -> CommandResult {
+    match subcommand {
+        Some("reset") => {
+            let Some((_, primary, _)) = app.fallback_chain_entries().first().copied() else {
+                return CommandResult::message(
+                    "No fallback providers configured. Add `fallback_providers` to your config.",
+                );
+            };
+            CommandResult::with_message_and_action(
+                format!(
+                    "Fallback chain reset to primary provider: {}.",
+                    primary.as_str()
+                ),
+                AppAction::SwitchProvider {
+                    provider: primary,
+                    model: None,
+                },
+            )
+        }
+        Some(other) => CommandResult::error(format!(
+            "Unknown fallback command '{other}'. Usage: /provider fallback [reset]"
+        )),
+        None => {
+            let entries = app.fallback_chain_entries();
+            if entries.is_empty() {
+                return CommandResult::message(
+                    "No fallback providers configured. Add `fallback_providers` to your config.",
+                );
+            }
+
+            let mut lines = vec![
+                format!("Current provider: {}", app.api_provider.as_str()),
+                "Fallback chain:".to_string(),
+            ];
+            for (index, provider, is_current) in entries {
+                let role = if index == 0 { "primary" } else { "fallback" };
+                let marker = if is_current { " <- current" } else { "" };
+                lines.push(format!(
+                    "  [{index}] {} ({role}){marker}",
+                    provider.as_str()
+                ));
+            }
+            if let Some(reason) = app.last_fallback_reason.as_deref() {
+                lines.push(format!("Last fallback: {reason}"));
+            }
+            lines.push("Use `/provider fallback reset` to return to the primary provider.".into());
+            CommandResult::message(lines.join("\n"))
+        }
+    }
 }
 
 fn expand_model_alias_for_provider(provider: ApiProvider, name: &str) -> String {
@@ -140,7 +195,9 @@ mod tests {
     #[test]
     fn unknown_provider_returns_error() {
         let mut app = create_test_app();
-        let result = provider(&mut app, Some("anthropic"));
+        // "anthropic" became a real provider in #3014; probe with an id that
+        // stays unknown.
+        let result = provider(&mut app, Some("not-a-provider"));
         let msg = result.message.expect("expected error message");
         assert!(msg.contains("Unknown provider"));
         assert!(msg.contains("openrouter"));
@@ -408,6 +465,31 @@ mod tests {
             }
             other => panic!("expected SwitchProvider action, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn provider_fallback_status_and_reset_use_configured_chain() {
+        let mut app = create_test_app();
+        app.provider_chain = Some(codewhale_config::ProviderChain::new(
+            codewhale_config::ProviderKind::Deepseek,
+            &[codewhale_config::ProviderKind::Openrouter],
+        ));
+
+        let status = provider(&mut app, Some("fallback"));
+        let message = status.message.expect("fallback status");
+        assert!(message.contains("Current provider: deepseek"));
+        assert!(message.contains("[0] deepseek (primary) <- current"));
+        assert!(message.contains("[1] openrouter (fallback)"));
+
+        let reset = provider(&mut app, Some("fallback reset"));
+        assert!(reset.message.as_deref().unwrap_or("").contains("deepseek"));
+        assert!(matches!(
+            reset.action,
+            Some(AppAction::SwitchProvider {
+                provider: ApiProvider::Deepseek,
+                model: None
+            })
+        ));
     }
 
     #[test]

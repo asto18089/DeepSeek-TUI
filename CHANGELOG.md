@@ -7,6 +7,336 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.60] - 2026-06-13
+
+### Added
+
+- **Agent Fleet real-run cutover (#3154/#3096).** `codewhale fleet run` now
+  launches durable workers through the headless `codewhale exec --output-format
+  stream-json` path instead of the local simulation interpreter, with terminal
+  worker events freeing leases so queued fleet tasks continue running.
+- **Read-only shell parallelism (#2983).** The engine can now run conservative
+  read-only shell calls in parallel, including strict `bash`/`sh`/`zsh -c`
+  wrappers for whitelisted commands, while writes, stdin, background TTY work,
+  redirects, pipes, command substitution, and follow-mode tails stay serial.
+- **Declarative JS/TS WhaleFlow authoring (#3097).** WhaleFlow now accepts a
+  compile-only `workflow({...})` JavaScript/TypeScript authoring form that
+  lowers into the existing `WorkflowSpec` validator without executing user
+  JavaScript.
+- **Slash-menu Ctrl+P/Ctrl+N navigation (#3196).** The slash command menu now
+  supports Ctrl+P/Ctrl+N movement without letting the global file picker steal
+  focus while the menu is open. Thanks @1Git2Clone for the PR.
+- **New models and first-party provider routes.** This release adds
+  **GLM-5.2** (selectable on the Z.ai Coding Plan and over OpenRouter as
+  `z-ai/glm-5.2`, alongside the existing GLM-5.1 default), a first-party
+  **Z.ai** provider route, a first-party **StepFun / StepFlash** route
+  (`step-3.7-flash`), and a first-party **MiniMax** route defaulting to
+  `MiniMax-M3` with the M2.7/M2.5/M2.1 family selectable (#3187/#3191).
+
+### Changed
+
+- **README and contributor credits.** The README now has a shorter public
+  overview and moves the full contributor ledger to `docs/CONTRIBUTORS.md`,
+  preserving public thanks for [DeepSeek](https://github.com/deepseek-ai),
+  [DataWhale](https://github.com/datawhalechina),
+  [OpenWarp](https://github.com/zerx-lab/warp), and
+  [Open Design](https://github.com/nexu-io/open-design).
+- **Fleet-backed sub-agent direction.** Runtime docs now state the intended
+  cutover clearly: "sub-agent" is role/UX vocabulary, while durable detached
+  work should converge on the fleet-backed worker lifecycle with retries,
+  receipts, and ledgered inspection.
+
+### Fixed
+
+- **Sub-agent eval no longer blocks by default.** `agent_eval` now returns the
+  current projection immediately and delivers follow-up input without waiting
+  for a running child to finish its provider call. Pass `block:true` for an
+  intentional terminal wait.
+- **Z.ai GLM thinking traces.** Direct Z.ai requests now use the documented
+  `thinking` shape, preserve and replay `reasoning_content`, classify GLM
+  reasoning streams as thinking output, and accept `ultracode` as a max-effort
+  alias.
+- **Claude skill archive compatibility (#2743).** `/skill install` keeps
+  portable Claude-style skill folders supported while rejecting multi-skill
+  Claude plugin archives clearly instead of silently installing only one skill
+  and dropping plugin semantics. Thanks @AiurArtanis for the ecosystem request.
+
+## [0.8.59] - 2026-06-12
+
+### Added
+
+- **Moonshot Kimi K2.7 Code model.** The Moonshot/Kimi provider now defaults to
+  `kimi-k2.7-code`, recognizes `kimi`/`kimi-k2` aliases for that model, keeps
+  explicit `kimi-k2.6` selectable, and adds the OpenRouter
+  `moonshotai/kimi-k2.7-code` registry row.
+- **Concise verbosity mode (#3052).** CLI noninteractive launches now default
+  to concise prompt/output discipline unless overridden by config, env, or
+  `--verbosity`, while interactive TUI launches remain normal by default.
+  Thanks @cyq1017 for the PR.
+- **Ephemeral generated project context (#3058).** Opening CodeWhale in a
+  directory with no instruction files now keeps the bounded generated project
+  overview in memory instead of creating `.codewhale/instructions.md`.
+- **ACP registry auth metadata (#1447).** The ACP stdio adapter now advertises
+  terminal authentication setup in `initialize.authMethods`, matching the
+  registry's validation requirement.
+- **Sidebar context menus (#3065).** Right-clicking the sidebar no longer shows
+  `Paste`; clickable sidebar rows now offer their row command as the first
+  context action.
+- **Sidebar hover popovers (#3088).** Streaming turns now keep sidebar hover
+  popovers responsive while continuing to throttle transcript/body mouse
+  motion.
+- **Dark-theme selection contrast (#3074, thanks @drpars).** Session, config,
+  help, context-menu, and approval selections now use the muted selection
+  background instead of the bright accent color.
+- **Cursor-style activity metadata rows (#3146).** Dense successful tool-run
+  summaries now render as a single muted `Explored ...` / `Updated metadata`
+  row, include short command-family labels for successful generic verifier
+  groups, and keep keyboard/mouse expansion and detail inspection intact.
+- **Provider-wait observability (#3095).** Footer stall reasons now name the
+  active provider/model route, idle seconds vs stream budget, and whether a
+  fanout plan is still at `0 running` or dispatch is pending. Structured
+  provider-wait incidents log once per turn from the main tick loop (not on
+  every footer redraw).
+- **Interactive fanout launch gate (#3095).** Direct sub-agent children queue
+  behind a configurable semaphore (`[subagents] interactive_max_launch`,
+  default 4) with a visible `queued: waiting for an interactive fanout slot`
+  reason before their first model step.
+- **Goal lifecycle controls.** `/goal` is now the primary command surface for
+  session goals, with `pause`, `resume`, `complete`, `blocked`, and `clear`
+  controls while `/hunt` remains a compatibility alias.
+- **Persistent thread-goal API.** App-server clients can now set, get, and clear
+  durable thread goals through `thread/goal/set`, `thread/goal/get`, and
+  `thread/goal/clear`, backed by the state store with Codex-style status and
+  token/time accounting fields.
+- **Command-boundary ownership layers (#2888/#3055).** Built-in slash command
+  metadata now lives in `commands/registry.rs`, slash parsing in
+  `commands/parse.rs`, and handlers under group-owned command areas, preserving
+  the existing dispatch surface while reducing future `commands/mod.rs` churn.
+- **Approval-rule source metadata (#1186/#2971).** Runtime API
+  `approval.required` events now include optional `matched_rule` metadata when
+  an execution-policy rule caused the prompt. Thanks @greyfreedom for the PR
+  and @Ram9199 for the audit-semantics discussion.
+- **Localized tool-family labels (#2901).** Tool activity labels for read,
+  patch, run, find, delegate, fanout, RLM, verify, think, and generic tool
+  work now route through the shipped locale tables. Thanks @gordonlu for the
+  PR.
+- **Localized config section labels (#2918).** The interactive config view now
+  localizes section and session/saved scope labels while preserving English
+  search terms. Thanks @gordonlu for the PR.
+- **Localized config editor labels (#2919).** The config editor modal now
+  localizes edit labels, default/unavailable placeholders, and effective
+  currency hints. Thanks @gordonlu for the PR.
+- **Hotbar number-key dispatch (#3056).** Bare `1`-`8` now trigger bound
+  hotbar slots only when the composer is empty, while `Alt+1`-`Alt+8` trigger
+  slots regardless of composer text and overlays keep key ownership. Thanks
+  @reidliu41 for the PR.
+- **Voice dictation commands (#3051).** `/voice`, `/voice-send`, and
+  `/voice-control` now record through `sox`/`rec`/`arecord`, transcribe via the
+  active provider's chat-completions API, and insert transcripts at the
+  composer cursor. The `voice.toggle` hotbar action dispatches the real voice
+  command, with help and status text localized across all seven shipped
+  locales. Thanks @huqiantao for the PR.
+- **Thread rewind and snapshot restore API (#2808).** GUI clients can now call
+  `POST /v1/threads/{id}/undo`, `/patch-undo`, and `/retry` to fork, roll back,
+  or rerun recent thread turns, plus `POST /v1/snapshots/{id}/restore` to
+  restore a workspace snapshot by id. Thanks @bengao168 for the PR.
+- **Active provider fallback chain (#2773).** Configured `fallback_providers`
+  now build an ordered primary-plus-fallback route that the TUI can report,
+  advance through, and reset with `/provider fallback reset`, including footer
+  visibility for fallback state. Thanks @idling11 for the PR.
+- **Provider metadata registry (#3005).** Built-in provider ids, display names,
+  defaults, env vars, config keys, aliases, and wire formats now live in a
+  shared metadata registry, with the provider drift check covering the registry
+  contract. Thanks @sximelon for the PR.
+- **Hugging Face provider route (#2879).** Hugging Face Inference Providers now
+  have first-class config, env, docs, and registry coverage for the
+  OpenAI-compatible router, including `huggingface`/`hugging-face`/
+  `hugging_face`/`hf` aliases and `HUGGINGFACE_*`/`HF_*` env fallbacks. Thanks
+  @mvanhorn for the PR.
+
+### Fixed
+
+- **SSE data lines without spaces (#3152).** Chat Completions, Responses, and
+  Anthropic stream readers now accept both `data: {...}` and `data:{...}` SSE
+  frames, matching the spec and preventing providers that omit the optional
+  space from streaming empty output. Thanks @wgeeker for the PR.
+- **Runtime thread detail N+1 reads (#3141).** `get_thread_detail` now scans
+  persisted turn items once and groups them by turn instead of reading the
+  items directory once per turn, preserving item order while keeping large
+  thread detail loads responsive.
+- **Project-local hook trust boundary (#3140).** `.codewhale/hooks.toml` is now
+  loaded only after the workspace is trusted in user-owned config, matching the
+  project-local MCP trust model while preserving the documented shell-command
+  hook contract.
+- **Skill registry sync latency (#3139).** `/skills sync` now syncs registry
+  entries with bounded ordered concurrency, so network latency no longer stacks
+  one skill at a time while output order stays deterministic.
+- **SiliconFlow China provider config (#2893/#2895).** `siliconflow-CN`
+  now reads its own `[providers.siliconflow_cn]` / `[providers.siliconflow-CN]`
+  table and falls back to `[providers.siliconflow]` only for unset
+  `api_key`/`base_url`/`model` fields. Thanks @Artenx for the report and
+  @idling11 for the PR.
+- **Self-update download timeout (#3006).** `codewhale update` now applies a
+  five-minute HTTP client timeout so blocked or very slow GitHub release
+  downloads fail instead of hanging indefinitely. Thanks @New2Niu for the PR.
+- **Legacy `deepseek` update migration (#2960/#3013/#3053).** Running
+  `deepseek update` or `deepseek-tui update` from a pre-rebrand install now
+  returns copy-pasteable npm, Cargo, Homebrew, and manual-binary migration
+  steps instead of trying to spawn a missing `codewhale` binary. README and
+  rebrand docs now cover the same upgrade path. Thanks @jazzi and
+  @tiangangQiu for the reports, @cyq1017 for the update-path PR, and
+  @angus-guo for the README PR.
+- **Short `codew` shim delegation.** The `codew` convenience binary now
+  prefers the sibling `codewhale` dispatcher installed next to it before
+  falling back to `PATH`, preventing fresh local builds or installs from
+  accidentally invoking an older global dispatcher.
+- **Constitution trust wording (#2950/#3008).** The base prompt now explains
+  that "begins with an A" means a baseline of trust, not a literal output
+  formatting rule. Thanks @cyq1017 for the PR.
+- **TUI provider-source recovery (#3007/#3011).** Unsupported interactive
+  providers now report whether the value came from `--provider`, environment,
+  or config. Config-sourced unsupported providers fall back to DeepSeek without
+  forwarding stale keyring secrets. Thanks @cyq1017 for the PR.
+- **Exec auto-model handoff (#3148).** `codewhale exec --model auto` now
+  survives the CLI/TUI boundary by honoring the CodeWhale model env alias and
+  legacy DeepSeek model handoff before falling back to provider defaults.
+  Thanks @hongchen1993 for the PR.
+- **macOS shortcut modifiers (#2938/#2943).** Ctrl-like shortcuts that are
+  reported as `SUPER` by macOS terminals now work for backgrounding tasks and
+  sidebar-focus chords without rewriting clipboard shortcuts. Thanks @idling11
+  for the PR.
+- **TUI mouse-report leak (#3063/#3067).** Strip raw SGR mouse coordinate
+  tails from the composer even when `use_mouse_capture` is false, covering
+  orphaned terminal reporting state after crashes or focus races.
+- **Interrupted sub-agent lifecycle (#3080).** API-timeout interruptions now
+  emit `MailboxMessage::Interrupted`, render terminal interrupted cards, and
+  reconcile stale running fanout counts from manager snapshots.
+- **OpenAI Codex stream diagnostics and active tool collapse (#3146).** The
+  Responses bridge now reports nested `response.failed` /
+  `response.incomplete` errors instead of `unknown`, and dense successful
+  in-flight tool bursts collapse into the same calm activity metadata row as
+  committed history.
+- **OpenAI Codex reasoning tiers.** Switching from DeepSeek to `openai-codex`
+  now normalizes stale reasoning state into Responses-compatible
+  `low`/`medium`/`high`/`xhigh` tiers. Startup, `/config`, and the model
+  picker now display Codex labels instead of leaking DeepSeek
+  `off`/`max` names, while Codex still reports as a Responses payload
+  provider. The Responses request builder also clamps legacy `minimal` input
+  to `low` and has regression coverage that Codex requests use
+  `reasoning.effort`, not DeepSeek `thinking` fields.
+- **OpenAI Codex context metadata (#3070).** The `gpt-5.5` default and
+  CodeWhale aliases now use OpenAI's documented 1,050,000-token context window
+  and 128,000 max-output metadata for context pressure, prompts, and doctor
+  capability output.
+- **OpenAI Codex effective context budgeting.** The public OpenAI API metadata
+  for `gpt-5.5` remains 1,050,000 tokens, but the `openai-codex` OAuth route now
+  budgets prompts against the 400K Codex-family effective window so preflight
+  compaction runs before the backend returns `context_length_exceeded`.
+- **OpenRouter Nemotron 3 Ultra preset.** The OpenRouter preset and model
+  registry now emit `nvidia/nemotron-3-ultra-550b-a55b` while keeping the old
+  Ultra aliases compatible.
+- **OpenRouter auth after MiMo switches (#3064).** Switching from Xiaomi MiMo
+  to OpenRouter now has regression coverage for preflight key failures and
+  Bearer auth header isolation before any request can be dispatched.
+- **Responses strict-tool schema compatibility (#3062/#3017/#1883).** Responses
+  function tools now preserve per-tool strict-mode compatibility, keep optional
+  strict-schema fields nullable, and append deterministic constraint notes when
+  root composition groups must be flattened for Responses.
+- **Runtime prompt autonomous loop guard (#3061).** Runtime policy reference
+  now explicitly forbids initiating new work when `<runtime_prompt>` is the
+  only new turn content and no tool/sub-agent handoff is pending.
+- **Goal runtime status sync.** Goal token budgets and active/paused/complete
+  status now sync into the engine alongside the objective, and model-visible
+  `update_goal` can only mark goals complete or blocked.
+
+### Contributors
+
+- Devin session work on #3080/#3095 (PRs #3103, #3104, #3106) — Hunter Bown
+  (maintainer integration/cherry-pick on `codex/v0.8.59-release-ready`).
+- Nightt (@nightt5879) for the Responses strict-tool schema hardening in PR
+  #3062.
+- yekern (@yekern) for the #3061 runtime-prompt loop safety report and repro
+  that shaped the dispatch guard.
+- Paulo Aboim Pinto (@aboimpinto) for the staged command-boundary design and
+  Layer 3 registry/parser extraction in PR #2888, plus the #2851/#2791/#2870
+  architecture stream that guided the grouped command areas in #3055.
+
+## [0.8.58] - 2026-06-11
+
+### Added
+
+- **Native Anthropic provider.** A dedicated Messages API adapter
+  (`/v1/messages` with `x-api-key` auth) replaces OpenAI-dialect shims for
+  Claude models: adaptive thinking with `output_config.effort` shaping,
+  prompt-cache breakpoints (capped at 4, earliest dropped), signed-thinking
+  replay via `signature_delta`, normalized cache-hit/miss usage telemetry,
+  and SSE error envelopes. `claude-opus-4-8`, `claude-sonnet-4-6`, and
+  `claude-haiku-4-5` join the model registry; configure with
+  `ANTHROPIC_API_KEY` (#3014).
+- **Hooks v2.** `tool_call_before` hooks can now return a JSON decision —
+  `{"decision": "allow"|"deny"|"ask", "reason", "updatedInput",
+  "additionalContext"}` — with deny > ask > allow precedence across multiple
+  hooks, last-writer-wins input rewriting, and concatenated context. Exit
+  code 2 remains a legacy hard deny. Hooks support glob matchers and
+  project-local `.codewhale/hooks.toml` (#3026).
+- **Clickable sidebar.** Background-job rows show/cancel on click, the
+  Ctrl+K hint row runs `/jobs cancel-all`, and agent rows open `/subagents`;
+  row actions are built in the same pass as the rendered lines so a click
+  can never target the wrong job (#3028).
+- OSC 8 out-of-band hyperlink infrastructure with per-region open/close
+  sequences that survive partial redraws (#3029).
+- `codewhale exec` gains `--allowed-tools`, `--disallowed-tools` (deny wins),
+  `--max-turns`, and `--append-system-prompt` (#3027).
+- Constitution prompt source: YAML source-of-truth plus Python renderer for
+  the system prompt, with the active prompt now served from
+  `constitution.md` (#3015, renderer reconciliation still tracked).
+- Agent-task issue template, labels, and runner protocol (#3021); remote
+  smoke-test droplet loop hardening — gh CLI, swapfile, agent sessions
+  (#3022).
+
+### Changed
+
+- **Sub-agent routing is provider-aware.** DeepSeek ids are no longer
+  hardcoded into model validation; routing works from per-provider
+  big/cheap candidates, the network router is skipped when a provider has
+  no cheap tier, and spawn-time model requests are validated against the
+  active provider (#3018).
+- Model-specific facts in the system prompt (context window, sub-agent
+  pricing, thinking notes, architecture characteristics) are now templated
+  per-model instead of hardcoded DeepSeek V4 claims, in both `base.md` and
+  `constitution.md` (#3025).
+- Provider capability lookups for Moonshot/OpenAI/Atlascloud resolve from
+  per-model registry rows (bare and vendor-prefixed ids) instead of
+  hardcoded 64K-era floors (#3023).
+- Reasoning-effort now reaches Atlascloud (DeepSeek dialect), Moonshot
+  (`thinking` enable/disable), and Ollama (`think` param) (#3024); Moonshot/
+  Kimi models joined the reasoning-content provider and model gates (#3016).
+- Transcript polish: compact tool-call cells without boilerplate (#3031),
+  internal turn/agent ids hidden behind stable labels (#3030), and Ctrl+B
+  now backgrounds the running foreground shell directly instead of opening
+  a menu (#3032).
+- The Tasks sidebar separates "Model reasoning" from "Background commands",
+  and `auth list` reports the same active-credential source as
+  `auth status` for openai-codex.
+
+### Fixed
+
+- **TUI freeze under sub-agent load.** Rapid `AgentProgress` events
+  saturated the render loop and starved terminal input; progress-driven
+  repaints are now throttled to one per 100ms (#3033).
+- **Hooks on Windows.** Hook commands were passed to `cmd /C` through
+  CRT-style argument quoting, which injected literal `\"` sequences that
+  cmd.exe never unescapes — JSON decisions could not parse. Commands now
+  reach cmd.exe verbatim via `raw_arg`.
+- Codex Responses: assistant tool results are converted to
+  `function_call_output` items (multi-turn tool calling previously broke),
+  tool schemas are sanitized for the Responses API, and `maximum` effort
+  maps to `xhigh` (#3019, #3017 — both partially; retry/backoff and
+  per-tool strict mode remain open).
+- Better tool-denial and provider error messages harvested from PR #2933
+  (#3020).
+
+
 ## [0.8.57] - 2026-06-10
 
 ### Added
@@ -1636,7 +1966,10 @@ overflow report and `/theme` picker edge-wrapping patch in #1814.
 
 Older releases (v0.8.39 and earlier) are archived in [docs/CHANGELOG_ARCHIVE.md](docs/CHANGELOG_ARCHIVE.md).
 
-[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.57...HEAD
+[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.60...HEAD
+[0.8.60]: https://github.com/Hmbown/CodeWhale/compare/v0.8.59...v0.8.60
+[0.8.59]: https://github.com/Hmbown/CodeWhale/compare/v0.8.58...v0.8.59
+[0.8.58]: https://github.com/Hmbown/CodeWhale/compare/v0.8.57...v0.8.58
 [0.8.57]: https://github.com/Hmbown/CodeWhale/compare/v0.8.56...v0.8.57
 [0.8.56]: https://github.com/Hmbown/CodeWhale/compare/v0.8.55...v0.8.56
 [0.8.55]: https://github.com/Hmbown/CodeWhale/compare/v0.8.54...v0.8.55

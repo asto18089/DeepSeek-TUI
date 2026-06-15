@@ -36,7 +36,8 @@ pub(super) async fn resolve_auto_model_selection(
         latest_request,
         &recent_auto_router_context(&app.api_messages),
         if app.auto_model { "auto" } else { "fixed" },
-        app.reasoning_effort.as_setting(),
+        app.reasoning_effort
+            .as_setting_for_provider(app.api_provider),
     )
     .await
 }
@@ -171,6 +172,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: "The user seems to be asking me to classify myself.".to_string(),
                     },
                     ContentBlock::Text {

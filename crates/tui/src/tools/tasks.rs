@@ -429,6 +429,10 @@ impl ToolSpec for TaskShellStartTool {
         ApprovalRequirement::Required
     }
 
+    fn starts_detached_for(&self, input: &Value) -> bool {
+        input.get("command").and_then(Value::as_str).is_some()
+    }
+
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let mut shell_input = json!({
             "command": required_str(&input, "command")?,

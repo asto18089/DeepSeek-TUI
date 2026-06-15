@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 
 use crate::config::{ApiProvider, Config};
+use crate::features::{FEATURES, Stage};
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::settings::Settings;
@@ -38,7 +39,6 @@ pub enum ModalKind {
     FeedbackPicker,
     ThemePicker,
     ContextMenu,
-    ShellControl,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +77,15 @@ pub enum ContextMenuAction {
     },
     /// Show all currently hidden cells.
     ShowAllHidden,
+    /// Execute a slash command associated with a contextual UI row.
+    ExecuteCommand {
+        command: String,
+    },
+    /// Copy a pre-resolved text payload (e.g. a sidebar row's full text)
+    /// to the clipboard.
+    CopyText {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -195,8 +204,6 @@ pub enum ViewEvent {
     ContextMenuSelected {
         action: ContextMenuAction,
     },
-    ShellControlBackground,
-    ShellControlCancel,
     /// Emitted by the pager (`c` / `y`) to copy its body to the system
     /// clipboard. The host handler writes via `app.clipboard` and surfaces a
     /// status message — modal views cannot reach `app` directly. `label` is
@@ -364,153 +371,20 @@ impl fmt::Debug for ViewStack {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShellControlChoice {
-    Background,
-    Cancel,
-}
-
-impl ShellControlChoice {
-    fn event(self) -> ViewEvent {
-        match self {
-            ShellControlChoice::Background => ViewEvent::ShellControlBackground,
-            ShellControlChoice::Cancel => ViewEvent::ShellControlCancel,
-        }
-    }
-}
-
-pub struct ShellControlView {
-    selected: ShellControlChoice,
-}
-
-impl ShellControlView {
-    pub fn new() -> Self {
-        Self {
-            selected: ShellControlChoice::Background,
-        }
-    }
-
-    fn toggle(&mut self) {
-        self.selected = match self.selected {
-            ShellControlChoice::Background => ShellControlChoice::Cancel,
-            ShellControlChoice::Cancel => ShellControlChoice::Background,
-        };
-    }
-}
-
-impl ModalView for ShellControlView {
-    fn kind(&self) -> ModalKind {
-        ModalKind::ShellControl
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => ViewAction::Close,
-            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                self.toggle();
-                ViewAction::None
-            }
-            KeyCode::Char('b') | KeyCode::Char('B') => {
-                ViewAction::EmitAndClose(ViewEvent::ShellControlBackground)
-            }
-            KeyCode::Char('c') | KeyCode::Char('C') => {
-                ViewAction::EmitAndClose(ViewEvent::ShellControlCancel)
-            }
-            KeyCode::Enter => ViewAction::EmitAndClose(self.selected.event()),
-            _ => ViewAction::None,
-        }
-    }
-
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        use ratatui::{
-            style::Style,
-            text::{Line, Span},
-            widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
-        };
-
-        let popup_width = 62.min(area.width.saturating_sub(4));
-        let popup_height = 11.min(area.height.saturating_sub(2));
-
-        let popup_area = Rect {
-            x: (area.width - popup_width) / 2,
-            y: (area.height - popup_height) / 2,
-            width: popup_width,
-            height: popup_height,
-        };
-
-        Clear.render(popup_area, buf);
-
-        let option_line = |choice: ShellControlChoice, key: &'static str, label: &'static str| {
-            let selected = self.selected == choice;
-            let style = if selected {
-                Style::default()
-                    .fg(palette::SELECTION_TEXT)
-                    .bg(palette::SELECTION_BG)
-            } else {
-                Style::default().fg(palette::TEXT_PRIMARY)
-            };
-            Line::from(vec![
-                Span::styled(if selected { "> " } else { "  " }, style),
-                Span::styled(format!("{key:<3}"), style.bold()),
-                Span::styled(label, style),
-            ])
-        };
-
-        let lines = vec![
-            Line::from(Span::styled(
-                "Foreground shell command is still running.",
-                Style::default().fg(palette::TEXT_PRIMARY),
-            )),
-            Line::from(""),
-            option_line(
-                ShellControlChoice::Background,
-                "B",
-                "Background - detach and keep the command running",
-            ),
-            option_line(
-                ShellControlChoice::Cancel,
-                "C",
-                "Cancel - stop the command and interrupt this turn",
-            ),
-        ];
-
-        let view = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title(Line::from(vec![Span::styled(
-                        " Shell command ",
-                        Style::default().fg(palette::DEEPSEEK_BLUE).bold(),
-                    )]))
-                    .title_bottom(Line::from(Span::styled(
-                        " Enter select | Esc close ",
-                        Style::default().fg(palette::TEXT_MUTED),
-                    )))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(palette::BORDER_COLOR))
-                    .style(Style::default().bg(palette::DEEPSEEK_INK))
-                    .padding(Padding::uniform(1)),
-            )
-            .style(Style::default().fg(palette::TEXT_PRIMARY));
-
-        view.render(popup_area, buf);
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigScope {
     Session,
     Saved,
 }
 
 impl ConfigScope {
-    fn label(self) -> &'static str {
-        match self {
-            ConfigScope::Session => "SESSION",
-            ConfigScope::Saved => "SAVED",
-        }
+    fn label(self, locale: Locale) -> &'static str {
+        tr(
+            locale,
+            match self {
+                ConfigScope::Session => MessageId::ConfigScopeSession,
+                ConfigScope::Saved => MessageId::ConfigScopeSaved,
+            },
+        )
     }
 
     fn persist(self) -> bool {
@@ -538,21 +412,28 @@ enum ConfigSection {
     Sidebar,
     History,
     Mcp,
+    Fleet,
+    Experimental,
 }
 
 impl ConfigSection {
-    fn label(self) -> &'static str {
-        match self {
-            ConfigSection::Provider => "Provider",
-            ConfigSection::Model => "Model",
-            ConfigSection::Permissions => "Permissions",
-            ConfigSection::Network => "Network",
-            ConfigSection::Display => "Display",
-            ConfigSection::Composer => "Composer",
-            ConfigSection::Sidebar => "Sidebar",
-            ConfigSection::History => "History",
-            ConfigSection::Mcp => "MCP",
-        }
+    fn label(self, locale: Locale) -> &'static str {
+        tr(
+            locale,
+            match self {
+                ConfigSection::Provider => MessageId::ConfigSectionProvider,
+                ConfigSection::Model => MessageId::ConfigSectionModel,
+                ConfigSection::Permissions => MessageId::ConfigSectionPermissions,
+                ConfigSection::Network => MessageId::ConfigSectionNetwork,
+                ConfigSection::Display => MessageId::ConfigSectionDisplay,
+                ConfigSection::Composer => MessageId::ConfigSectionComposer,
+                ConfigSection::Sidebar => MessageId::ConfigSectionSidebar,
+                ConfigSection::History => MessageId::ConfigSectionHistory,
+                ConfigSection::Mcp => MessageId::ConfigSectionMcp,
+                ConfigSection::Fleet => MessageId::ConfigSectionFleet,
+                ConfigSection::Experimental => MessageId::ConfigSectionExperimental,
+            },
+        )
     }
 }
 
@@ -595,7 +476,9 @@ const CONFIG_COLUMN_GAPS_WIDTH: usize = 2;
 impl ConfigView {
     pub fn new_for_app(app: &App) -> Self {
         let settings = Settings::load().unwrap_or_else(|_| Settings::default());
-        let rows = vec![
+        let config = Config::load(app.config_path.clone(), app.config_profile.as_deref())
+            .unwrap_or_default();
+        let mut rows = vec![
             ConfigRow {
                 section: ConfigSection::Provider,
                 key: "provider".to_string(),
@@ -623,7 +506,7 @@ impl ConfigView {
                 value: settings
                     .default_model
                     .as_deref()
-                    .unwrap_or("(default)")
+                    .unwrap_or(tr(app.ui_locale, MessageId::ConfigDefaultValue))
                     .to_string(),
                 editable: true,
                 scope: ConfigScope::Saved,
@@ -631,11 +514,17 @@ impl ConfigView {
             ConfigRow {
                 section: ConfigSection::Model,
                 key: "reasoning_effort".to_string(),
-                value: settings
-                    .reasoning_effort
-                    .as_deref()
-                    .unwrap_or("(config/default)")
-                    .to_string(),
+                value: settings.reasoning_effort.as_deref().map_or_else(
+                    || tr(app.ui_locale, MessageId::ConfigDefaultReasoning).to_string(),
+                    |value| {
+                        crate::tui::app::ReasoningEffort::from_setting_for_provider(
+                            value,
+                            app.api_provider,
+                        )
+                        .as_setting_for_provider(app.api_provider)
+                        .to_string()
+                    },
+                ),
                 editable: true,
                 scope: ConfigScope::Saved,
             },
@@ -684,10 +573,9 @@ impl ConfigView {
             ConfigRow {
                 section: ConfigSection::Display,
                 key: "background_color".to_string(),
-                value: settings
-                    .background_color
-                    .clone()
-                    .unwrap_or_else(|| "(default)".to_string()),
+                value: settings.background_color.clone().unwrap_or_else(|| {
+                    tr(app.ui_locale, MessageId::ConfigDefaultValue).to_string()
+                }),
                 editable: true,
                 scope: ConfigScope::Saved,
             },
@@ -873,7 +761,20 @@ impl ConfigView {
                 editable: true,
                 scope: ConfigScope::Saved,
             },
+            ConfigRow {
+                section: ConfigSection::Fleet,
+                key: "fleet.exec.max_spawn_depth".to_string(),
+                value: config
+                    .fleet
+                    .as_ref()
+                    .map(|fleet| fleet.exec.max_spawn_depth)
+                    .unwrap_or_else(|| codewhale_config::FleetExecConfig::default().max_spawn_depth)
+                    .to_string(),
+                editable: false,
+                scope: ConfigScope::Saved,
+            },
         ];
+        rows.extend(experimental_config_rows(&config));
 
         Self {
             rows,
@@ -904,16 +805,20 @@ impl ConfigView {
             return true;
         }
 
-        let section = row.section.label().to_lowercase();
+        let section = row.section.label(self.locale).to_lowercase();
+        let section_en = row.section.label(Locale::En).to_lowercase();
         let key = row.key.to_lowercase();
         let value = self.row_display_value(row).to_lowercase();
-        let scope = row.scope.label().to_lowercase();
+        let scope = row.scope.label(self.locale).to_lowercase();
+        let scope_en = row.scope.label(Locale::En).to_lowercase();
 
         filter.split_whitespace().all(|term| {
             section.contains(term)
+                || section_en.contains(term)
                 || key.contains(term)
                 || value.contains(term)
                 || scope.contains(term)
+                || scope_en.contains(term)
         })
     }
 
@@ -1061,7 +966,7 @@ impl ConfigView {
         match key.code {
             KeyCode::Esc => {
                 self.editing = None;
-                self.status = Some("Edit cancelled".to_string());
+                self.status = Some(self.tr(MessageId::ConfigEditCancelled).to_string());
                 ViewAction::None
             }
             KeyCode::Enter => {
@@ -1179,12 +1084,14 @@ impl ConfigView {
         };
         let key = row.key.clone();
         let original_value = row.value.clone();
-        let initial_value = if (key == "default_model" && original_value == "(default)")
-            || (key == "reasoning_effort" && original_value == "(config/default)")
-        {
-            String::new()
-        } else {
-            original_value.clone()
+        let initial_value = match config_default_placeholder_message(&key) {
+            Some(message_id)
+                if original_value == tr(self.locale, message_id)
+                    || original_value == tr(Locale::En, message_id) =>
+            {
+                String::new()
+            }
+            _ => original_value.clone(),
         };
 
         let buffer: Vec<char> = initial_value.chars().collect();
@@ -1213,7 +1120,12 @@ impl ConfigView {
             let effective_cost_currency =
                 crate::pricing::CostCurrency::from_setting(&self.effective_cost_currency);
             if saved_cost_currency != effective_cost_currency {
-                return format!("{} (effective {})", row.value, self.effective_cost_currency);
+                return format!(
+                    "{}{}",
+                    row.value,
+                    self.tr(MessageId::ConfigRowEffective)
+                        .replace("{currency}", &self.effective_cost_currency)
+                );
             }
         }
 
@@ -1235,7 +1147,7 @@ fn config_base_url_row_value(app: &App) -> String {
             config.provider = Some(app.api_provider.as_str().to_string());
             config.deepseek_base_url()
         })
-        .unwrap_or_else(|_| "(unavailable)".to_string())
+        .unwrap_or_else(|_| tr(app.ui_locale, MessageId::ConfigUnavailable).to_string())
 }
 
 fn cost_currency_config_value(app: &App) -> String {
@@ -1244,6 +1156,64 @@ fn cost_currency_config_value(app: &App) -> String {
         crate::pricing::CostCurrency::Cny => "cny",
     }
     .to_string()
+}
+
+fn experimental_config_rows(config: &Config) -> Vec<ConfigRow> {
+    let features = config.features();
+    let configured = config.features.as_ref().map(|table| &table.entries);
+    let mut rows = Vec::new();
+
+    for spec in FEATURES
+        .iter()
+        .filter(|spec| spec.stage == Stage::Experimental)
+    {
+        let effective = features.enabled(spec.id);
+        let configured_value = configured
+            .and_then(|entries| entries.get(spec.key))
+            .copied();
+        rows.push(ConfigRow {
+            section: ConfigSection::Experimental,
+            key: format!("features.{}", spec.key),
+            value: experimental_feature_value(
+                effective,
+                spec.default_enabled,
+                configured_value.is_some(),
+            ),
+            editable: false,
+            scope: ConfigScope::Saved,
+        });
+    }
+
+    rows.push(ConfigRow {
+        section: ConfigSection::Experimental,
+        key: "goal_command".to_string(),
+        value: "preview placeholder (not stable; see #1976/#891)".to_string(),
+        editable: false,
+        scope: ConfigScope::Saved,
+    });
+    rows.push(ConfigRow {
+        section: ConfigSection::Experimental,
+        key: "whaleflow".to_string(),
+        value: "preview overlay for workflow/fleet runs (not stable; see #3154/#3178)".to_string(),
+        editable: false,
+        scope: ConfigScope::Saved,
+    });
+
+    rows
+}
+
+fn experimental_feature_value(effective: bool, default_enabled: bool, configured: bool) -> String {
+    let state = if effective { "enabled" } else { "disabled" };
+    let default_state = if default_enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    if configured {
+        format!("{state} (configured; default {default_state})")
+    } else {
+        format!("{state} (default {default_state})")
+    }
 }
 
 fn config_hint_for_key(key: &str) -> &'static str {
@@ -1275,13 +1245,29 @@ fn config_hint_for_key(key: &str) -> &'static str {
         "max_history" => "integer (0 allowed)",
         "auto_compact_threshold_percent" => "10..=100",
         "default_model" => "deepseek-v4-pro | deepseek-v4-flash | deepseek-* | none/default",
-        "reasoning_effort" => "auto | off | low | medium | high | max | default",
+        "reasoning_effort" => {
+            "DeepSeek: auto/off/high/max; Codex: low/medium/high/xhigh; default clears saved value"
+        }
         "mcp_config_path" => "path to mcp.json",
+        "fleet.exec.max_spawn_depth" => {
+            "0 blocks child agents; 3 default (same axis as sub-agents); capped at 3"
+        }
         _ => "",
     }
 }
 
-fn render_config_editor_value_line(edit: &ConfigEdit) -> ratatui::text::Line<'static> {
+fn config_default_placeholder_message(key: &str) -> Option<MessageId> {
+    match key {
+        "default_model" | "background_color" => Some(MessageId::ConfigDefaultValue),
+        "reasoning_effort" => Some(MessageId::ConfigDefaultReasoning),
+        _ => None,
+    }
+}
+
+fn render_config_editor_value_line(
+    edit: &ConfigEdit,
+    locale: Locale,
+) -> ratatui::text::Line<'static> {
     use ratatui::{
         style::Style,
         text::{Line, Span},
@@ -1289,7 +1275,7 @@ fn render_config_editor_value_line(edit: &ConfigEdit) -> ratatui::text::Line<'st
 
     let mut spans = Vec::new();
     spans.push(Span::styled(
-        "New: ",
+        tr(locale, MessageId::ConfigEditNewLabel),
         Style::default().fg(palette::TEXT_MUTED),
     ));
 
@@ -1478,33 +1464,38 @@ impl ModalView for ConfigView {
         let (lines, footer) = if let Some(edit) = self.editing.as_ref() {
             let mut lines: Vec<Line> = Vec::new();
             lines.push(Line::from(vec![Span::styled(
-                format!("Edit {}", edit.key),
+                format!("{}{}", self.tr(MessageId::ConfigEditTitlePrefix), edit.key),
                 Style::default().fg(palette::DEEPSEEK_SKY).bold(),
             )]));
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::styled("Scope: ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw(edit.scope.label()),
+                Span::styled(
+                    self.tr(MessageId::ConfigEditScopeLabel),
+                    Style::default().fg(palette::TEXT_MUTED),
+                ),
+                Span::raw(edit.scope.label(self.locale)),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("Current: ", Style::default().fg(palette::TEXT_MUTED)),
+                Span::styled(
+                    self.tr(MessageId::ConfigEditCurrentLabel),
+                    Style::default().fg(palette::TEXT_MUTED),
+                ),
                 Span::raw(truncate_view_text(&edit.original_value, 60)),
             ]));
             lines.push(Line::from(""));
-            lines.push(render_config_editor_value_line(edit));
+            lines.push(render_config_editor_value_line(edit, self.locale));
             lines.push(Line::from(""));
             let hint = config_hint_for_key(&edit.key);
             if !hint.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::styled("Hint: ", Style::default().fg(palette::TEXT_MUTED)),
+                    Span::styled(
+                        self.tr(MessageId::ConfigEditHintLabel),
+                        Style::default().fg(palette::TEXT_MUTED),
+                    ),
                     Span::raw(hint),
                 ]));
             }
-            (
-                lines,
-                " Enter=apply, Esc=cancel, Ctrl+U=clear, Ctrl+A=all, \u{2190}/\u{2192}=move "
-                    .to_string(),
-            )
+            (lines, self.tr(MessageId::ConfigEditFooter).to_string())
         } else {
             let content_height = usize::from(inner.height);
             let header_lines = 5usize;
@@ -1566,7 +1557,7 @@ impl ModalView for ConfigView {
                 match item {
                     ConfigListItem::Section(section) => {
                         lines.push(Line::from(Span::styled(
-                            format!("  {}", section.label()),
+                            format!("  {}", section.label(self.locale)),
                             Style::default().fg(palette::DEEPSEEK_SKY).bold(),
                         )));
                     }
@@ -1579,8 +1570,8 @@ impl ModalView for ConfigView {
                         let selected = *idx == self.selected;
                         let style = if selected {
                             Style::default()
-                                .fg(ratatui::style::Color::White)
-                                .bg(palette::DEEPSEEK_BLUE)
+                                .fg(palette::SELECTION_TEXT)
+                                .bg(palette::SELECTION_BG)
                                 .add_modifier(ratatui::style::Modifier::BOLD)
                         } else {
                             Style::default().fg(palette::TEXT_PRIMARY)
@@ -1588,7 +1579,8 @@ impl ModalView for ConfigView {
                         let key = truncate_view_text(&row.key, key_column_width);
                         let value =
                             truncate_view_text(&self.row_display_value(row), value_column_width);
-                        let scope = truncate_view_text(row.scope.label(), scope_column_width);
+                        let scope =
+                            truncate_view_text(row.scope.label(self.locale), scope_column_width);
                         let mut line = Line::from(format!(
                             "  {:<key_width$} {:<value_width$} {:<scope_width$}",
                             key,
@@ -1761,6 +1753,9 @@ fn lifecycle_to_subagent_status(status: AgentLifecycle) -> SubAgentStatus {
         AgentLifecycle::Completed => SubAgentStatus::Completed,
         AgentLifecycle::Failed => SubAgentStatus::Failed("failed in transcript".to_string()),
         AgentLifecycle::Cancelled => SubAgentStatus::Cancelled,
+        AgentLifecycle::Interrupted => {
+            SubAgentStatus::Interrupted("interrupted in transcript".to_string())
+        }
     }
 }
 
@@ -2176,11 +2171,12 @@ fn truncate_view_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigListItem, ConfigSection, ConfigView, ModalKind, ModalView, ShellControlView,
-        ViewAction, ViewEvent, ViewStack, subagent_view_agents, truncate_view_text,
+        ConfigListItem, ConfigView, HelpView, ModalKind, ModalView, ViewAction, ViewEvent,
+        ViewStack, subagent_view_agents, truncate_view_text,
     };
     use crate::config::Config;
-    use crate::localization::Locale;
+    use crate::localization::{Locale, MessageId, tr};
+    use crate::palette;
     use crate::settings::Settings;
     use crate::tools::subagent::{
         SubAgentAssignment, SubAgentResult, SubAgentStatus, SubAgentType,
@@ -2371,10 +2367,16 @@ mod tests {
         view.visible_items()
             .into_iter()
             .filter_map(|item| match item {
-                ConfigListItem::Section(section) => Some(section.label()),
+                ConfigListItem::Section(section) => Some(section.label(view.locale)),
                 ConfigListItem::Row(_) => None,
             })
             .collect()
+    }
+
+    fn create_config_view(locale: Locale) -> ConfigView {
+        let mut app = create_test_app();
+        app.ui_locale = locale;
+        ConfigView::new_for_app(&app)
     }
 
     fn visible_row_keys(view: &ConfigView) -> Vec<&str> {
@@ -2399,20 +2401,21 @@ mod tests {
 
     #[test]
     fn config_view_groups_rows_by_expected_sections() {
-        let app = create_test_app();
-        let view = ConfigView::new_for_app(&app);
+        let view = create_config_view(Locale::En);
         assert_eq!(
             visible_section_labels(&view),
             vec![
-                ConfigSection::Provider.label(),
-                ConfigSection::Model.label(),
-                ConfigSection::Permissions.label(),
-                ConfigSection::Network.label(),
-                ConfigSection::Display.label(),
-                ConfigSection::Composer.label(),
-                ConfigSection::Sidebar.label(),
-                ConfigSection::History.label(),
-                ConfigSection::Mcp.label(),
+                "Provider",
+                "Model",
+                "Permissions",
+                "Network",
+                "Display",
+                "Composer",
+                "Sidebar",
+                "History",
+                "MCP",
+                "Fleet",
+                "Experimental",
             ]
         );
     }
@@ -2448,7 +2451,137 @@ mod tests {
         assert!(keys.contains(&"cost_currency"));
         assert!(keys.contains(&"prefer_external_pdftotext"));
         assert!(keys.contains(&"mcp_config_path"));
-        assert!(view.rows.iter().all(|row| row.editable));
+        assert!(keys.contains(&"fleet.exec.max_spawn_depth"));
+        assert!(keys.contains(&"features.subagents"));
+        assert!(keys.contains(&"features.web_search"));
+        assert!(keys.contains(&"features.apply_patch"));
+        assert!(keys.contains(&"features.mcp"));
+        assert!(keys.contains(&"features.exec_policy"));
+        assert!(keys.contains(&"features.vision_model"));
+        assert!(keys.contains(&"goal_command"));
+        assert!(keys.contains(&"whaleflow"));
+        assert!(
+            view.rows
+                .iter()
+                .filter(|row| {
+                    !matches!(
+                        row.section,
+                        super::ConfigSection::Experimental | super::ConfigSection::Fleet
+                    )
+                })
+                .all(|row| row.editable)
+        );
+        assert!(
+            view.rows
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row.section,
+                        super::ConfigSection::Experimental | super::ConfigSection::Fleet
+                    )
+                })
+                .all(|row| !row.editable)
+        );
+    }
+
+    #[test]
+    fn config_view_experimental_features_show_effective_state_and_overrides() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "codewhale-experimental-config-view-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let config_path = temp_root.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[features]
+web_search = false
+vision_model = true
+"#,
+        )
+        .unwrap();
+
+        let mut app = create_test_app();
+        app.config_path = Some(config_path);
+        let view = ConfigView::new_for_app(&app);
+
+        let web_search = view
+            .rows
+            .iter()
+            .find(|row| row.key == "features.web_search")
+            .expect("web_search feature row");
+        assert_eq!(web_search.value, "disabled (configured; default enabled)");
+        assert!(!web_search.editable);
+
+        let vision = view
+            .rows
+            .iter()
+            .find(|row| row.key == "features.vision_model")
+            .expect("vision feature row");
+        assert_eq!(vision.value, "enabled (configured; default disabled)");
+        assert!(!vision.editable);
+
+        let subagents = view
+            .rows
+            .iter()
+            .find(|row| row.key == "features.subagents")
+            .expect("subagents feature row");
+        assert_eq!(subagents.value, "enabled (default enabled)");
+    }
+
+    #[test]
+    fn config_view_shows_fleet_max_spawn_depth_from_config() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "codewhale-fleet-config-view-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let config_path = temp_root.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[fleet.exec]
+max_spawn_depth = 2
+"#,
+        )
+        .unwrap();
+
+        let mut app = create_test_app();
+        app.config_path = Some(config_path);
+        let view = ConfigView::new_for_app(&app);
+
+        let row = view
+            .rows
+            .iter()
+            .find(|row| row.key == "fleet.exec.max_spawn_depth")
+            .expect("fleet spawn depth row");
+        assert_eq!(row.value, "2");
+        assert!(!row.editable);
+    }
+
+    #[test]
+    fn config_view_experimental_section_is_searchable() {
+        let mut view = create_config_view(Locale::En);
+
+        view.update_filter(|filter| filter.push_str("experimental"));
+        assert_eq!(visible_section_labels(&view), vec!["Experimental"]);
+        assert!(visible_row_keys(&view).contains(&"features.subagents"));
+
+        view.clear_filter();
+        type_filter(&mut view, "feature vision");
+        assert_eq!(visible_section_labels(&view), vec!["Experimental"]);
+        assert_eq!(visible_row_keys(&view), vec!["features.vision_model"]);
+
+        view.clear_filter();
+        type_filter(&mut view, "goal");
+        assert_eq!(visible_section_labels(&view), vec!["Experimental"]);
+        assert_eq!(visible_row_keys(&view), vec!["goal_command"]);
+
+        view.clear_filter();
+        type_filter(&mut view, "whaleflow");
+        assert_eq!(visible_section_labels(&view), vec!["Experimental"]);
+        assert_eq!(visible_row_keys(&view), vec!["whaleflow"]);
     }
 
     #[test]
@@ -2526,7 +2659,7 @@ base_url = "https://api.xiaomimimo.com/v1"
             .expect("cost_currency row");
 
         assert_eq!(row.value, "usd");
-        assert_eq!(view.row_display_value(row), "usd (effective cny)");
+        assert_eq!(view.row_display_value(row), "usd (实际 cny)");
         assert_eq!(Settings::load().expect("settings").cost_currency, "usd");
     }
 
@@ -2580,9 +2713,53 @@ base_url = "https://api.xiaomimimo.com/v1"
     }
 
     #[test]
-    fn config_view_filter_matches_group_and_rows() {
+    fn config_view_displays_saved_codex_reasoning_effort_label() {
+        let _guard = ConfigSettingsEnvGuard::new("reasoning_effort = \"max\"\n");
+        let mut app = create_test_app();
+        app.api_provider = crate::config::ApiProvider::OpenaiCodex;
+
+        let view = ConfigView::new_for_app(&app);
+        let row = view
+            .rows
+            .iter()
+            .find(|row| row.key == "reasoning_effort")
+            .expect("reasoning_effort row");
+
+        assert_eq!(row.value, "xhigh");
+    }
+
+    #[test]
+    fn config_view_editing_localized_default_placeholders_starts_blank() {
+        let _guard = ConfigSettingsEnvGuard::new("locale = \"zh-Hans\"\n");
         let app = create_test_app();
         let mut view = ConfigView::new_for_app(&app);
+
+        for (key, message_id) in [
+            ("default_model", MessageId::ConfigDefaultValue),
+            ("reasoning_effort", MessageId::ConfigDefaultReasoning),
+            ("background_color", MessageId::ConfigDefaultValue),
+        ] {
+            view.selected = view
+                .rows
+                .iter()
+                .position(|row| row.key == key)
+                .unwrap_or_else(|| panic!("{key} row missing"));
+            view.start_edit();
+
+            let edit = view.editing.as_ref().expect("editing should start");
+            assert_eq!(edit.original_value, tr(Locale::ZhHans, message_id));
+            assert!(
+                edit.buffer.is_empty(),
+                "localized default placeholder should not become edit text for {key}"
+            );
+
+            view.editing = None;
+        }
+    }
+
+    #[test]
+    fn config_view_filter_matches_group_and_rows() {
+        let mut view = create_config_view(Locale::En);
 
         type_filter(&mut view, "side");
 
@@ -2593,6 +2770,20 @@ base_url = "https://api.xiaomimimo.com/v1"
             vec!["sidebar_width", "sidebar_focus", "context_panel"]
         );
         assert_eq!(view.rows[view.selected].key, "sidebar_width");
+    }
+
+    #[test]
+    fn localized_config_view_filter_matches_english_section_and_scope_labels() {
+        let mut view = create_config_view(Locale::PtBr);
+
+        type_filter(&mut view, "sidebar saved");
+
+        assert_eq!(view.filter, "sidebar saved");
+        assert_eq!(visible_section_labels(&view), vec!["Barra lateral"]);
+        assert_eq!(
+            visible_row_keys(&view),
+            vec!["sidebar_width", "sidebar_focus", "context_panel"]
+        );
     }
 
     #[test]
@@ -2631,9 +2822,48 @@ base_url = "https://api.xiaomimimo.com/v1"
     }
 
     #[test]
+    fn config_view_selected_row_uses_muted_selection_highlight() {
+        let mut view = create_config_view(Locale::En);
+        view.selected = view
+            .rows
+            .iter()
+            .position(|row| row.key == "theme")
+            .expect("theme row");
+        view.adjust_scroll(8);
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buf = Buffer::empty(area);
+
+        view.render(area, &mut buf);
+
+        let y = view
+            .last_row_hitboxes
+            .borrow()
+            .iter()
+            .find_map(|(y, idx)| (*idx == view.selected).then_some(*y))
+            .expect("selected config row should have a hitbox");
+        let highlighted_cells = (area.x..area.x.saturating_add(area.width))
+            .filter(|&x| {
+                let cell = &buf[(x, y)];
+                !cell.symbol().trim().is_empty()
+                    && cell.bg == palette::SELECTION_BG
+                    && cell.fg == palette::SELECTION_TEXT
+            })
+            .count();
+
+        assert!(
+            highlighted_cells >= 4,
+            "selected config row should render readable selection text"
+        );
+        assert!(
+            !(area.x..area.x.saturating_add(area.width))
+                .any(|x| buf[(x, y)].bg == palette::DEEPSEEK_BLUE),
+            "selected config row should not use the bright accent background"
+        );
+    }
+
+    #[test]
     fn config_view_keeps_scope_column_aligned_for_long_keys() {
-        let app = create_test_app();
-        let mut view = ConfigView::new_for_app(&app);
+        let mut view = create_config_view(Locale::ZhHans);
         type_filter(&mut view, "composer");
         let area = Rect::new(0, 0, 100, 24);
         let mut buf = Buffer::empty(area);
@@ -2647,7 +2877,8 @@ base_url = "https://api.xiaomimimo.com/v1"
         );
         let scope_columns = dump
             .lines()
-            .filter_map(|line| line.find("SAVED").or_else(|| line.find("SESSION")))
+            .filter(|line| line.contains("composer_") || line.contains("bracketed_paste"))
+            .filter_map(|line| line.find('已'))
             .collect::<Vec<_>>();
         assert!(
             scope_columns.len() >= 3,
@@ -2804,7 +3035,8 @@ base_url = "https://api.xiaomimimo.com/v1"
 
     #[test]
     fn config_view_escape_cancels_editing() {
-        let app = create_test_app();
+        let mut app = create_test_app();
+        app.ui_locale = Locale::En;
         let mut view = ConfigView::new_for_app(&app);
         let _ = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(view.editing.is_some());
@@ -2812,31 +3044,10 @@ base_url = "https://api.xiaomimimo.com/v1"
         let cancel = view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(cancel, ViewAction::None));
         assert!(view.editing.is_none());
-        assert_eq!(view.status.as_deref(), Some("Edit cancelled"));
-    }
-
-    #[test]
-    fn shell_control_view_defaults_to_background() {
-        let mut view = ShellControlView::new();
-
-        let action = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert!(matches!(
-            action,
-            ViewAction::EmitAndClose(ViewEvent::ShellControlBackground)
-        ));
-    }
-
-    #[test]
-    fn shell_control_view_can_select_cancel() {
-        let mut view = ShellControlView::new();
-
-        let action = view.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
-
-        assert!(matches!(
-            action,
-            ViewAction::EmitAndClose(ViewEvent::ShellControlCancel)
-        ));
+        assert_eq!(
+            view.status.as_deref(),
+            Some(tr(Locale::En, MessageId::ConfigEditCancelled))
+        );
     }
 
     /// A modal that doesn't override `handle_paste` must report
@@ -2846,9 +3057,9 @@ base_url = "https://api.xiaomimimo.com/v1"
     #[test]
     fn default_modal_does_not_consume_paste() {
         let mut stack = ViewStack::new();
-        stack.push(ShellControlView::new());
+        stack.push(HelpView::new_for_locale(crate::localization::Locale::En));
         assert!(!stack.handle_paste("hello"));
-        assert_eq!(stack.top_kind(), Some(ModalKind::ShellControl));
+        assert_eq!(stack.top_kind(), Some(ModalKind::Help));
     }
 
     fn buffer_text(buf: &Buffer, area: Rect) -> String {

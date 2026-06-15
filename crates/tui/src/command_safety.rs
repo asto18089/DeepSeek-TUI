@@ -355,6 +355,90 @@ pub fn prefix_allow_matches(pattern: &str, command: &str) -> bool {
     command_norm == pattern_norm || command_norm.starts_with(&format!("{pattern_norm} "))
 }
 
+const PARALLEL_READONLY_PREFIXES: &[&str] = &[
+    "git status",
+    "git log",
+    "git diff",
+    "git show",
+    "git ls-files",
+    "git blame",
+    "git grep",
+    "ls",
+    "pwd",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "which",
+    "stat",
+    "file",
+    "du",
+    "df",
+    "grep",
+    "rg",
+    "fd",
+];
+
+/// Return `true` when a shell command is safe to auto-approve and run in a
+/// parallel read-only chunk.
+pub fn is_parallel_readonly_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains("$(")
+        || trimmed
+            .chars()
+            .any(|ch| matches!(ch, '\n' | '\r' | ';' | '&' | '|' | '>' | '<' | '`'))
+    {
+        return false;
+    }
+
+    let tokens = shell_words(trimmed);
+    let Some(start) = primary_token_index(&tokens) else {
+        return false;
+    };
+    let command_tokens = tokens[start..].to_vec();
+
+    if let Some(inner_command) = readonly_shell_wrapper_inner_command(&command_tokens) {
+        return is_parallel_readonly_command(inner_command);
+    }
+
+    let command_refs = command_tokens
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let canonical = classify_command(&command_refs);
+    if canonical == "tail"
+        && command_refs.iter().skip(1).any(|token| {
+            *token == "-f"
+                || *token == "-F"
+                || *token == "--follow"
+                || token.starts_with("--follow=")
+        })
+    {
+        return false;
+    }
+
+    PARALLEL_READONLY_PREFIXES
+        .iter()
+        .any(|prefix| *prefix == canonical)
+}
+
+fn readonly_shell_wrapper_inner_command(tokens: &[String]) -> Option<&str> {
+    let shell = tokens.first()?.as_str();
+    if !matches!(shell, "bash" | "sh" | "zsh") {
+        return None;
+    }
+    if tokens.len() != 3 {
+        return None;
+    }
+    if !matches!(tokens[1].as_str(), "-c" | "-lc") {
+        return None;
+    }
+    Some(tokens[2].as_str())
+}
+
 /// Safety classification of a command
 ///
 /// `PartialOrd, Ord` (pinvou3-fork): variants declared from safest to most
@@ -1037,6 +1121,42 @@ mod tests {
             analyze_command("grep pattern file").level,
             SafetyLevel::Safe
         );
+    }
+
+    #[test]
+    fn parallel_readonly_command_classifier_is_strict() {
+        for command in [
+            "git status -s",
+            "git log --oneline -5",
+            "rg foo crates/",
+            "ls -la",
+            "cat Cargo.toml",
+            "bash -lc 'git status -s'",
+            "sh -c 'rg foo crates/'",
+        ] {
+            assert!(
+                is_parallel_readonly_command(command),
+                "{command} should be parallel read-only"
+            );
+        }
+
+        for command in [
+            "git status && rm -rf /",
+            "cat a > b",
+            "git push",
+            "cargo build",
+            "tail -f log",
+            "rg foo | head",
+            "find . -delete",
+            "sleep 5 &",
+            "bash -lc 'git status && rm -rf /'",
+            "bash -lc 'rg foo | head'",
+        ] {
+            assert!(
+                !is_parallel_readonly_command(command),
+                "{command} should not be parallel read-only"
+            );
+        }
     }
 
     #[test]

@@ -78,6 +78,7 @@ impl Engine {
         // the SAME request up to MAX_STREAM_RETRIES times before surfacing
         // the failure to the user.
         let mut stream_retry_attempts: u32 = 0;
+        let mut last_dispatched_messages_revision: Option<u64> = None;
 
         'turn_loop: loop {
             if self.cancel_token.is_cancelled() {
@@ -156,7 +157,7 @@ impl Engine {
                         // Only update if we got valid messages (never corrupt state)
                         if !result.messages.is_empty() || self.session.messages.is_empty() {
                             let auto_messages_after = result.messages.len();
-                            self.session.messages = result.messages;
+                            self.session.messages = result.messages.into();
                             self.merge_compaction_summary(result.summary_prompt);
                             self.emit_session_updated().await;
                             let removed = auto_messages_before.saturating_sub(auto_messages_after);
@@ -207,7 +208,9 @@ impl Engine {
                 continue;
             }
 
-            if let Some(input_budget) = context_input_budget(&self.session.model) {
+            if let Some(input_budget) =
+                context_input_budget_for_provider(self.api_provider, &self.session.model)
+            {
                 let estimated_input = self.estimated_input_tokens();
                 if estimated_input > input_budget {
                     if context_recovery_attempts >= MAX_CONTEXT_RECOVERY_ATTEMPTS {
@@ -242,6 +245,17 @@ impl Engine {
             // v0.7.5 while #200 audits cache-hit behavior; when enabled it
             // appends <archived_context> blocks rather than replacing history.
             self.layered_context_checkpoint().await;
+
+            if should_skip_runtime_prompt_only_dispatch(
+                last_dispatched_messages_revision,
+                self.session.messages_revision,
+                stream_retry_attempts,
+            ) {
+                let message = "No new user, tool, sub-agent, or continuation input since the last provider request; ending turn instead of dispatching a runtime-prompt-only request.";
+                crate::logging::warn(message);
+                let _ = self.tx_event.send(Event::status(message)).await;
+                break;
+            }
 
             // Build the request
             let force_update_plan_this_step = force_update_plan_first && turn.tool_calls.is_empty();
@@ -391,6 +405,7 @@ impl Engine {
             // first call) so we can resend it on a transparent retry below
             // when the wire dies before any content was streamed (#103).
             let stream_request = request;
+            last_dispatched_messages_revision = Some(self.session.messages_revision);
             let stream_result = tokio::select! {
                 biased;
                 () = self.cancel_token.cancelled() => {
@@ -413,6 +428,7 @@ impl Engine {
                             .await
                     {
                         context_recovery_attempts = context_recovery_attempts.saturating_add(1);
+                        last_dispatched_messages_revision = None;
                         continue;
                     }
                     turn_error = Some(message.clone());
@@ -433,6 +449,9 @@ impl Engine {
             let mut current_text_raw = String::new();
             let mut current_text_visible = String::new();
             let mut current_thinking = String::new();
+            // #3014: Anthropic signed-thinking signature for the current
+            // thinking block; must be replayed verbatim in tool loops.
+            let mut current_thinking_signature: Option<String> = None;
             let mut tool_uses: Vec<ToolUseState> = Vec::new();
             let mut usage = Usage {
                 input_tokens: 0,
@@ -787,6 +806,14 @@ impl Engine {
                                     .await;
                             }
                         }
+                        Delta::SignatureDelta { signature } => {
+                            // #3014: capture (and concatenate, defensively)
+                            // the signed-thinking signature for replay.
+                            match current_thinking_signature.as_mut() {
+                                Some(existing) => existing.push_str(&signature),
+                                None => current_thinking_signature = Some(signature),
+                            }
+                        }
                         Delta::InputJsonDelta { partial_json } => {
                             if let Some(&tool_idx) = current_tool_indices.get(&index)
                                 && let Some(tool_state) = tool_uses.get_mut(tool_idx)
@@ -887,6 +914,14 @@ impl Engine {
                         }
                     }
                     StreamEvent::MessageStop | StreamEvent::Ping => {}
+                    StreamEvent::Error { error } => {
+                        // #3014: Anthropic SSE error event. The adapter
+                        // surfaces fatal errors as stream Err items; this
+                        // defensive arm keeps any passed-through error
+                        // visible instead of silently dropped.
+                        crate::logging::warn(format!("Provider stream error event: {error}"));
+                        stream_errors += 1;
+                    }
                 }
             }
 
@@ -974,7 +1009,10 @@ impl Engine {
                 None
             };
             if let Some(thinking) = thinking_to_persist {
-                content_blocks.push(ContentBlock::Thinking { thinking });
+                content_blocks.push(ContentBlock::Thinking {
+                    thinking,
+                    signature: current_thinking_signature.clone(),
+                });
             }
             let mut final_text = current_text_visible.clone();
             if tool_uses.is_empty() && tool_parser::has_tool_call_markers(&current_text_raw) {
@@ -1362,11 +1400,15 @@ impl Engine {
             let active_tools_at_batch_start = active_tool_names.clone();
             let mut deferred_tools_hydrated_this_batch: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
+            // #3026: `additionalContext` strings from tool_call_before hooks,
+            // keyed by tool id; appended to the tool result sent to the model.
+            let mut hook_contexts: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             let mut plans: Vec<ToolExecutionPlan> = Vec::with_capacity(tool_uses.len());
             for (index, tool) in tool_uses.iter_mut().enumerate() {
                 let tool_id = tool.id.clone();
                 let mut tool_name = tool.name.clone();
-                let tool_input = tool.input.clone();
+                let mut tool_input = tool.input.clone();
                 let tool_caller = tool.caller.clone();
                 crate::logging::info(format!(
                     "Planning tool '{tool_name}' with input: {tool_input:?}"
@@ -1390,8 +1432,13 @@ impl Engine {
                 let mut approval_description = "Tool execution requires approval".to_string();
                 let mut supports_parallel = false;
                 let mut read_only = false;
+                let mut detached_start = false;
                 let mut blocked_error: Option<ToolError> = None;
                 let mut guard_result: Option<ToolResult> = None;
+                // #3026: set by a hook `ask` decision; applied AFTER the
+                // registry-based approval computation below so it cannot be
+                // clobbered by it.
+                let mut hook_requires_approval = false;
 
                 if mode == AppMode::Plan
                     && matches!(
@@ -1406,7 +1453,17 @@ impl Engine {
                     )
                 {
                     blocked_error = Some(ToolError::permission_denied(format!(
-                        "'{tool_name}' is not available in Plan mode — switch to Agent, Goal, or YOLO mode to run commands and code."
+                        "'{tool_name}' is not available in Plan mode — switch to Agent or YOLO mode to run commands and code."
+                    )));
+                }
+
+                // #3027: deny wins over allow — check the deny-list first so a
+                // tool present in both lists is still blocked.
+                if blocked_error.is_none()
+                    && command_denies_tool(self.config.disallowed_tools.as_deref(), &tool_name)
+                {
+                    blocked_error = Some(ToolError::permission_denied(format!(
+                        "Tool '{tool_name}' is in the disallowed-tools list"
                     )));
                 }
 
@@ -1476,29 +1533,25 @@ impl Engine {
                         tracing::error!("Hook executor task panicked: {join_err}");
                         Vec::new()
                     });
-                    if let Some(denial) = hook_results
-                        .iter()
-                        .find(|result| result.exit_code == Some(2))
-                    {
-                        let reason = denial
-                            .stdout
-                            .trim()
-                            .lines()
-                            .next()
-                            .filter(|line| !line.is_empty())
-                            .or_else(|| {
-                                denial
-                                    .stderr
-                                    .trim()
-                                    .lines()
-                                    .next()
-                                    .filter(|line| !line.is_empty())
-                            })
-                            .or(denial.error.as_deref())
-                            .unwrap_or("ToolCallBefore hook denied tool execution");
+                    // #3026: fold all foreground hook results into one
+                    // decision: deny (exit code 2 or JSON) > ask > allow;
+                    // last `updatedInput` writer wins; `additionalContext`
+                    // strings are concatenated.
+                    let fold = fold_tool_call_before_results(&hook_results);
+                    if let Some(reason) = fold.deny_reason {
                         blocked_error = Some(ToolError::permission_denied(format!(
                             "ToolCallBefore hook denied tool '{tool_name}': {reason}"
                         )));
+                    } else {
+                        if fold.requires_approval {
+                            hook_requires_approval = true;
+                        }
+                        if let Some(updated) = fold.updated_input {
+                            tool_input = updated;
+                        }
+                        if let Some(context) = fold.additional_context {
+                            hook_contexts.insert(tool_id.clone(), context);
+                        }
                     }
                 }
 
@@ -1510,10 +1563,13 @@ impl Engine {
                 } else if let Some(registry) = tool_registry
                     && let Some(spec) = registry.get(&tool_name)
                 {
-                    approval_required = spec.approval_requirement() != ApprovalRequirement::Auto;
+                    approval_required = spec.approval_requirement_for(&tool_input)
+                        != ApprovalRequirement::Auto
+                        && !registry.context().auto_approve;
                     approval_description = spec.description().to_string();
-                    supports_parallel = spec.supports_parallel();
-                    read_only = spec.is_read_only();
+                    supports_parallel = spec.supports_parallel_for(&tool_input);
+                    read_only = spec.is_read_only_for(&tool_input);
+                    detached_start = spec.starts_detached_for(&tool_input);
                 } else if tool_name == CODE_EXECUTION_TOOL_NAME {
                     approval_required = true;
                     approval_description =
@@ -1532,6 +1588,14 @@ impl Engine {
                     approval_description = "Search tool catalog".to_string();
                     supports_parallel = false;
                     read_only = true;
+                }
+
+                // #3026: a hook `ask` decision forces the approval prompt even
+                // for tools the registry would auto-run. Must stay after the
+                // registry-based computation above, which assigns rather than
+                // ORs `approval_required`.
+                if hook_requires_approval {
+                    approval_required = true;
                 }
 
                 let should_emit_hydration_status =
@@ -1578,6 +1642,7 @@ impl Engine {
                     approval_description,
                     supports_parallel,
                     read_only,
+                    detached_start,
                     blocked_error,
                     guard_result,
                 });
@@ -1611,11 +1676,25 @@ impl Engine {
                 .collect::<Vec<_>>();
             if !parallel_chunks.is_empty() {
                 let parallel_tool_count: usize = parallel_chunks.iter().sum();
+                let detached_start_count: usize = batches
+                    .iter()
+                    .filter_map(|batch| match batch {
+                        ToolExecutionBatch::Parallel(plans) if plans.len() > 1 => {
+                            Some(plans.iter().filter(|plan| plan.detached_start).count())
+                        }
+                        _ => None,
+                    })
+                    .sum();
+                let tool_kind = if detached_start_count > 0 {
+                    "read-only/background-start tools"
+                } else {
+                    "read-only tools"
+                };
                 let _ = self
                     .tx_event
                     .send(Event::status(format!(
-                        "Executing {parallel_tool_count} read-only tools in {} parallel chunk(s)",
-                        parallel_chunks.len()
+                        "Executing {parallel_tool_count} {tool_kind} in {} parallel chunk(s)",
+                        parallel_chunks.len(),
                     )))
                     .await;
             } else if plan_count > 1 {
@@ -1638,6 +1717,8 @@ impl Engine {
 
                 if parallel_allowed {
                     let mut tool_tasks = FuturesUnordered::new();
+                    let shell_permits =
+                        Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_SHELL_EXEC));
                     for plan in plans {
                         if let Some(result) = plan.guard_result.clone() {
                             let result = Ok(result);
@@ -1676,11 +1757,17 @@ impl Engine {
                         let tx_event = self.tx_event.clone();
                         let session_id = self.session.id.clone();
                         let started_at = Instant::now();
+                        let shell_permits = shell_permits.clone();
 
                         tool_tasks.push(async move {
+                            let _shell_permit = if plan.name == "exec_shell" {
+                                shell_permits.acquire_owned().await.ok()
+                            } else {
+                                None
+                            };
                             let mut result = Engine::execute_tool_with_lock(
                                 lock,
-                                plan.supports_parallel,
+                                plan.supports_parallel || plan.detached_start,
                                 plan.interactive,
                                 tx_event.clone(),
                                 plan.name.clone(),
@@ -2159,6 +2246,15 @@ impl Engine {
                                 .await;
                         }
 
+                        // #3026: pipe `additionalContext` from tool_call_before
+                        // hooks back to the model alongside the tool result.
+                        let output_for_context = match hook_contexts.get(&outcome.id) {
+                            Some(context) => {
+                                format!("{output_for_context}\n\n[hook context] {context}")
+                            }
+                            None => output_for_context,
+                        };
+
                         self.add_session_message(Message {
                             role: "user".to_string(),
                             content: vec![ContentBlock::ToolResult {
@@ -2345,7 +2441,7 @@ impl Engine {
         // messages. This preserves the stable prefix through all stored
         // messages while avoiding strict chat templates that only allow
         // system messages at messages[0].
-        let mut messages = self.session.messages.clone();
+        let mut messages: Vec<Message> = self.session.messages.clone().into();
         // [pinvou3-fork #42] runtime_prompt tag 受 composer gate:装了 composer 的
         // embedder(pinvou3)单固定模式,tag 恒定零信息;且其解释文档(Runtime Policy
         // Reference)已被 composer gate 抑制——无解释的 internal tag 只会诱发模型复述。
@@ -2387,6 +2483,15 @@ fn should_hold_turn_for_subagents(queued_completions: usize, running_children: u
     queued_completions > 0 || running_children > 0
 }
 
+fn should_skip_runtime_prompt_only_dispatch(
+    last_dispatched_messages_revision: Option<u64>,
+    current_messages_revision: u64,
+    stream_retry_attempts: u32,
+) -> bool {
+    last_dispatched_messages_revision == Some(current_messages_revision)
+        && stream_retry_attempts == 0
+}
+
 fn stream_chunk_timeout_budget(config: &EngineConfig) -> (u64, Duration) {
     let secs = config.stream_chunk_timeout.as_secs();
     (secs, Duration::from_secs(secs))
@@ -2410,11 +2515,95 @@ mod stream_timeout_tests {
     }
 }
 
-fn command_allows_tool(allowed_tools: Option<&[String]>, tool_name: &str) -> bool {
+pub(super) fn command_allows_tool(allowed_tools: Option<&[String]>, tool_name: &str) -> bool {
     let Some(allowed_tools) = allowed_tools else {
         return true;
     };
     allowed_tools.contains(&tool_name.to_ascii_lowercase())
+}
+
+/// Folded outcome of all `tool_call_before` hook results for one tool call
+/// (#3026). Precedence: deny (exit code 2 or JSON) > ask > allow;
+/// `updatedInput` is last-writer-wins; `additionalContext` is concatenated.
+#[derive(Debug, Default, PartialEq)]
+struct ToolCallHookFold {
+    /// Denial reason from an exit-code-2 hook or a JSON `deny` decision.
+    deny_reason: Option<String>,
+    /// At least one hook returned a JSON `ask` decision.
+    requires_approval: bool,
+    /// Replacement tool input from the last hook that supplied one.
+    updated_input: Option<serde_json::Value>,
+    /// Concatenated `additionalContext` strings from all hooks.
+    additional_context: Option<String>,
+}
+
+fn fold_tool_call_before_results(results: &[crate::hooks::HookResult]) -> ToolCallHookFold {
+    let mut fold = ToolCallHookFold::default();
+
+    // Legacy hard deny: exit code 2 wins regardless of stdout (backwards
+    // compatible with pre-#3026 hooks).
+    if let Some(denial) = results.iter().find(|result| result.exit_code == Some(2)) {
+        let reason = denial
+            .stdout
+            .trim()
+            .lines()
+            .next()
+            .filter(|line| !line.is_empty())
+            .or_else(|| {
+                denial
+                    .stderr
+                    .trim()
+                    .lines()
+                    .next()
+                    .filter(|line| !line.is_empty())
+            })
+            .or(denial.error.as_deref())
+            .unwrap_or("ToolCallBefore hook denied tool execution");
+        fold.deny_reason = Some(reason.to_string());
+        return fold;
+    }
+
+    for result in results {
+        // Background hooks return immediately with no process result and
+        // cannot steer (the caller warns about that configuration).
+        if result.exit_code.is_none() {
+            continue;
+        }
+        let parsed = crate::hooks::parse_tool_call_before_stdout(&result.stdout);
+        match parsed.decision {
+            Some(crate::hooks::ToolCallDecision::Deny) => {
+                fold.deny_reason =
+                    Some(parsed.reason.unwrap_or_else(|| {
+                        "ToolCallBefore hook denied tool execution".to_string()
+                    }));
+                return fold;
+            }
+            Some(crate::hooks::ToolCallDecision::Ask) => fold.requires_approval = true,
+            Some(crate::hooks::ToolCallDecision::Allow) | None => {}
+        }
+        if let Some(updated) = parsed.updated_input {
+            fold.updated_input = Some(updated);
+        }
+        if let Some(context) = parsed.additional_context {
+            match &mut fold.additional_context {
+                Some(existing) => {
+                    existing.push('\n');
+                    existing.push_str(&context);
+                }
+                None => fold.additional_context = Some(context),
+            }
+        }
+    }
+    fold
+}
+
+/// Check whether `tool_name` is explicitly denied (#3027).
+/// Deny always wins over allow.
+pub(super) fn command_denies_tool(disallowed_tools: Option<&[String]>, tool_name: &str) -> bool {
+    let Some(disallowed_tools) = disallowed_tools else {
+        return false;
+    };
+    disallowed_tools.contains(&tool_name.to_ascii_lowercase())
 }
 
 fn resolve_tool_definition<'a>(
@@ -2549,6 +2738,14 @@ mod tests {
         assert!(should_hold_turn_for_subagents(1, 0));
         assert!(should_hold_turn_for_subagents(0, 1));
         assert!(!should_hold_turn_for_subagents(0, 0));
+    }
+
+    #[test]
+    fn runtime_prompt_only_dispatch_guard_requires_new_transcript_input() {
+        assert!(!should_skip_runtime_prompt_only_dispatch(None, 7, 0));
+        assert!(!should_skip_runtime_prompt_only_dispatch(Some(6), 7, 0));
+        assert!(!should_skip_runtime_prompt_only_dispatch(Some(7), 7, 1));
+        assert!(should_skip_runtime_prompt_only_dispatch(Some(7), 7, 0));
     }
 
     #[test]
@@ -2753,6 +2950,36 @@ mod tests {
     }
 
     #[test]
+    fn disallowed_tools_gate_blocks_listed_tool() {
+        let disallowed = vec!["exec_shell".to_string()];
+        assert!(command_denies_tool(Some(&disallowed), "exec_shell"));
+        assert!(!command_denies_tool(Some(&disallowed), "read_file"));
+    }
+
+    #[test]
+    fn disallowed_tools_gate_blocks_case_insensitively() {
+        let disallowed = vec!["exec_shell".to_string()];
+        assert!(command_denies_tool(Some(&disallowed), "Exec_Shell"));
+    }
+
+    #[test]
+    fn disallowed_tools_gate_is_inert_when_not_set() {
+        assert!(!command_denies_tool(None, "exec_shell"));
+        let empty: Vec<String> = Vec::new();
+        assert!(!command_denies_tool(Some(&empty), "exec_shell"));
+    }
+
+    #[test]
+    fn deny_wins_over_allow_for_same_tool() {
+        // The turn-loop gate chain checks the deny-list before the allow-list,
+        // so a tool present in both must still be blocked.
+        let allowed = vec!["exec_shell".to_string()];
+        let disallowed = vec!["exec_shell".to_string()];
+        assert!(command_allows_tool(Some(&allowed), "exec_shell"));
+        assert!(command_denies_tool(Some(&disallowed), "exec_shell"));
+    }
+
+    #[test]
     fn review_regression_allowed_tools_gate_checks_canonical_tool_name() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let context = crate::tools::spec::ToolContext::new(tmp.path().to_path_buf());
@@ -2869,5 +3096,150 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].exit_code, Some(2));
         assert!(results[0].stdout.contains("security"));
+    }
+
+    // ── #3026: JSON decision contract fold ─────────────────────────────────
+
+    fn hook_result(stdout: &str, exit_code: Option<i32>) -> crate::hooks::HookResult {
+        crate::hooks::HookResult {
+            name: None,
+            success: exit_code == Some(0),
+            exit_code,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            duration: Duration::from_millis(1),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn hook_fold_json_deny_blocks_with_reason() {
+        let fold = fold_tool_call_before_results(&[hook_result(
+            r#"{"decision":"deny","reason":"nope"}"#,
+            Some(0),
+        )]);
+        assert_eq!(fold.deny_reason.as_deref(), Some("nope"));
+        assert!(!fold.requires_approval);
+    }
+
+    #[test]
+    fn hook_fold_exit_code_2_denies_regardless_of_stdout() {
+        let fold =
+            fold_tool_call_before_results(&[hook_result(r#"{"decision":"allow"}"#, Some(2))]);
+        assert!(
+            fold.deny_reason.is_some(),
+            "exit code 2 must hard-deny even when stdout says allow"
+        );
+    }
+
+    #[test]
+    fn hook_fold_deny_wins_over_ask_and_allow() {
+        let fold = fold_tool_call_before_results(&[
+            hook_result(r#"{"decision":"allow"}"#, Some(0)),
+            hook_result(r#"{"decision":"ask"}"#, Some(0)),
+            hook_result(r#"{"decision":"deny","reason":"policy"}"#, Some(0)),
+        ]);
+        assert_eq!(fold.deny_reason.as_deref(), Some("policy"));
+    }
+
+    #[test]
+    fn hook_fold_ask_requires_approval() {
+        let fold = fold_tool_call_before_results(&[
+            hook_result(r#"{"decision":"allow"}"#, Some(0)),
+            hook_result(r#"{"decision":"ask"}"#, Some(0)),
+        ]);
+        assert!(fold.deny_reason.is_none());
+        assert!(fold.requires_approval);
+    }
+
+    #[test]
+    fn hook_fold_updated_input_last_writer_wins() {
+        let fold = fold_tool_call_before_results(&[
+            hook_result(r#"{"updatedInput":{"command":"first"}}"#, Some(0)),
+            hook_result(r#"{"updatedInput":{"command":"second"}}"#, Some(0)),
+        ]);
+        assert_eq!(
+            fold.updated_input,
+            Some(serde_json::json!({"command":"second"}))
+        );
+    }
+
+    #[test]
+    fn hook_fold_background_results_cannot_steer() {
+        // Background hooks return exit_code: None immediately — their stdout
+        // (if any were captured) must not deny, ask, or rewrite input.
+        let fold = fold_tool_call_before_results(&[hook_result(
+            r#"{"decision":"deny","reason":"too late"}"#,
+            None,
+        )]);
+        assert_eq!(fold, ToolCallHookFold::default());
+    }
+
+    #[test]
+    fn hook_fold_concatenates_additional_context() {
+        let fold = fold_tool_call_before_results(&[
+            hook_result(r#"{"additionalContext":"one"}"#, Some(0)),
+            hook_result(r#"{"additionalContext":"two"}"#, Some(0)),
+        ]);
+        assert_eq!(fold.additional_context.as_deref(), Some("one\ntwo"));
+    }
+
+    #[test]
+    fn hook_fold_legacy_stdout_is_passthrough() {
+        let fold = fold_tool_call_before_results(&[
+            hook_result("", Some(0)),
+            hook_result("not json at all", Some(0)),
+            hook_result(r#"{"status":"fine"}"#, Some(1)),
+        ]);
+        assert_eq!(fold, ToolCallHookFold::default());
+    }
+
+    #[test]
+    fn hook_gate_denies_with_json_decision_from_executor() {
+        use crate::hooks::{Hook, HookContext, HookEvent, HookExecutor, HooksConfig};
+
+        let deny_cmd = if cfg!(windows) {
+            r#"echo {"decision":"deny","reason":"blocked by project policy"}"#
+        } else {
+            r#"echo '{"decision":"deny","reason":"blocked by project policy"}'"#
+        };
+        let config = HooksConfig {
+            enabled: true,
+            hooks: vec![Hook::new(HookEvent::ToolCallBefore, deny_cmd)],
+            ..HooksConfig::default()
+        };
+        let executor = HookExecutor::new(config, std::path::PathBuf::from("."));
+        let ctx = HookContext::new().with_tool_name("exec_shell");
+        let results = executor.execute(HookEvent::ToolCallBefore, &ctx);
+
+        let fold = fold_tool_call_before_results(&results);
+        assert_eq!(
+            fold.deny_reason.as_deref(),
+            Some("blocked by project policy"),
+            "JSON deny with exit code 0 must block: {results:?}"
+        );
+    }
+
+    #[test]
+    fn hook_gate_ask_forces_approval_from_executor() {
+        use crate::hooks::{Hook, HookContext, HookEvent, HookExecutor, HooksConfig};
+
+        let ask_cmd = if cfg!(windows) {
+            r#"echo {"decision":"ask"}"#
+        } else {
+            r#"echo '{"decision":"ask"}'"#
+        };
+        let config = HooksConfig {
+            enabled: true,
+            hooks: vec![Hook::new(HookEvent::ToolCallBefore, ask_cmd)],
+            ..HooksConfig::default()
+        };
+        let executor = HookExecutor::new(config, std::path::PathBuf::from("."));
+        let ctx = HookContext::new().with_tool_name("write_file");
+        let results = executor.execute(HookEvent::ToolCallBefore, &ctx);
+
+        let fold = fold_tool_call_before_results(&results);
+        assert!(fold.deny_reason.is_none());
+        assert!(fold.requires_approval);
     }
 }

@@ -19,14 +19,14 @@ path = "src/bin/codew_legacy_shim.rs"
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
-codewhale-agent = { path = "../agent", version = "0.8.57" }
-codewhale-app-server = { path = "../app-server", version = "0.8.57" }
-codewhale-config = { path = "../config", version = "0.8.57" }
-codewhale-execpolicy = { path = "../execpolicy", version = "0.8.57" }
-codewhale-mcp = { path = "../mcp", version = "0.8.57" }
-codewhale-release = { path = "../release", version = "0.8.57" }
-codewhale-secrets = { path = "../secrets", version = "0.8.57" }
-codewhale-state = { path = "../state", version = "0.8.57" }
+codewhale-agent = { path = "../agent", version = "0.8.60" }
+codewhale-app-server = { path = "../app-server", version = "0.8.60" }
+codewhale-config = { path = "../config", version = "0.8.60" }
+codewhale-execpolicy = { path = "../execpolicy", version = "0.8.60" }
+codewhale-mcp = { path = "../mcp", version = "0.8.60" }
+codewhale-release = { path = "../release", version = "0.8.60" }
+codewhale-secrets = { path = "../secrets", version = "0.8.60" }
+codewhale-state = { path = "../state", version = "0.8.60" }
 chrono.workspace = true
 dirs.workspace = true
 serde.workspace = true
@@ -36,7 +36,7 @@ rustls.workspace = true
 semver.workspace = true
 tokio.workspace = true
 sha2.workspace = true
-tempfile = "3.16"
+tempfile = "3.27"
 tracing.workspace = true
 
 [dev-dependencies]

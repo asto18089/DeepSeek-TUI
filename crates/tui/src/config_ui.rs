@@ -649,11 +649,12 @@ fn reload_runtime_config(app: &mut App, config: &mut Config) -> Result<()> {
     let reloaded = Config::load(app.config_path.clone(), app.config_profile.as_deref())?;
     *config = reloaded.clone();
     app.api_provider = reloaded.api_provider();
-    app.reasoning_effort = ReasoningEffort::from_setting(
-        reloaded
-            .reasoning_effort()
-            .unwrap_or_else(|| app.reasoning_effort.as_setting()),
-    );
+    app.reasoning_effort =
+        ReasoningEffort::from_setting(reloaded.reasoning_effort().unwrap_or_else(|| {
+            app.reasoning_effort
+                .as_setting_for_provider(app.api_provider)
+        }))
+        .normalize_for_provider(app.api_provider);
     app.last_effective_reasoning_effort = None;
     app.update_model_compaction_budget();
     app.mcp_config_path = reloaded.mcp_config_path();
@@ -680,7 +681,8 @@ fn apply_reasoning_effort(
     value: ReasoningEffortValue,
     persist: bool,
 ) -> Result<()> {
-    let effort: ReasoningEffort = value.into();
+    let effort: ReasoningEffort =
+        ReasoningEffort::from(value).normalize_for_provider(app.api_provider);
     app.reasoning_effort = effort;
     app.last_effective_reasoning_effort = None;
     app.update_model_compaction_budget();
@@ -688,10 +690,10 @@ fn apply_reasoning_effort(
         crate::config_persistence::persist_root_string_key(
             app.config_path.as_deref(),
             "reasoning_effort",
-            effort.as_setting(),
+            effort.as_setting_for_provider(app.api_provider),
         )?;
     }
-    config.reasoning_effort = Some(effort.as_setting().to_string());
+    config.reasoning_effort = Some(effort.as_setting_for_provider(app.api_provider).to_string());
     Ok(())
 }
 

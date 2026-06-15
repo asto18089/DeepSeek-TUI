@@ -27,6 +27,8 @@ const DEFAULT_OPENAI_MODEL: &str = "deepseek-v4-pro";
 const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/beta";
 const DEFAULT_NVIDIA_NIM_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 const DEFAULT_OPENAI_CODEX_MODEL: &str = "gpt-5.5";
+const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
+const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_ATLASCLOUD_MODEL: &str = "deepseek-ai/deepseek-v4-flash";
@@ -41,7 +43,11 @@ const OPENROUTER_ARCEE_TRINITY_LARGE_THINKING_MODEL: &str = "arcee-ai/trinity-la
 const OPENROUTER_GEMMA_4_31B_MODEL: &str = "google/gemma-4-31b-it";
 const OPENROUTER_GEMMA_4_26B_A4B_MODEL: &str = "google/gemma-4-26b-a4b-it";
 const OPENROUTER_GLM_5_1_MODEL: &str = "z-ai/glm-5.1";
+const OPENROUTER_GLM_5_2_MODEL: &str = "z-ai/glm-5.2";
+const OPENROUTER_KIMI_K2_7_CODE_MODEL: &str = "moonshotai/kimi-k2.7-code";
 const OPENROUTER_KIMI_K2_6_MODEL: &str = "moonshotai/kimi-k2.6";
+const OPENROUTER_MINIMAX_M3_MODEL: &str = "minimax/minimax-m3";
+const OPENROUTER_MINIMAX_2_7_MODEL: &str = "minimax/minimax-2.7";
 const OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL: &str =
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
 const OPENROUTER_QWEN_3_6_FLASH_MODEL: &str = "qwen/qwen3.6-flash";
@@ -68,7 +74,8 @@ const DEFAULT_SILICONFLOW_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 const DEFAULT_ARCEE_MODEL: &str = "trinity-large-thinking";
 const ARCEE_TRINITY_LARGE_PREVIEW_MODEL: &str = "trinity-large-preview";
 const ARCEE_TRINITY_MINI_MODEL: &str = "trinity-mini";
-const DEFAULT_MOONSHOT_MODEL: &str = "kimi-k2.6";
+const DEFAULT_MOONSHOT_MODEL: &str = "kimi-k2.7-code";
+const MOONSHOT_KIMI_K2_6_MODEL: &str = "kimi-k2.6";
 const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 const DEFAULT_KIMI_CODE_MODEL: &str = "kimi-for-coding";
 const DEFAULT_KIMI_CODE_BASE_URL: &str = "https://api.kimi.com/coding/v1";
@@ -97,6 +104,24 @@ const DEFAULT_VLLM_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 const DEFAULT_VLLM_BASE_URL: &str = "http://localhost:8000/v1";
 const DEFAULT_OLLAMA_MODEL: &str = "deepseek-coder:1.3b";
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
+
+// Z.ai (GLM Coding Plan) defaults
+const DEFAULT_ZAI_MODEL: &str = "GLM-5.1";
+const ZAI_GLM_5_2_MODEL: &str = "GLM-5.2";
+const DEFAULT_ZAI_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
+// StepFun / StepFlash defaults
+const DEFAULT_STEPFUN_MODEL: &str = "step-3.7-flash";
+const DEFAULT_STEPFUN_BASE_URL: &str = "https://api.stepfun.ai/v1";
+// MiniMax defaults
+const DEFAULT_MINIMAX_MODEL: &str = "MiniMax-M3";
+const MINIMAX_M2_7_MODEL: &str = "MiniMax-M2.7";
+const MINIMAX_M2_7_HIGHSPEED_MODEL: &str = "MiniMax-M2.7-highspeed";
+const MINIMAX_M2_5_MODEL: &str = "MiniMax-M2.5";
+const MINIMAX_M2_5_HIGHSPEED_MODEL: &str = "MiniMax-M2.5-highspeed";
+const MINIMAX_M2_1_MODEL: &str = "MiniMax-M2.1";
+const MINIMAX_M2_1_HIGHSPEED_MODEL: &str = "MiniMax-M2.1-highspeed";
+const MINIMAX_M2_MODEL: &str = "MiniMax-M2";
+const DEFAULT_MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -152,10 +177,25 @@ pub enum ProviderKind {
         alias = "chatgpt_codex"
     )]
     OpenaiCodex,
+    #[serde(alias = "claude")]
+    Anthropic,
+    #[serde(alias = "z-ai", alias = "z_ai", alias = "z.ai")]
+    Zai,
+    #[serde(
+        alias = "step-fun",
+        alias = "step_fun",
+        alias = "stepfun",
+        alias = "stepflash",
+        alias = "step-flash",
+        alias = "step_flash"
+    )]
+    Stepfun,
+    #[serde(alias = "mini-max", alias = "mini_max", alias = "minimax")]
+    Minimax,
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 24] = [
         Self::Deepseek,
         Self::NvidiaNim,
         Self::Openai,
@@ -167,8 +207,8 @@ impl ProviderKind {
         Self::Novita,
         Self::Fireworks,
         Self::Siliconflow,
-        Self::SiliconflowCN,
         Self::Arcee,
+        Self::SiliconflowCN,
         Self::Moonshot,
         Self::Sglang,
         Self::Vllm,
@@ -176,65 +216,66 @@ impl ProviderKind {
         Self::Huggingface,
         Self::Together,
         Self::OpenaiCodex,
+        Self::Anthropic,
+        Self::Zai,
+        Self::Stepfun,
+        Self::Minimax,
     ];
 
     #[must_use]
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Deepseek,
+            Self::NvidiaNim,
+            Self::Openai,
+            Self::Atlascloud,
+            Self::WanjieArk,
+            Self::Volcengine,
+            Self::Openrouter,
+            Self::XiaomiMimo,
+            Self::Novita,
+            Self::Fireworks,
+            Self::Siliconflow,
+            Self::SiliconflowCN,
+            Self::Arcee,
+            Self::Moonshot,
+            Self::Sglang,
+            Self::Vllm,
+            Self::Ollama,
+            Self::Huggingface,
+            Self::Together,
+            Self::OpenaiCodex,
+            Self::Anthropic,
+            Self::Zai,
+            Self::Stepfun,
+            Self::Minimax,
+        ]
+    }
+
+    #[must_use]
+    pub fn names_hint() -> String {
+        Self::all()
+            .iter()
+            .map(|provider| provider.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    #[must_use]
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Deepseek => "deepseek",
-            Self::NvidiaNim => "nvidia-nim",
-            Self::Openai => "openai",
-            Self::Atlascloud => "atlascloud",
-            Self::WanjieArk => "wanjie-ark",
-            Self::Volcengine => "volcengine",
-            Self::Openrouter => "openrouter",
-            Self::XiaomiMimo => "xiaomi-mimo",
-            Self::Novita => "novita",
-            Self::Fireworks => "fireworks",
-            Self::Siliconflow => "siliconflow",
-            Self::SiliconflowCN => "siliconflow-CN",
-            Self::Arcee => "arcee",
-            Self::Moonshot => "moonshot",
-            Self::Sglang => "sglang",
-            Self::Vllm => "vllm",
-            Self::Ollama => "ollama",
-            Self::Huggingface => "huggingface",
-            Self::Together => "together",
-            Self::OpenaiCodex => "openai-codex",
-        }
+        self.provider().id()
     }
 
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "deepseek" | "deep-seek" | "deepseek-cn" | "deepseek_china" | "deepseekcn"
-            | "deepseek-china" => Some(Self::Deepseek),
-            "nvidia" | "nvidia-nim" | "nvidia_nim" | "nim" => Some(Self::NvidiaNim),
-            "openai" | "open-ai" => Some(Self::Openai),
-            "atlascloud" | "atlas-cloud" | "atlas_cloud" | "atlas" => Some(Self::Atlascloud),
-            "wanjie" | "wanjie-ark" | "wanjie_ark" | "ark-wanjie" | "ark_wanjie" | "wanjieark"
-            | "wanjie-maas" | "wanjie_maas" | "wanjiemaas" => Some(Self::WanjieArk),
-            "volcengine" | "volcengine-ark" | "volcengine_ark" | "ark" | "volc-ark"
-            | "volcengineark" => Some(Self::Volcengine),
-            "openrouter" | "open_router" => Some(Self::Openrouter),
-            "xiaomi-mimo" | "xiaomi_mimo" | "xiaomimimo" | "mimo" | "xiaomi" => {
-                Some(Self::XiaomiMimo)
-            }
-            "novita" => Some(Self::Novita),
-            "fireworks" | "fireworks-ai" => Some(Self::Fireworks),
-            "siliconflow" | "silicon-flow" | "silicon_flow" => Some(Self::Siliconflow),
-            "siliconflow-cn" | "siliconflow-CN" => Some(Self::SiliconflowCN),
-            "arcee" | "arcee-ai" | "arcee_ai" => Some(Self::Arcee),
-            "moonshot" | "moonshot-ai" | "kimi" | "kimi-k2" => Some(Self::Moonshot),
-            "sglang" | "sg-lang" => Some(Self::Sglang),
-            "vllm" | "v-llm" => Some(Self::Vllm),
-            "ollama" | "ollama-local" => Some(Self::Ollama),
-            "huggingface" | "hugging-face" | "hugging_face" | "hf" => Some(Self::Huggingface),
-            "together" | "together-ai" | "together_ai" => Some(Self::Together),
-            "openai-codex" | "openai_codex" | "openaicodex" | "codex" | "chatgpt"
-            | "chatgpt-codex" | "chatgpt_codex" | "chatgptcodex" => Some(Self::OpenaiCodex),
-            _ => None,
-        }
+        let trimmed = value.trim();
+        provider::all_providers()
+            .iter()
+            .find(|p| {
+                trimmed.eq_ignore_ascii_case(p.id())
+                    || p.aliases().iter().any(|a| trimmed.eq_ignore_ascii_case(a))
+            })
+            .map(|p| p.kind())
     }
 
     #[must_use]
@@ -289,6 +330,8 @@ pub struct ProvidersToml {
     pub fireworks: ProviderConfigToml,
     #[serde(default)]
     pub siliconflow: ProviderConfigToml,
+    #[serde(default, alias = "siliconflow-CN", alias = "siliconflow-cn")]
+    pub siliconflow_cn: ProviderConfigToml,
     #[serde(default)]
     pub arcee: ProviderConfigToml,
     #[serde(default)]
@@ -312,6 +355,22 @@ pub struct ProvidersToml {
         alias = "chatgpt-codex"
     )]
     pub openai_codex: ProviderConfigToml,
+    #[serde(default)]
+    pub anthropic: ProviderConfigToml,
+    #[serde(default, alias = "z-ai", alias = "z_ai", alias = "z.ai")]
+    pub zai: ProviderConfigToml,
+    #[serde(
+        default,
+        alias = "step-fun",
+        alias = "step_fun",
+        alias = "stepfun",
+        alias = "stepflash",
+        alias = "step-flash",
+        alias = "step_flash"
+    )]
+    pub stepfun: ProviderConfigToml,
+    #[serde(default, alias = "mini-max", alias = "mini_max", alias = "minimax")]
+    pub minimax: ProviderConfigToml,
 }
 
 /// Sibling `permissions.toml` schema.
@@ -352,7 +411,8 @@ impl ProvidersToml {
             ProviderKind::XiaomiMimo => &self.xiaomi_mimo,
             ProviderKind::Novita => &self.novita,
             ProviderKind::Fireworks => &self.fireworks,
-            ProviderKind::Siliconflow | ProviderKind::SiliconflowCN => &self.siliconflow,
+            ProviderKind::Siliconflow => &self.siliconflow,
+            ProviderKind::SiliconflowCN => &self.siliconflow_cn,
             ProviderKind::Arcee => &self.arcee,
             ProviderKind::Moonshot => &self.moonshot,
             ProviderKind::Sglang => &self.sglang,
@@ -361,6 +421,10 @@ impl ProvidersToml {
             ProviderKind::Huggingface => &self.huggingface,
             ProviderKind::Together => &self.together,
             ProviderKind::OpenaiCodex => &self.openai_codex,
+            ProviderKind::Anthropic => &self.anthropic,
+            ProviderKind::Zai => &self.zai,
+            ProviderKind::Stepfun => &self.stepfun,
+            ProviderKind::Minimax => &self.minimax,
         }
     }
 
@@ -376,7 +440,8 @@ impl ProvidersToml {
             ProviderKind::XiaomiMimo => &mut self.xiaomi_mimo,
             ProviderKind::Novita => &mut self.novita,
             ProviderKind::Fireworks => &mut self.fireworks,
-            ProviderKind::Siliconflow | ProviderKind::SiliconflowCN => &mut self.siliconflow,
+            ProviderKind::Siliconflow => &mut self.siliconflow,
+            ProviderKind::SiliconflowCN => &mut self.siliconflow_cn,
             ProviderKind::Arcee => &mut self.arcee,
             ProviderKind::Moonshot => &mut self.moonshot,
             ProviderKind::Sglang => &mut self.sglang,
@@ -385,6 +450,10 @@ impl ProvidersToml {
             ProviderKind::Huggingface => &mut self.huggingface,
             ProviderKind::Together => &mut self.together,
             ProviderKind::OpenaiCodex => &mut self.openai_codex,
+            ProviderKind::Anthropic => &mut self.anthropic,
+            ProviderKind::Zai => &mut self.zai,
+            ProviderKind::Stepfun => &mut self.stepfun,
+            ProviderKind::Minimax => &mut self.minimax,
         }
     }
 }
@@ -550,6 +619,7 @@ pub struct ConfigToml {
     pub model: Option<String>,
     pub auth_mode: Option<String>,
     pub output_mode: Option<String>,
+    pub verbosity: Option<String>,
     pub log_level: Option<String>,
     pub telemetry: Option<bool>,
     pub approval_policy: Option<String>,
@@ -559,9 +629,9 @@ pub struct ConfigToml {
     pub tools: Option<ToolsToml>,
     #[serde(default)]
     pub providers: ProvidersToml,
-    /// Dormant provider fallback chain (#2574). This is parsed and preserved
-    /// for future provider-routing work; current runtime resolution still uses
-    /// the selected primary provider and does not auto-switch routes.
+    /// Provider fallback chain (#2574). TUI runtime code may advance through
+    /// these providers after recoverable provider errors; config resolution
+    /// itself still reports the selected primary provider.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_providers: Vec<ProviderKind>,
     /// Per-domain network policy (#135). When absent, network tools fall back
@@ -593,6 +663,10 @@ pub struct ConfigToml {
     /// lifecycle `[hooks]` table so config rewrites preserve existing hooks.
     #[serde(default)]
     pub hook_sinks: Option<HookSinksToml>,
+    /// Agent Fleet trust and security policy (#3165). When absent, fleet
+    /// workers inherit conservative Sandbox defaults.
+    #[serde(default)]
+    pub fleet: Option<FleetConfigToml>,
     #[serde(flatten)]
     pub extras: BTreeMap<String, toml::Value>,
 }
@@ -894,7 +968,10 @@ impl ProviderChain {
 
     #[must_use]
     pub fn current(&self) -> ProviderKind {
-        self.providers[self.position]
+        self.providers
+            .get(self.position)
+            .copied()
+            .unwrap_or(self.providers[0])
     }
 
     #[must_use]
@@ -908,6 +985,10 @@ impl ProviderChain {
         }
         self.position += 1;
         Some(self.current())
+    }
+
+    pub fn reset(&mut self) {
+        self.position = 0;
     }
 
     #[must_use]
@@ -980,6 +1061,236 @@ impl Default for SnapshotsToml {
             max_age_days: default_snapshot_max_age_days(),
         }
     }
+}
+
+/// On-disk schema for the `[fleet]` table (#3165). See `config.example.toml`
+/// and `docs/FLEET.md` for documentation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetConfigToml {
+    /// Default trust level for fleet workers. One of `"sandbox"`, `"local"`,
+    /// `"remote-verified"`, or `"operator"`. Defaults to `"sandbox"`.
+    #[serde(default = "default_fleet_trust_level_str")]
+    pub default_trust_level: String,
+    /// Require identity verification for remote (SSH) workers before
+    /// granting them `remote-verified` trust. Defaults to true.
+    #[serde(default = "default_fleet_require_identity")]
+    pub require_identity_verification: bool,
+    /// Maximum trust level any worker may have (`"sandbox"`, `"local"`,
+    /// `"remote-verified"`, or `"operator"`). Defaults to `"operator"`.
+    #[serde(default = "default_fleet_max_trust_level_str")]
+    pub max_trust_level: String,
+    /// User-defined and built-in role presets.
+    ///
+    /// Each role defines default tool profiles, capabilities, budgets, and
+    /// trust settings that task specs can reference by name. Built-in roles
+    /// (`smoke-runner`, `reviewer`, `builder`, `read-only`) are always
+    /// available; user-defined roles in config override or extend them.
+    #[serde(default)]
+    pub roles: BTreeMap<String, FleetRolePreset>,
+    /// Headless worker execution hardening (#3027).
+    #[serde(default)]
+    pub exec: FleetExecConfig,
+}
+
+/// Canonical recursion-depth policy for the headless worker runtime.
+///
+/// Single source of truth shared by BOTH standalone sub-agents and fleet
+/// workers so the two cannot drift into "two moving targets":
+/// - [`DEFAULT_SPAWN_DEPTH`] is the default recursion budget (the sub-agent
+///   runtime's `DEFAULT_MAX_SPAWN_DEPTH` is defined as this value).
+/// - [`MAX_SPAWN_DEPTH_CEILING`] is the hard safety cap; every configured
+///   value (fleet `max_spawn_depth`, `agent_open`'s `max_depth`) clamps to it.
+///
+/// A worker runs at `spawn_depth = 0` and may spawn while
+/// `spawn_depth + 1 <= max_spawn_depth`, so a depth of N affords N nested
+/// delegation levels below the root worker. The default of 3 affords at least
+/// three recursion levels out of the box; the root worker still runs at
+/// depth 0 even when the budget is 0.
+pub const DEFAULT_SPAWN_DEPTH: u32 = 3;
+
+/// Hard ceiling on recursion depth for any worker/sub-agent. See
+/// [`DEFAULT_SPAWN_DEPTH`]. Raising this single constant lifts the limit
+/// everywhere (the fleet clamp and `agent_open` validation both read it).
+pub const MAX_SPAWN_DEPTH_CEILING: u32 = 3;
+
+/// Headless worker execution constraints (#3027).
+///
+/// These limits apply to all fleet workers and sub-agents spawned through
+/// the headless worker runtime. Task specs can tighten but not loosen them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetExecConfig {
+    /// Tools that are always allowed regardless of role or task spec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    /// Tools that are always disallowed, overriding role and task spec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disallowed_tools: Vec<String>,
+    /// Hard ceiling on sub-agent steps (tool calls + model turns).
+    /// Workers that exceed this are terminated. Default: unbounded (u32::MAX).
+    #[serde(default = "default_fleet_max_turns")]
+    pub max_turns: u32,
+    /// Recursive child-agent budget for headless fleet workers.
+    /// Defaults to [`DEFAULT_SPAWN_DEPTH`] (3) so a fleet worker has the SAME
+    /// recursion budget as a standalone sub-agent — fleet and sub-agents are one
+    /// substrate, not two. Set 0 to block child `agent_open` (the root worker
+    /// still runs); the value is clamped to [`MAX_SPAWN_DEPTH_CEILING`].
+    #[serde(default = "default_fleet_max_spawn_depth")]
+    pub max_spawn_depth: u32,
+    /// Extra system prompt text appended to every headless worker.
+    /// Useful for injecting org-wide policy or behavior constraints.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub append_system_prompt: String,
+    /// Output format for fleet worker results.
+    /// `"text"` (default) or `"stream-json"` for newline-delimited JSON events.
+    #[serde(default = "default_fleet_output_format")]
+    pub output_format: String,
+}
+
+fn default_fleet_max_turns() -> u32 {
+    u32::MAX
+}
+
+fn default_fleet_max_spawn_depth() -> u32 {
+    DEFAULT_SPAWN_DEPTH
+}
+
+fn default_fleet_output_format() -> String {
+    "text".to_string()
+}
+
+impl Default for FleetExecConfig {
+    fn default() -> Self {
+        Self {
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            max_turns: default_fleet_max_turns(),
+            max_spawn_depth: default_fleet_max_spawn_depth(),
+            append_system_prompt: String::new(),
+            output_format: default_fleet_output_format(),
+        }
+    }
+}
+
+/// A named role preset that bundles common worker settings.
+///
+/// Task specs reference a role name (e.g. `"role": "reviewer"`), and the
+/// fleet manager fills in any missing fields from the preset. User-defined
+/// roles in `[fleet.roles]` override built-in defaults with the same name.
+///
+/// Token budgets and tool-call limits are task-level decisions — they don't
+/// belong on role presets. Use `timeout_seconds` as the safety bound.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetRolePreset {
+    /// Short description of what this role is for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Default tool profile (`"read-only"`, `"read-write"`, or `"custom"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_profile: Option<String>,
+    /// Default set of tool names available to this role.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// Default capability tags (e.g. `"rust"`, `"git"`, `"gh"`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// Default timeout in seconds for tasks using this role.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+    /// Default trust level override for this role.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_level: Option<String>,
+}
+
+fn default_fleet_trust_level_str() -> String {
+    "sandbox".to_string()
+}
+
+fn default_fleet_require_identity() -> bool {
+    true
+}
+
+fn default_fleet_max_trust_level_str() -> String {
+    "operator".to_string()
+}
+
+impl Default for FleetConfigToml {
+    fn default() -> Self {
+        Self {
+            default_trust_level: default_fleet_trust_level_str(),
+            require_identity_verification: default_fleet_require_identity(),
+            max_trust_level: default_fleet_max_trust_level_str(),
+            roles: BTreeMap::new(),
+            exec: FleetExecConfig::default(),
+        }
+    }
+}
+
+impl FleetConfigToml {
+    /// Resolve a role preset by name. Checks user-defined roles first,
+    /// then falls back to built-in role defaults.
+    #[must_use]
+    pub fn resolve_role(&self, name: &str) -> Option<FleetRolePreset> {
+        self.roles
+            .get(name)
+            .cloned()
+            .or_else(|| built_in_role_presets().get(name).cloned())
+    }
+}
+
+/// Built-in role presets that are always available without config.
+#[must_use]
+pub fn built_in_role_presets() -> BTreeMap<String, FleetRolePreset> {
+    [
+        (
+            "smoke-runner".to_string(),
+            FleetRolePreset {
+                description: Some("Lightweight read-only smoke check worker".to_string()),
+                tool_profile: Some("read-only".to_string()),
+                tools: vec![],
+                capabilities: vec![],
+                timeout_seconds: Some(300),
+                trust_level: Some("local".to_string()),
+            },
+        ),
+        (
+            "reviewer".to_string(),
+            FleetRolePreset {
+                description: Some("Read-only code and documentation review".to_string()),
+                tool_profile: Some("read-only".to_string()),
+                tools: vec![],
+                capabilities: vec![],
+                timeout_seconds: Some(600),
+                trust_level: None,
+            },
+        ),
+        (
+            "builder".to_string(),
+            FleetRolePreset {
+                description: Some(
+                    "Read-write builder with compilation and test access".to_string(),
+                ),
+                tool_profile: Some("read-write".to_string()),
+                tools: vec![],
+                capabilities: vec![],
+                timeout_seconds: Some(1800),
+                trust_level: Some("local".to_string()),
+            },
+        ),
+        (
+            "read-only".to_string(),
+            FleetRolePreset {
+                description: Some(
+                    "Minimal read-only observer with no writes or secrets".to_string(),
+                ),
+                tool_profile: Some("read-only".to_string()),
+                tools: vec![],
+                capabilities: vec![],
+                timeout_seconds: Some(300),
+                trust_level: Some("sandbox".to_string()),
+            },
+        ),
+    ]
+    .into()
 }
 
 /// On-disk schema for the `[network]` table (#135). See `config.example.toml`
@@ -1062,6 +1373,9 @@ impl ConfigToml {
         if project.output_mode.is_some() {
             self.output_mode = project.output_mode;
         }
+        if project.verbosity.is_some() {
+            self.verbosity = project.verbosity;
+        }
         if project.log_level.is_some() {
             self.log_level = project.log_level;
         }
@@ -1110,6 +1424,10 @@ impl ConfigToml {
             &mut self.providers.siliconflow,
             &project.providers.siliconflow,
         );
+        merge_project_provider_config(
+            &mut self.providers.siliconflow_cn,
+            &project.providers.siliconflow_cn,
+        );
         merge_project_provider_config(&mut self.providers.arcee, &project.providers.arcee);
         merge_project_provider_config(&mut self.providers.moonshot, &project.providers.moonshot);
         merge_project_provider_config(&mut self.providers.sglang, &project.providers.sglang);
@@ -1132,6 +1450,7 @@ impl ConfigToml {
             "model" => self.model.clone(),
             "auth.mode" => self.auth_mode.clone(),
             "output_mode" => self.output_mode.clone(),
+            "verbosity" => self.verbosity.clone(),
             "log_level" => self.log_level.clone(),
             "telemetry" => self.telemetry.map(|v| v.to_string()),
             "approval_policy" => self.approval_policy.clone(),
@@ -1209,6 +1528,12 @@ impl ConfigToml {
             "providers.siliconflow.http_headers" => {
                 serialize_http_headers(&self.providers.siliconflow.http_headers)
             }
+            "providers.siliconflow_cn.api_key" => self.providers.siliconflow_cn.api_key.clone(),
+            "providers.siliconflow_cn.base_url" => self.providers.siliconflow_cn.base_url.clone(),
+            "providers.siliconflow_cn.model" => self.providers.siliconflow_cn.model.clone(),
+            "providers.siliconflow_cn.http_headers" => {
+                serialize_http_headers(&self.providers.siliconflow_cn.http_headers)
+            }
             "providers.arcee.api_key" => self.providers.arcee.api_key.clone(),
             "providers.arcee.base_url" => self.providers.arcee.base_url.clone(),
             "providers.arcee.model" => self.providers.arcee.model.clone(),
@@ -1270,8 +1595,12 @@ impl ConfigToml {
     pub fn set_value(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
             "provider" => {
-                self.provider = ProviderKind::parse(value)
-                    .with_context(|| format!("unknown provider '{value}'"))?;
+                self.provider = ProviderKind::parse(value).with_context(|| {
+                    format!(
+                        "unknown provider '{value}': expected {}",
+                        ProviderKind::names_hint()
+                    )
+                })?;
             }
             "api_key" => self.api_key = Some(value.to_string()),
             "base_url" => self.base_url = Some(value.to_string()),
@@ -1280,6 +1609,7 @@ impl ConfigToml {
             "model" => self.model = Some(value.to_string()),
             "auth.mode" => self.auth_mode = Some(value.to_string()),
             "output_mode" => self.output_mode = Some(value.to_string()),
+            "verbosity" => self.verbosity = Some(value.to_string()),
             "log_level" => self.log_level = Some(value.to_string()),
             "telemetry" => {
                 self.telemetry = Some(parse_bool(value)?);
@@ -1428,6 +1758,18 @@ impl ConfigToml {
             "providers.siliconflow.http_headers" => {
                 self.providers.siliconflow.http_headers = parse_http_headers(value)?;
             }
+            "providers.siliconflow_cn.api_key" => {
+                self.providers.siliconflow_cn.api_key = Some(value.to_string());
+            }
+            "providers.siliconflow_cn.base_url" => {
+                self.providers.siliconflow_cn.base_url = Some(value.to_string());
+            }
+            "providers.siliconflow_cn.model" => {
+                self.providers.siliconflow_cn.model = Some(value.to_string());
+            }
+            "providers.siliconflow_cn.http_headers" => {
+                self.providers.siliconflow_cn.http_headers = parse_http_headers(value)?;
+            }
             "providers.arcee.api_key" => {
                 self.providers.arcee.api_key = Some(value.to_string());
             }
@@ -1533,6 +1875,7 @@ impl ConfigToml {
             "model" => self.model = None,
             "auth.mode" => self.auth_mode = None,
             "output_mode" => self.output_mode = None,
+            "verbosity" => self.verbosity = None,
             "log_level" => self.log_level = None,
             "telemetry" => self.telemetry = None,
             "approval_policy" => self.approval_policy = None,
@@ -1607,6 +1950,12 @@ impl ConfigToml {
             "providers.siliconflow.http_headers" => {
                 self.providers.siliconflow.http_headers.clear();
             }
+            "providers.siliconflow_cn.api_key" => self.providers.siliconflow_cn.api_key = None,
+            "providers.siliconflow_cn.base_url" => self.providers.siliconflow_cn.base_url = None,
+            "providers.siliconflow_cn.model" => self.providers.siliconflow_cn.model = None,
+            "providers.siliconflow_cn.http_headers" => {
+                self.providers.siliconflow_cn.http_headers.clear();
+            }
             "providers.arcee.api_key" => self.providers.arcee.api_key = None,
             "providers.arcee.base_url" => self.providers.arcee.base_url = None,
             "providers.arcee.model" => self.providers.arcee.model = None,
@@ -1670,6 +2019,9 @@ impl ConfigToml {
         }
         if let Some(v) = self.output_mode.as_ref() {
             out.insert("output_mode".to_string(), v.clone());
+        }
+        if let Some(v) = self.verbosity.as_ref() {
+            out.insert("verbosity".to_string(), v.clone());
         }
         if let Some(v) = self.log_level.as_ref() {
             out.insert("log_level".to_string(), v.clone());
@@ -1834,6 +2186,21 @@ impl ConfigToml {
         if let Some(v) = serialize_http_headers(&self.providers.siliconflow.http_headers) {
             out.insert("providers.siliconflow.http_headers".to_string(), v);
         }
+        if let Some(v) = self.providers.siliconflow_cn.api_key.as_ref() {
+            out.insert(
+                "providers.siliconflow_cn.api_key".to_string(),
+                redact_secret(v),
+            );
+        }
+        if let Some(v) = self.providers.siliconflow_cn.base_url.as_ref() {
+            out.insert("providers.siliconflow_cn.base_url".to_string(), v.clone());
+        }
+        if let Some(v) = self.providers.siliconflow_cn.model.as_ref() {
+            out.insert("providers.siliconflow_cn.model".to_string(), v.clone());
+        }
+        if let Some(v) = serialize_http_headers(&self.providers.siliconflow_cn.http_headers) {
+            out.insert("providers.siliconflow_cn.http_headers".to_string(), v);
+        }
         if let Some(v) = self.providers.arcee.api_key.as_ref() {
             out.insert("providers.arcee.api_key".to_string(), redact_secret(v));
         }
@@ -1943,9 +2310,30 @@ impl ConfigToml {
         secrets: &Secrets,
     ) -> ResolvedRuntimeOptions {
         let env = EnvRuntimeOverrides::load();
-        let provider = cli.provider.or(env.provider).unwrap_or(self.provider);
+        let (provider, provider_source) = if let Some(provider) = cli.provider {
+            (provider, ProviderSource::Cli)
+        } else if let Some(provider) = env.provider {
+            (
+                provider,
+                ProviderSource::Env(env.provider_source.unwrap_or("CODEWHALE_PROVIDER")),
+            )
+        } else {
+            (self.provider, ProviderSource::Config)
+        };
 
-        let provider_cfg = self.providers.for_provider(provider);
+        let mut provider_cfg = self.providers.for_provider(provider).clone();
+        if provider == ProviderKind::SiliconflowCN {
+            let fb = &self.providers.siliconflow;
+            if provider_cfg.api_key.is_none() {
+                provider_cfg.api_key = fb.api_key.clone();
+            }
+            if provider_cfg.base_url.is_none() {
+                provider_cfg.base_url = fb.base_url.clone();
+            }
+            if provider_cfg.model.is_none() {
+                provider_cfg.model = fb.model.clone();
+            }
+        }
         let root_deepseek_api_key = (provider == ProviderKind::Deepseek)
             .then(|| self.api_key.clone())
             .flatten();
@@ -2022,6 +2410,10 @@ impl ConfigToml {
                 ProviderKind::Huggingface => DEFAULT_HUGGINGFACE_BASE_URL.to_string(),
                 ProviderKind::Together => DEFAULT_TOGETHER_BASE_URL.to_string(),
                 ProviderKind::OpenaiCodex => DEFAULT_OPENAI_CODEX_BASE_URL.to_string(),
+                ProviderKind::Anthropic => DEFAULT_ANTHROPIC_BASE_URL.to_string(),
+                ProviderKind::Zai => DEFAULT_ZAI_BASE_URL.to_string(),
+                ProviderKind::Stepfun => DEFAULT_STEPFUN_BASE_URL.to_string(),
+                ProviderKind::Minimax => DEFAULT_MINIMAX_BASE_URL.to_string(),
             })
         };
         // CLI flag wins outright. Otherwise: config-file → injected secrets/env.
@@ -2040,7 +2432,7 @@ impl ConfigToml {
         } else if let Some(value) = xiaomi_mimo_env_api_key.filter(|v| !v.trim().is_empty()) {
             (Some(value), Some(RuntimeApiKeySource::Env))
         } else if should_skip_secret_store_for_provider(provider, &base_url, auth_mode.as_deref()) {
-            match codewhale_secrets::env_for(provider.as_str()) {
+            match env_api_key_for_provider(provider) {
                 Some(value) => (Some(value), Some(RuntimeApiKeySource::Env)),
                 None => (None, None),
             }
@@ -2053,7 +2445,10 @@ impl ConfigToml {
                     };
                     (Some(value), Some(source))
                 }
-                None => (None, None),
+                None => match env_api_key_for_provider(provider) {
+                    Some(value) => (Some(value), Some(RuntimeApiKeySource::Env)),
+                    None => (None, None),
+                },
             }
         };
 
@@ -2122,9 +2517,15 @@ impl ConfigToml {
             .or_else(|| env.sandbox_mode.clone())
             .or_else(|| self.sandbox_mode.clone());
         let yolo = cli.yolo.or(env.yolo);
+        let verbosity = cli
+            .verbosity
+            .clone()
+            .or_else(|| env.verbosity.clone())
+            .or_else(|| self.verbosity.clone());
 
         ResolvedRuntimeOptions {
             provider,
+            provider_source,
             model,
             api_key,
             api_key_source,
@@ -2137,6 +2538,7 @@ impl ConfigToml {
             approval_policy,
             sandbox_mode,
             yolo,
+            verbosity,
             http_headers,
         }
     }
@@ -2225,6 +2627,16 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
     {
         return canonical.to_string();
     }
+    if matches!(provider, ProviderKind::Minimax)
+        && let Some(canonical) = canonical_minimax_model_id(model)
+    {
+        return canonical.to_string();
+    }
+    if matches!(provider, ProviderKind::Zai)
+        && let Some(canonical) = canonical_zai_model_id(model)
+    {
+        return canonical.to_string();
+    }
 
     if matches!(
         provider,
@@ -2232,6 +2644,9 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
             | ProviderKind::WanjieArk
             | ProviderKind::Volcengine
             | ProviderKind::XiaomiMimo
+            | ProviderKind::Zai
+            | ProviderKind::Stepfun
+            | ProviderKind::Minimax
             | ProviderKind::Ollama
     ) {
         return model.to_string();
@@ -2272,11 +2687,11 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
             DEFAULT_FIREWORKS_MODEL.to_string()
         }
         (
-            ProviderKind::Siliconflow,
+            ProviderKind::Siliconflow | ProviderKind::SiliconflowCN,
             "deepseek-v4-pro" | "deepseek-v4pro" | "deepseek-reasoner" | "deepseek-r1",
         ) => DEFAULT_SILICONFLOW_MODEL.to_string(),
         (
-            ProviderKind::Siliconflow,
+            ProviderKind::Siliconflow | ProviderKind::SiliconflowCN,
             "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-v3",
         ) => DEFAULT_SILICONFLOW_FLASH_MODEL.to_string(),
         (
@@ -2289,7 +2704,20 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
         (ProviderKind::Arcee, "arcee-trinity-large-preview") => {
             ARCEE_TRINITY_LARGE_PREVIEW_MODEL.to_string()
         }
-        (ProviderKind::Moonshot, "kimi-k2.6" | "kimi-k2") => DEFAULT_MOONSHOT_MODEL.to_string(),
+        (
+            ProviderKind::Moonshot,
+            "kimi"
+            | "kimi-k2"
+            | "kimi-k2.7"
+            | "kimi-k2-7"
+            | "kimi-k2.7-code"
+            | "kimi-k2-7-code"
+            | "kimi-code"
+            | "moonshot-kimi-k2.7-code",
+        ) => DEFAULT_MOONSHOT_MODEL.to_string(),
+        (ProviderKind::Moonshot, "kimi-k2.6" | "kimi-k2-6" | "moonshot-kimi-k2.6") => {
+            MOONSHOT_KIMI_K2_6_MODEL.to_string()
+        }
         (ProviderKind::Sglang, "deepseek-v4-pro" | "deepseek-v4pro") => {
             DEFAULT_SGLANG_MODEL.to_string()
         }
@@ -2372,6 +2800,49 @@ fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
     }
 }
 
+fn canonical_minimax_model_id(model: &str) -> Option<&'static str> {
+    let normalized = model.trim().to_ascii_lowercase();
+    let normalized = normalized.replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "minimax" | "minimax-m3" | "minimax-m-3" | "minimax-m-3-thinking" => {
+            Some(DEFAULT_MINIMAX_MODEL)
+        }
+        "minimax-m2.7" | "minimax-m2-7" | "minimax-m-2.7" | "minimax-m-2-7" => {
+            Some(MINIMAX_M2_7_MODEL)
+        }
+        "minimax-m2.7-highspeed"
+        | "minimax-m2-7-highspeed"
+        | "minimax-m-2.7-highspeed"
+        | "minimax-m-2-7-highspeed" => Some(MINIMAX_M2_7_HIGHSPEED_MODEL),
+        "minimax-m2.5" | "minimax-m2-5" | "minimax-m-2.5" | "minimax-m-2-5" => {
+            Some(MINIMAX_M2_5_MODEL)
+        }
+        "minimax-m2.5-highspeed"
+        | "minimax-m2-5-highspeed"
+        | "minimax-m-2.5-highspeed"
+        | "minimax-m-2-5-highspeed" => Some(MINIMAX_M2_5_HIGHSPEED_MODEL),
+        "minimax-m2.1" | "minimax-m2-1" | "minimax-m-2.1" | "minimax-m-2-1" => {
+            Some(MINIMAX_M2_1_MODEL)
+        }
+        "minimax-m2.1-highspeed"
+        | "minimax-m2-1-highspeed"
+        | "minimax-m-2.1-highspeed"
+        | "minimax-m-2-1-highspeed" => Some(MINIMAX_M2_1_HIGHSPEED_MODEL),
+        "minimax-m2" | "minimax-m-2" => Some(MINIMAX_M2_MODEL),
+        _ => None,
+    }
+}
+
+fn canonical_zai_model_id(model: &str) -> Option<&'static str> {
+    let normalized = model.trim().to_ascii_lowercase();
+    let normalized = normalized.replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "glm-5.1" | "glm-5-1" | "zai-glm-5.1" | "zai-glm-5-1" => Some(DEFAULT_ZAI_MODEL),
+        "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => Some(ZAI_GLM_5_2_MODEL),
+        _ => None,
+    }
+}
+
 fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
     let normalized = model.trim().to_ascii_lowercase();
     let normalized = normalized.replace(['_', ' '], "-");
@@ -2390,9 +2861,32 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
         OPENROUTER_GLM_5_1_MODEL | "glm-5.1" | "glm-5-1" | "zai-glm-5.1" | "zai-glm-5-1" => {
             Some(OPENROUTER_GLM_5_1_MODEL)
         }
+        OPENROUTER_GLM_5_2_MODEL | "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => {
+            Some(OPENROUTER_GLM_5_2_MODEL)
+        }
+        OPENROUTER_KIMI_K2_7_CODE_MODEL
+        | "kimi"
+        | "kimi-k2"
+        | "kimi-k2.7"
+        | "kimi-k2-7"
+        | "kimi-k2.7-code"
+        | "kimi-k2-7-code"
+        | "kimi-code"
+        | "moonshot-kimi-k2.7-code"
+        | "openrouter-kimi-k2.7-code" => Some(OPENROUTER_KIMI_K2_7_CODE_MODEL),
         OPENROUTER_KIMI_K2_6_MODEL | "kimi-k2.6" | "kimi-k2-6" | "moonshot-kimi-k2.6" => {
             Some(OPENROUTER_KIMI_K2_6_MODEL)
         }
+        OPENROUTER_MINIMAX_M3_MODEL | "minimax-m3" | "minimax-m-3" => {
+            Some(OPENROUTER_MINIMAX_M3_MODEL)
+        }
+        OPENROUTER_MINIMAX_2_7_MODEL
+        | "minimax-2.7"
+        | "minimax-2-7"
+        | "minimax-m2.7"
+        | "minimax-m2-7"
+        | "minimax-m-2.7"
+        | "minimax-m-2-7" => Some(OPENROUTER_MINIMAX_2_7_MODEL),
         OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL
         | "nemotron-3-nano-omni"
         | "nemotron-3-nano-omni-reasoning" => Some(OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL),
@@ -2454,6 +2948,10 @@ fn default_model_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Huggingface => DEFAULT_HUGGINGFACE_MODEL,
         ProviderKind::Together => DEFAULT_TOGETHER_MODEL,
         ProviderKind::OpenaiCodex => DEFAULT_OPENAI_CODEX_MODEL,
+        ProviderKind::Anthropic => DEFAULT_ANTHROPIC_MODEL,
+        ProviderKind::Zai => DEFAULT_ZAI_MODEL,
+        ProviderKind::Stepfun => DEFAULT_STEPFUN_MODEL,
+        ProviderKind::Minimax => DEFAULT_MINIMAX_MODEL,
     }
 }
 
@@ -2479,6 +2977,10 @@ fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Huggingface => DEFAULT_HUGGINGFACE_BASE_URL,
         ProviderKind::Together => DEFAULT_TOGETHER_BASE_URL,
         ProviderKind::OpenaiCodex => DEFAULT_OPENAI_CODEX_BASE_URL,
+        ProviderKind::Anthropic => DEFAULT_ANTHROPIC_BASE_URL,
+        ProviderKind::Zai => DEFAULT_ZAI_BASE_URL,
+        ProviderKind::Stepfun => DEFAULT_STEPFUN_BASE_URL,
+        ProviderKind::Minimax => DEFAULT_MINIMAX_BASE_URL,
     }
 }
 
@@ -2665,6 +3167,21 @@ fn should_skip_secret_store_for_provider(
     ) || base_url_uses_local_host(base_url)
 }
 
+fn env_api_key_for_provider(provider: ProviderKind) -> Option<String> {
+    if provider == ProviderKind::Huggingface {
+        return std::env::var("HUGGINGFACE_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                std::env::var("HF_TOKEN")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            });
+    }
+
+    codewhale_secrets::env_for(provider.as_str())
+}
+
 fn auth_mode_requires_api_key(auth_mode: Option<&str>) -> bool {
     matches!(
         auth_mode
@@ -2740,6 +3257,7 @@ pub struct CliRuntimeOverrides {
     pub approval_policy: Option<String>,
     pub sandbox_mode: Option<String>,
     pub yolo: Option<bool>,
+    pub verbosity: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2762,9 +3280,17 @@ impl RuntimeApiKeySource {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderSource {
+    Cli,
+    Env(&'static str),
+    Config,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedRuntimeOptions {
     pub provider: ProviderKind,
+    pub provider_source: ProviderSource,
     pub model: String,
     pub api_key: Option<String>,
     pub api_key_source: Option<RuntimeApiKeySource>,
@@ -2777,6 +3303,7 @@ pub struct ResolvedRuntimeOptions {
     pub approval_policy: Option<String>,
     pub sandbox_mode: Option<String>,
     pub yolo: Option<bool>,
+    pub verbosity: Option<String>,
     pub http_headers: BTreeMap<String, String>,
 }
 
@@ -3190,6 +3717,7 @@ fn normalize_config_file_path(path: PathBuf) -> Result<PathBuf> {
 #[derive(Debug, Clone, Default)]
 struct EnvRuntimeOverrides {
     provider: Option<ProviderKind>,
+    provider_source: Option<&'static str>,
     model: Option<String>,
     volcengine_model: Option<String>,
     wanjie_ark_model: Option<String>,
@@ -3207,6 +3735,7 @@ struct EnvRuntimeOverrides {
     approval_policy: Option<String>,
     sandbox_mode: Option<String>,
     yolo: Option<bool>,
+    verbosity: Option<String>,
     http_headers: Option<BTreeMap<String, String>>,
     deepseek_base_url: Option<String>,
     nvidia_base_url: Option<String>,
@@ -3231,15 +3760,22 @@ struct EnvRuntimeOverrides {
     together_model: Option<String>,
     openai_codex_base_url: Option<String>,
     openai_codex_model: Option<String>,
+    anthropic_base_url: Option<String>,
+    anthropic_model: Option<String>,
+    zai_base_url: Option<String>,
+    zai_model: Option<String>,
+    stepfun_base_url: Option<String>,
+    stepfun_model: Option<String>,
+    minimax_base_url: Option<String>,
+    minimax_model: Option<String>,
 }
 
 impl EnvRuntimeOverrides {
     fn load() -> Self {
+        let (provider, provider_source) = Self::load_provider();
         Self {
-            provider: std::env::var("CODEWHALE_PROVIDER")
-                .or_else(|_| std::env::var("DEEPSEEK_PROVIDER"))
-                .ok()
-                .and_then(|v| ProviderKind::parse(&v)),
+            provider,
+            provider_source,
             model: std::env::var("CODEWHALE_MODEL")
                 .or_else(|_| std::env::var("DEEPSEEK_MODEL"))
                 .or_else(|_| std::env::var("DEEPSEEK_DEFAULT_TEXT_MODEL"))
@@ -3279,6 +3815,9 @@ impl EnvRuntimeOverrides {
             arcee_model: std::env::var("ARCEE_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            verbosity: std::env::var("CODEWHALE_VERBOSITY")
+                .or_else(|_| std::env::var("DEEPSEEK_VERBOSITY"))
+                .ok(),
             output_mode: std::env::var("DEEPSEEK_OUTPUT_MODE").ok(),
             auth_mode: std::env::var("DEEPSEEK_AUTH_MODE").ok(),
             log_level: std::env::var("DEEPSEEK_LOG_LEVEL").ok(),
@@ -3394,7 +3933,49 @@ impl EnvRuntimeOverrides {
                 .or_else(|_| std::env::var("CODEX_MODEL"))
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            anthropic_base_url: std::env::var("ANTHROPIC_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            anthropic_model: std::env::var("ANTHROPIC_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            zai_base_url: std::env::var("ZAI_BASE_URL")
+                .or_else(|_| std::env::var("Z_AI_BASE_URL"))
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            zai_model: std::env::var("ZAI_MODEL")
+                .or_else(|_| std::env::var("Z_AI_MODEL"))
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            stepfun_base_url: std::env::var("STEPFUN_BASE_URL")
+                .or_else(|_| std::env::var("STEP_BASE_URL"))
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            stepfun_model: std::env::var("STEPFUN_MODEL")
+                .or_else(|_| std::env::var("STEP_MODEL"))
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            minimax_base_url: std::env::var("MINIMAX_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            minimax_model: std::env::var("MINIMAX_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
         }
+    }
+
+    fn load_provider() -> (Option<ProviderKind>, Option<&'static str>) {
+        if let Ok(value) = std::env::var("CODEWHALE_PROVIDER") {
+            let parsed = ProviderKind::parse(&value);
+            return (parsed, parsed.map(|_| "CODEWHALE_PROVIDER"));
+        }
+
+        if let Ok(value) = std::env::var("DEEPSEEK_PROVIDER") {
+            let parsed = ProviderKind::parse(&value);
+            return (parsed, parsed.map(|_| "DEEPSEEK_PROVIDER"));
+        }
+
+        (None, None)
     }
 
     fn base_url_for(&self, provider: ProviderKind) -> Option<String> {
@@ -3422,6 +4003,10 @@ impl EnvRuntimeOverrides {
             ProviderKind::Huggingface => self.huggingface_base_url.clone(),
             ProviderKind::Together => self.together_base_url.clone(),
             ProviderKind::OpenaiCodex => self.openai_codex_base_url.clone(),
+            ProviderKind::Anthropic => self.anthropic_base_url.clone(),
+            ProviderKind::Zai => self.zai_base_url.clone(),
+            ProviderKind::Stepfun => self.stepfun_base_url.clone(),
+            ProviderKind::Minimax => self.minimax_base_url.clone(),
         }
     }
 
@@ -3441,6 +4026,10 @@ impl EnvRuntimeOverrides {
             ProviderKind::Huggingface => self.huggingface_model.clone(),
             ProviderKind::Together => self.together_model.clone(),
             ProviderKind::OpenaiCodex => self.openai_codex_model.clone(),
+            ProviderKind::Anthropic => self.anthropic_model.clone(),
+            ProviderKind::Zai => self.zai_model.clone(),
+            ProviderKind::Stepfun => self.stepfun_model.clone(),
+            ProviderKind::Minimax => self.minimax_model.clone(),
             _ => None,
         }?;
 
@@ -3838,12 +4427,29 @@ action = "mode.agent"
         kimi_base_url: Option<OsString>,
         kimi_model: Option<OsString>,
         kimi_model_name: Option<OsString>,
+        zai_api_key: Option<OsString>,
+        z_ai_api_key: Option<OsString>,
+        zai_base_url: Option<OsString>,
+        zai_model: Option<OsString>,
+        stepfun_api_key: Option<OsString>,
+        step_api_key: Option<OsString>,
+        stepfun_base_url: Option<OsString>,
+        stepfun_model: Option<OsString>,
+        minimax_api_key: Option<OsString>,
+        minimax_base_url: Option<OsString>,
+        minimax_model: Option<OsString>,
         sglang_api_key: Option<OsString>,
         sglang_base_url: Option<OsString>,
         vllm_api_key: Option<OsString>,
         vllm_base_url: Option<OsString>,
         ollama_api_key: Option<OsString>,
         ollama_base_url: Option<OsString>,
+        huggingface_api_key: Option<OsString>,
+        huggingface_token: Option<OsString>,
+        huggingface_base_url: Option<OsString>,
+        hf_base_url: Option<OsString>,
+        huggingface_model: Option<OsString>,
+        hf_model: Option<OsString>,
         codewhale_provider: Option<OsString>,
         codewhale_model: Option<OsString>,
         codewhale_base_url: Option<OsString>,
@@ -3915,12 +4521,29 @@ action = "mode.agent"
                 kimi_base_url: env::var_os("KIMI_BASE_URL"),
                 kimi_model: env::var_os("KIMI_MODEL"),
                 kimi_model_name: env::var_os("KIMI_MODEL_NAME"),
+                zai_api_key: env::var_os("ZAI_API_KEY"),
+                z_ai_api_key: env::var_os("Z_AI_API_KEY"),
+                zai_base_url: env::var_os("ZAI_BASE_URL"),
+                zai_model: env::var_os("ZAI_MODEL"),
+                stepfun_api_key: env::var_os("STEPFUN_API_KEY"),
+                step_api_key: env::var_os("STEP_API_KEY"),
+                stepfun_base_url: env::var_os("STEPFUN_BASE_URL"),
+                stepfun_model: env::var_os("STEPFUN_MODEL"),
+                minimax_api_key: env::var_os("MINIMAX_API_KEY"),
+                minimax_base_url: env::var_os("MINIMAX_BASE_URL"),
+                minimax_model: env::var_os("MINIMAX_MODEL"),
                 sglang_api_key: env::var_os("SGLANG_API_KEY"),
                 sglang_base_url: env::var_os("SGLANG_BASE_URL"),
                 vllm_api_key: env::var_os("VLLM_API_KEY"),
                 vllm_base_url: env::var_os("VLLM_BASE_URL"),
                 ollama_api_key: env::var_os("OLLAMA_API_KEY"),
                 ollama_base_url: env::var_os("OLLAMA_BASE_URL"),
+                huggingface_api_key: env::var_os("HUGGINGFACE_API_KEY"),
+                huggingface_token: env::var_os("HF_TOKEN"),
+                huggingface_base_url: env::var_os("HUGGINGFACE_BASE_URL"),
+                hf_base_url: env::var_os("HF_BASE_URL"),
+                huggingface_model: env::var_os("HUGGINGFACE_MODEL"),
+                hf_model: env::var_os("HF_MODEL"),
             };
             // Safety: test-only environment mutation guarded by a module mutex.
             unsafe {
@@ -3987,12 +4610,29 @@ action = "mode.agent"
                 env::remove_var("KIMI_BASE_URL");
                 env::remove_var("KIMI_MODEL");
                 env::remove_var("KIMI_MODEL_NAME");
+                env::remove_var("ZAI_API_KEY");
+                env::remove_var("Z_AI_API_KEY");
+                env::remove_var("ZAI_BASE_URL");
+                env::remove_var("ZAI_MODEL");
+                env::remove_var("STEPFUN_API_KEY");
+                env::remove_var("STEP_API_KEY");
+                env::remove_var("STEPFUN_BASE_URL");
+                env::remove_var("STEPFUN_MODEL");
+                env::remove_var("MINIMAX_API_KEY");
+                env::remove_var("MINIMAX_BASE_URL");
+                env::remove_var("MINIMAX_MODEL");
                 env::remove_var("SGLANG_API_KEY");
                 env::remove_var("SGLANG_BASE_URL");
                 env::remove_var("VLLM_API_KEY");
                 env::remove_var("VLLM_BASE_URL");
                 env::remove_var("OLLAMA_API_KEY");
                 env::remove_var("OLLAMA_BASE_URL");
+                env::remove_var("HUGGINGFACE_API_KEY");
+                env::remove_var("HF_TOKEN");
+                env::remove_var("HUGGINGFACE_BASE_URL");
+                env::remove_var("HF_BASE_URL");
+                env::remove_var("HUGGINGFACE_MODEL");
+                env::remove_var("HF_MODEL");
             }
             guard
         }
@@ -4085,12 +4725,29 @@ action = "mode.agent"
                 Self::restore_var("KIMI_BASE_URL", self.kimi_base_url.take());
                 Self::restore_var("KIMI_MODEL", self.kimi_model.take());
                 Self::restore_var("KIMI_MODEL_NAME", self.kimi_model_name.take());
+                Self::restore_var("ZAI_API_KEY", self.zai_api_key.take());
+                Self::restore_var("Z_AI_API_KEY", self.z_ai_api_key.take());
+                Self::restore_var("ZAI_BASE_URL", self.zai_base_url.take());
+                Self::restore_var("ZAI_MODEL", self.zai_model.take());
+                Self::restore_var("STEPFUN_API_KEY", self.stepfun_api_key.take());
+                Self::restore_var("STEP_API_KEY", self.step_api_key.take());
+                Self::restore_var("STEPFUN_BASE_URL", self.stepfun_base_url.take());
+                Self::restore_var("STEPFUN_MODEL", self.stepfun_model.take());
+                Self::restore_var("MINIMAX_API_KEY", self.minimax_api_key.take());
+                Self::restore_var("MINIMAX_BASE_URL", self.minimax_base_url.take());
+                Self::restore_var("MINIMAX_MODEL", self.minimax_model.take());
                 Self::restore_var("SGLANG_API_KEY", self.sglang_api_key.take());
                 Self::restore_var("SGLANG_BASE_URL", self.sglang_base_url.take());
                 Self::restore_var("VLLM_API_KEY", self.vllm_api_key.take());
                 Self::restore_var("VLLM_BASE_URL", self.vllm_base_url.take());
                 Self::restore_var("OLLAMA_API_KEY", self.ollama_api_key.take());
                 Self::restore_var("OLLAMA_BASE_URL", self.ollama_base_url.take());
+                Self::restore_var("HUGGINGFACE_API_KEY", self.huggingface_api_key.take());
+                Self::restore_var("HF_TOKEN", self.huggingface_token.take());
+                Self::restore_var("HUGGINGFACE_BASE_URL", self.huggingface_base_url.take());
+                Self::restore_var("HF_BASE_URL", self.hf_base_url.take());
+                Self::restore_var("HUGGINGFACE_MODEL", self.huggingface_model.take());
+                Self::restore_var("HF_MODEL", self.hf_model.take());
             }
         }
     }
@@ -4609,6 +5266,59 @@ unix_socket_path = "/tmp/cw-hooks.sock"
     }
 
     #[test]
+    fn siliconflow_cn_provider_config_values_round_trip() -> Result<()> {
+        let mut config = ConfigToml::default();
+
+        config.set_value("providers.siliconflow_cn.api_key", "sf-cn-secret-value")?;
+        config.set_value(
+            "providers.siliconflow_cn.base_url",
+            DEFAULT_SILICONFLOW_CN_BASE_URL,
+        )?;
+        config.set_value("providers.siliconflow_cn.model", DEFAULT_SILICONFLOW_MODEL)?;
+        config.set_value("providers.siliconflow_cn.http_headers", "X-Test=ok")?;
+
+        assert_eq!(
+            config
+                .get_display_value("providers.siliconflow_cn.api_key")
+                .as_deref(),
+            Some("sf-c***alue")
+        );
+        assert_eq!(
+            config
+                .get_value("providers.siliconflow_cn.base_url")
+                .as_deref(),
+            Some(DEFAULT_SILICONFLOW_CN_BASE_URL)
+        );
+        assert_eq!(
+            config
+                .get_value("providers.siliconflow_cn.model")
+                .as_deref(),
+            Some(DEFAULT_SILICONFLOW_MODEL)
+        );
+        assert_eq!(
+            config
+                .list_values()
+                .get("providers.siliconflow_cn.api_key")
+                .map(String::as_str),
+            Some("sf-c***alue")
+        );
+
+        config.unset_value("providers.siliconflow_cn.api_key")?;
+        config.unset_value("providers.siliconflow_cn.base_url")?;
+        config.unset_value("providers.siliconflow_cn.model")?;
+        config.unset_value("providers.siliconflow_cn.http_headers")?;
+
+        assert_eq!(config.get_value("providers.siliconflow_cn.api_key"), None);
+        assert_eq!(config.get_value("providers.siliconflow_cn.base_url"), None);
+        assert_eq!(config.get_value("providers.siliconflow_cn.model"), None);
+        assert_eq!(
+            config.get_value("providers.siliconflow_cn.http_headers"),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
     fn volcengine_provider_config_values_round_trip() -> Result<()> {
         let mut config = ConfigToml::default();
 
@@ -5024,6 +5734,13 @@ unix_socket_path = "/tmp/cw-hooks.sock"
             ProviderKind::parse("ark_wanjie"),
             Some(ProviderKind::WanjieArk)
         );
+        for alias in ["huggingface", "hugging-face", "hugging_face", "hf"] {
+            assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::Huggingface));
+
+            let parsed: ConfigToml =
+                toml::from_str(&format!("provider = \"{alias}\"")).expect("huggingface alias");
+            assert_eq!(parsed.provider, ProviderKind::Huggingface);
+        }
 
         let parsed: ConfigToml =
             toml::from_str("provider = \"ark-wanjie\"").expect("wanjie provider alias");
@@ -5032,6 +5749,17 @@ unix_socket_path = "/tmp/cw-hooks.sock"
         let parsed: ConfigToml =
             toml::from_str("provider = \"silicon-flow\"").expect("siliconflow provider alias");
         assert_eq!(parsed.provider, ProviderKind::Siliconflow);
+    }
+
+    #[test]
+    fn unknown_provider_error_lists_huggingface() {
+        let mut config = ConfigToml::default();
+        let err = config
+            .set_value("provider", "not-a-provider")
+            .expect_err("unknown provider should fail");
+        let message = err.to_string();
+        assert!(message.contains("unknown provider 'not-a-provider'"));
+        assert!(message.contains("huggingface"));
     }
 
     #[test]
@@ -5111,11 +5839,11 @@ unix_socket_path = "/tmp/cw-hooks.sock"
             provider::resolve_provider("siliconflow-cn").expect("siliconflow-cn alias resolves");
         assert_eq!(siliconflow_cn.kind(), ProviderKind::SiliconflowCN);
         assert_eq!(siliconflow_cn.id(), "siliconflow-CN");
-        assert_eq!(siliconflow_cn.provider_config_key(), "siliconflow");
+        assert_eq!(siliconflow_cn.provider_config_key(), "siliconflow_cn");
 
         let config = ProvidersToml::default();
         let shared_table = config.for_provider(ProviderKind::SiliconflowCN);
-        assert!(std::ptr::eq(
+        assert!(!std::ptr::eq(
             shared_table,
             config.for_provider(ProviderKind::Siliconflow)
         ));
@@ -5132,10 +5860,12 @@ unix_socket_path = "/tmp/cw-hooks.sock"
             );
             assert!(!provider.display_name().trim().is_empty());
             assert!(!provider.env_vars().is_empty());
-            // OpenAI Codex (ChatGPT) speaks the Responses API; every other
-            // built-in provider is OpenAI-compatible Chat Completions.
+            // OpenAI Codex (ChatGPT) speaks the Responses API and Anthropic
+            // speaks the native Messages API; every other built-in provider
+            // is OpenAI-compatible Chat Completions.
             let expected_wire = match kind {
                 ProviderKind::OpenaiCodex => provider::WireFormat::Responses,
+                ProviderKind::Anthropic => provider::WireFormat::AnthropicMessages,
                 _ => provider::WireFormat::ChatCompletions,
             };
             assert_eq!(provider.wire(), expected_wire);
@@ -5290,6 +6020,22 @@ mode = "token-plan-usa"
     }
 
     #[test]
+    fn zai_aliases_resolve_to_canonical_models() {
+        assert_eq!(
+            normalize_model_for_provider(ProviderKind::Zai, "glm-5.1"),
+            DEFAULT_ZAI_MODEL
+        );
+        assert_eq!(
+            normalize_model_for_provider(ProviderKind::Zai, "glm-5-2"),
+            ZAI_GLM_5_2_MODEL
+        );
+        assert_eq!(
+            normalize_model_for_provider(ProviderKind::Zai, "custom-glm-preview"),
+            "custom-glm-preview"
+        );
+    }
+
+    #[test]
     fn novita_provider_defaults_to_canonical_endpoint_and_model() {
         let _lock = env_lock();
         let _env = EnvGuard::without_deepseek_runtime_overrides();
@@ -5338,7 +6084,29 @@ mode = "token-plan-usa"
     }
 
     #[test]
-    fn moonshot_provider_defaults_to_kimi_k2() {
+    fn siliconflow_cn_config_falls_back_to_shared_table_when_unset() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        let mut config = ConfigToml {
+            provider: ProviderKind::SiliconflowCN,
+            ..ConfigToml::default()
+        };
+        config.providers.siliconflow.api_key = Some("sf-shared-key".to_string());
+        config.providers.siliconflow.base_url = Some(DEFAULT_SILICONFLOW_BASE_URL.to_string());
+        config.providers.siliconflow.model = Some("deepseek-chat".to_string());
+        config.providers.siliconflow_cn.base_url =
+            Some(DEFAULT_SILICONFLOW_CN_BASE_URL.to_string());
+
+        let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+        assert_eq!(resolved.provider, ProviderKind::SiliconflowCN);
+        assert_eq!(resolved.api_key.as_deref(), Some("sf-shared-key"));
+        assert_eq!(resolved.base_url, DEFAULT_SILICONFLOW_CN_BASE_URL);
+        assert_eq!(resolved.model, DEFAULT_SILICONFLOW_FLASH_MODEL);
+    }
+
+    #[test]
+    fn moonshot_provider_defaults_to_kimi_k27_code() {
         let _lock = env_lock();
         let _env = EnvGuard::without_deepseek_runtime_overrides();
         let config = ConfigToml {
@@ -5351,6 +6119,86 @@ mode = "token-plan-usa"
         assert_eq!(resolved.provider, ProviderKind::Moonshot);
         assert_eq!(resolved.base_url, DEFAULT_MOONSHOT_BASE_URL);
         assert_eq!(resolved.model, DEFAULT_MOONSHOT_MODEL);
+    }
+
+    #[test]
+    fn zai_stepfun_and_minimax_default_to_first_party_routes() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+
+        for (provider, expected_base_url, expected_model) in [
+            (ProviderKind::Zai, DEFAULT_ZAI_BASE_URL, DEFAULT_ZAI_MODEL),
+            (
+                ProviderKind::Stepfun,
+                DEFAULT_STEPFUN_BASE_URL,
+                DEFAULT_STEPFUN_MODEL,
+            ),
+            (
+                ProviderKind::Minimax,
+                DEFAULT_MINIMAX_BASE_URL,
+                DEFAULT_MINIMAX_MODEL,
+            ),
+        ] {
+            let config = ConfigToml {
+                provider,
+                ..ConfigToml::default()
+            };
+            let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+            assert_eq!(resolved.provider, provider);
+            assert_eq!(resolved.base_url, expected_base_url);
+            assert_eq!(resolved.model, expected_model);
+        }
+    }
+
+    #[test]
+    fn first_party_provider_env_model_overrides_pass_through() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        unsafe {
+            env::set_var("CODEWHALE_PROVIDER", "minimax");
+            env::set_var("MINIMAX_MODEL", "MiniMax-M2.7-highspeed");
+            env::set_var("MINIMAX_BASE_URL", "https://minimax.example/v1");
+        }
+
+        let resolved =
+            ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
+
+        assert_eq!(resolved.provider, ProviderKind::Minimax);
+        assert_eq!(resolved.base_url, "https://minimax.example/v1");
+        assert_eq!(resolved.model, "MiniMax-M2.7-highspeed");
+    }
+
+    #[test]
+    fn minimax_env_model_override_canonicalizes_known_aliases() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        unsafe {
+            env::set_var("CODEWHALE_PROVIDER", "minimax");
+            env::set_var("MINIMAX_MODEL", "minimax-m2-5-highspeed");
+        }
+
+        let resolved =
+            ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
+
+        assert_eq!(resolved.provider, ProviderKind::Minimax);
+        assert_eq!(resolved.model, "MiniMax-M2.5-highspeed");
+    }
+
+    #[test]
+    fn moonshot_provider_preserves_explicit_kimi_k26() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        let mut config = ConfigToml {
+            provider: ProviderKind::Moonshot,
+            ..ConfigToml::default()
+        };
+        config.providers.moonshot.model = Some("kimi-k2.6".to_string());
+
+        let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+        assert_eq!(resolved.provider, ProviderKind::Moonshot);
+        assert_eq!(resolved.model, MOONSHOT_KIMI_K2_6_MODEL);
     }
 
     #[test]
@@ -5418,6 +6266,10 @@ mode = "token-plan-usa"
         let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
 
         assert_eq!(resolved.provider, ProviderKind::Moonshot);
+        assert_eq!(
+            resolved.provider_source,
+            ProviderSource::Env("CODEWHALE_PROVIDER")
+        );
         assert_eq!(resolved.base_url, DEFAULT_KIMI_CODE_BASE_URL);
         assert_eq!(resolved.model, DEFAULT_KIMI_CODE_MODEL);
         assert_eq!(resolved.api_key.as_deref(), Some("kimi-code-key"));
@@ -5444,6 +6296,70 @@ mode = "token-plan-usa"
         let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
 
         assert_eq!(resolved.provider, ProviderKind::Moonshot);
+        assert_eq!(
+            resolved.provider_source,
+            ProviderSource::Env("CODEWHALE_PROVIDER")
+        );
+    }
+
+    #[test]
+    fn legacy_deepseek_provider_env_records_provider_source() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        // Safety: test-only env mutation guarded by env_lock().
+        unsafe {
+            env::set_var("DEEPSEEK_PROVIDER", "openrouter");
+        }
+        let config = ConfigToml {
+            provider: ProviderKind::Deepseek,
+            ..ConfigToml::default()
+        };
+
+        let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+        assert_eq!(resolved.provider, ProviderKind::Openrouter);
+        assert_eq!(
+            resolved.provider_source,
+            ProviderSource::Env("DEEPSEEK_PROVIDER")
+        );
+    }
+
+    #[test]
+    fn cli_provider_records_provider_source() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        // Safety: test-only env mutation guarded by env_lock().
+        unsafe {
+            env::set_var("CODEWHALE_PROVIDER", "moonshot");
+        }
+        let cli = CliRuntimeOverrides {
+            provider: Some(ProviderKind::Openai),
+            ..CliRuntimeOverrides::default()
+        };
+        let config = ConfigToml {
+            provider: ProviderKind::Deepseek,
+            ..ConfigToml::default()
+        };
+
+        let resolved = config.resolve_runtime_options(&cli);
+
+        assert_eq!(resolved.provider, ProviderKind::Openai);
+        assert_eq!(resolved.provider_source, ProviderSource::Cli);
+    }
+
+    #[test]
+    fn config_provider_records_provider_source() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        let config = ConfigToml {
+            provider: ProviderKind::Moonshot,
+            ..ConfigToml::default()
+        };
+
+        let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+        assert_eq!(resolved.provider, ProviderKind::Moonshot);
+        assert_eq!(resolved.provider_source, ProviderSource::Config);
     }
 
     /// `CODEWHALE_MODEL` is the user-facing env alias for picking a model
@@ -5899,6 +6815,69 @@ mode = "token-plan-usa"
     }
 
     #[test]
+    fn huggingface_env_precedence_prefers_documented_names() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        // Safety: test-only environment mutation guarded by a module mutex.
+        unsafe {
+            env::set_var("CODEWHALE_PROVIDER", "hf");
+            env::set_var("HUGGINGFACE_API_KEY", "hf-full-key");
+            env::set_var("HF_TOKEN", "hf-token-fallback");
+            env::set_var("HUGGINGFACE_BASE_URL", "https://hf-full.example/v1");
+            env::set_var("HF_BASE_URL", "https://hf-short.example/v1");
+            env::set_var("HUGGINGFACE_MODEL", "org/full-model");
+            env::set_var("HF_MODEL", "org/short-model");
+        }
+
+        let resolved =
+            ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
+
+        assert_eq!(resolved.provider, ProviderKind::Huggingface);
+        assert_eq!(resolved.api_key.as_deref(), Some("hf-full-key"));
+        assert_eq!(resolved.base_url, "https://hf-full.example/v1");
+        assert_eq!(resolved.model, "org/full-model");
+    }
+
+    #[test]
+    fn huggingface_short_env_fallbacks_resolve_when_primary_names_are_absent() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        // Safety: test-only environment mutation guarded by a module mutex.
+        unsafe {
+            env::set_var("CODEWHALE_PROVIDER", "huggingface");
+            env::set_var("HF_TOKEN", "hf-token-fallback");
+            env::set_var("HF_BASE_URL", "https://hf-short.example/v1");
+            env::set_var("HF_MODEL", "org/short-model");
+        }
+
+        let resolved =
+            ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
+
+        assert_eq!(resolved.provider, ProviderKind::Huggingface);
+        assert_eq!(resolved.api_key.as_deref(), Some("hf-token-fallback"));
+        assert_eq!(resolved.base_url, "https://hf-short.example/v1");
+        assert_eq!(resolved.model, "org/short-model");
+    }
+
+    #[test]
+    fn huggingface_token_fallback_resolves_when_primary_api_key_is_blank() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        // Safety: test-only environment mutation guarded by a module mutex.
+        unsafe {
+            env::set_var("CODEWHALE_PROVIDER", "huggingface");
+            env::set_var("HUGGINGFACE_API_KEY", " ");
+            env::set_var("HF_TOKEN", "hf-token-fallback");
+        }
+
+        let resolved =
+            ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
+
+        assert_eq!(resolved.provider, ProviderKind::Huggingface);
+        assert_eq!(resolved.api_key.as_deref(), Some("hf-token-fallback"));
+    }
+
+    #[test]
     fn siliconflow_cn_base_url_env_normalizes_model_aliases() {
         let _lock = env_lock();
         let _env = EnvGuard::without_deepseek_runtime_overrides();
@@ -6038,9 +7017,14 @@ mode = "token-plan-usa"
             ("qwen3.6-max-preview", OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL),
             ("qwen3.6-plus", OPENROUTER_QWEN_3_6_PLUS_MODEL),
             ("mimo-v2.5-pro", OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL),
+            ("kimi-k2.7-code", OPENROUTER_KIMI_K2_7_CODE_MODEL),
+            ("kimi", OPENROUTER_KIMI_K2_7_CODE_MODEL),
             ("kimi-k2.6", OPENROUTER_KIMI_K2_6_MODEL),
+            ("minimax-m3", OPENROUTER_MINIMAX_M3_MODEL),
+            ("minimax-2.7", OPENROUTER_MINIMAX_2_7_MODEL),
             ("gemma-4-31b-it", OPENROUTER_GEMMA_4_31B_MODEL),
             ("glm-5.1", OPENROUTER_GLM_5_1_MODEL),
+            ("glm-5.2", OPENROUTER_GLM_5_2_MODEL),
         ] {
             let cli = CliRuntimeOverrides {
                 provider: Some(ProviderKind::Openrouter),
@@ -6430,6 +7414,32 @@ fallback_providers = ["deepseek", "openrouter"]
     }
 
     #[test]
+    fn fleet_exec_config_default_matches_subagent_spawn_depth() {
+        // Fleet workers and standalone sub-agents share one recursion axis:
+        // the fleet default equals DEFAULT_SPAWN_DEPTH (3) and affords >=3
+        // nested delegation levels out of the box.
+        assert_eq!(
+            FleetExecConfig::default().max_spawn_depth,
+            DEFAULT_SPAWN_DEPTH
+        );
+        assert_eq!(FleetExecConfig::default().max_spawn_depth, 3);
+        const { assert!(DEFAULT_SPAWN_DEPTH <= MAX_SPAWN_DEPTH_CEILING) };
+    }
+
+    #[test]
+    fn fleet_exec_config_parses_max_spawn_depth() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+[fleet.exec]
+max_spawn_depth = 2
+"#,
+        )
+        .expect("fleet exec config should parse");
+
+        assert_eq!(config.fleet.expect("fleet config").exec.max_spawn_depth, 2);
+    }
+
+    #[test]
     fn fallback_providers_do_not_change_runtime_resolution() {
         let _lock = env_lock();
         let _env = EnvGuard::without_deepseek_runtime_overrides();
@@ -6718,5 +7728,37 @@ unknown_policy = "surprise"
         .expect_err("unknown posture keys should not be ignored");
 
         assert!(err.to_string().contains("unknown_policy"));
+    }
+
+    #[test]
+    fn test_verbosity_resolution() {
+        let _lock = env_lock();
+        // Test TOML parsing
+        let toml_str = r#"
+            verbosity = "concise"
+        "#;
+        let config: ConfigToml = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.verbosity, Some("concise".to_string()));
+
+        // Test Env overrides
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        unsafe {
+            std::env::set_var("CODEWHALE_VERBOSITY", "normal");
+        }
+        let env_overrides = EnvRuntimeOverrides::load();
+        assert_eq!(env_overrides.verbosity, Some("normal".to_string()));
+        unsafe {
+            std::env::remove_var("CODEWHALE_VERBOSITY");
+        }
+
+        // Test fallback to DEEPSEEK_VERBOSITY
+        unsafe {
+            std::env::set_var("DEEPSEEK_VERBOSITY", "concise");
+        }
+        let env_overrides = EnvRuntimeOverrides::load();
+        assert_eq!(env_overrides.verbosity, Some("concise".to_string()));
+        unsafe {
+            std::env::remove_var("DEEPSEEK_VERBOSITY");
+        }
     }
 }

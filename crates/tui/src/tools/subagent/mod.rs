@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, Semaphore, broadcast};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -73,6 +73,18 @@ const DEFAULT_MAX_STEPS: u32 = u32::MAX;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 const WEB_SEARCH_BUDGET: u32 = 6;
 const FETCH_URL_BUDGET: u32 = 8;
+
+/// Format a step counter for sub-agent progress messages.
+///
+/// When `max_steps == u32::MAX` (the default), the denominator is a sentinel
+/// meaning "unbounded" — render just `step N` instead of `step N/4294967295`.
+fn format_step_counter(steps: u32, max_steps: u32) -> String {
+    if max_steps == u32::MAX {
+        format!("step {steps}")
+    } else {
+        format!("step {steps}/{max_steps}")
+    }
+}
 // Non-streaming sub-agents need enough response budget to carry large tool-call
 // arguments, especially write_file content. The API bills generated tokens, not
 // the requested ceiling.
@@ -96,9 +108,13 @@ const DEFAULT_RESULT_TIMEOUT_MS: u64 = 30_000;
 const MIN_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_RESULT_TIMEOUT_MS: u64 = 3_600_000;
 const COMPLETED_AGENT_RETENTION: Duration = Duration::from_secs(60 * 60);
+const MAX_AGENT_WORKER_RECORDS: usize = 256;
+const MAX_AGENT_WORKER_EVENTS_PER_RECORD: usize = 128;
 const SUBAGENT_STATE_SCHEMA_VERSION: u32 = 1;
 const SUBAGENT_STATE_FILE: &str = "subagents.v1.json";
 const SUBAGENT_RESTART_REASON: &str = "Interrupted by process restart";
+const SUBAGENT_QUEUED_LAUNCH_REASON: &str = "queued: waiting for an interactive fanout slot";
+const SUBAGENT_MODEL_WAIT_REASON: &str = "waiting for model response";
 
 const VALID_SUBAGENT_TYPES: &str = "general (aliases: general-purpose, general_purpose, worker, default), \
      explore (aliases: exploration, explorer), plan (aliases: planning, planner, awaiter), \
@@ -390,7 +406,7 @@ impl SubAgentAssignment {
 }
 
 /// Sub-agent execution types with specialized behavior and tool access.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SubAgentType {
     /// General purpose - full tool access for multi-step tasks.
@@ -642,6 +658,362 @@ pub struct SubAgentResult {
     pub from_prior_session: bool,
 }
 
+/// Headless worker lifecycle states for sub-agent execution.
+///
+/// This is the TUI-independent state machine that future CLI/API/workflow
+/// surfaces should consume. The legacy `SubAgentStatus` remains the
+/// compatibility projection returned by existing `agent_*` tools.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentWorkerStatus {
+    Queued,
+    Starting,
+    Running,
+    WaitingForUser,
+    ModelWait,
+    RunningTool,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+/// Tool capability profile requested for a headless worker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentWorkerToolProfile {
+    /// Inherit the parent runtime registry for compatibility.
+    Inherited,
+    /// Use the listed tools only.
+    Explicit(Vec<String>),
+}
+
+/// Declarative headless worker request derived from `agent_open`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentWorkerSpec {
+    pub worker_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    pub agent_type: SubAgentType,
+    pub model: String,
+    pub workspace: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    pub context_mode: String,
+    pub fork_context: bool,
+    pub tool_profile: AgentWorkerToolProfile,
+    pub max_steps: u32,
+    pub spawn_depth: u32,
+    pub max_spawn_depth: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunFollowUpDelivery {
+    pub delivered: bool,
+    pub timestamp_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interrupt: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub continued_from_checkpoint: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunFollowUpTarget {
+    #[serde(default = "default_agent_eval_tool")]
+    pub tool: String,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    #[serde(default)]
+    pub accepted_statuses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_delivery: Option<AgentRunFollowUpDelivery>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunTakeoverTarget {
+    #[serde(default = "default_subagent_takeover_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub supported: bool,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    pub instructions: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsupported_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunArtifactRef {
+    pub kind: String,
+    pub name: String,
+    pub target: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunUsage {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunVerificationSummary {
+    pub status: String,
+    pub summary: String,
+}
+
+/// Structured headless worker event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentWorkerEvent {
+    pub seq: u64,
+    pub worker_id: String,
+    pub status: AgentWorkerStatus,
+    pub timestamp_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+}
+
+/// Canonical headless worker record retained by `SubAgentManager`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentWorkerRecord {
+    pub spec: AgentWorkerSpec,
+    #[serde(default = "default_subagent_actor_kind")]
+    pub actor_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    #[serde(default = "default_agent_run_follow_up")]
+    pub follow_up: AgentRunFollowUpTarget,
+    #[serde(default = "default_agent_run_takeover")]
+    pub takeover: AgentRunTakeoverTarget,
+    #[serde(default)]
+    pub artifacts: Vec<AgentRunArtifactRef>,
+    #[serde(default = "default_agent_run_usage")]
+    pub usage: AgentRunUsage,
+    #[serde(default = "default_agent_run_verification")]
+    pub verification: AgentRunVerificationSummary,
+    pub status: AgentWorkerStatus,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub steps_taken: u32,
+    #[serde(default)]
+    pub events: VecDeque<AgentWorkerEvent>,
+}
+
+impl AgentWorkerRecord {
+    fn new(spec: AgentWorkerSpec, now_ms: u64) -> Self {
+        let run_id = agent_worker_run_id(&spec);
+        let artifacts = default_subagent_artifacts(&run_id);
+        let follow_up = follow_up_target_for_spec(&spec);
+        let takeover = takeover_target_for_spec(&spec);
+        Self {
+            parent_run_id: spec.parent_run_id.clone(),
+            spec,
+            actor_kind: default_subagent_actor_kind(),
+            follow_up,
+            takeover,
+            artifacts,
+            usage: default_agent_run_usage(),
+            verification: default_agent_run_verification(),
+            status: AgentWorkerStatus::Starting,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            started_at_ms: None,
+            completed_at_ms: None,
+            latest_message: None,
+            result_summary: None,
+            error: None,
+            steps_taken: 0,
+            events: VecDeque::new(),
+        }
+    }
+}
+
+fn default_subagent_actor_kind() -> String {
+    "subagent".to_string()
+}
+
+fn default_agent_eval_tool() -> String {
+    "agent_eval".to_string()
+}
+
+fn default_subagent_takeover_kind() -> String {
+    "local_subagent_session".to_string()
+}
+
+fn default_agent_run_follow_up() -> AgentRunFollowUpTarget {
+    AgentRunFollowUpTarget {
+        tool: default_agent_eval_tool(),
+        agent_id: String::new(),
+        session_name: None,
+        accepted_statuses: vec!["running".to_string(), "interrupted_continuable".to_string()],
+        latest_delivery: None,
+    }
+}
+
+fn default_agent_run_takeover() -> AgentRunTakeoverTarget {
+    AgentRunTakeoverTarget {
+        kind: default_subagent_takeover_kind(),
+        supported: false,
+        agent_id: String::new(),
+        session_name: None,
+        instructions: "No takeover target is available for this older record.".to_string(),
+        unsupported_reason: Some("legacy_record_missing_agent_id".to_string()),
+    }
+}
+
+fn default_agent_run_usage() -> AgentRunUsage {
+    AgentRunUsage {
+        status: "unknown".to_string(),
+        total_tokens: None,
+        note: "Token usage is not yet reported by the sub-agent worker ledger.".to_string(),
+    }
+}
+
+fn default_agent_run_verification() -> AgentRunVerificationSummary {
+    AgentRunVerificationSummary {
+        status: "self_report_only".to_string(),
+        summary:
+            "No verified command or test receipt is attached; treat the result summary as a child self-report."
+                .to_string(),
+    }
+}
+
+fn agent_worker_run_id(spec: &AgentWorkerSpec) -> String {
+    if spec.run_id.is_empty() {
+        spec.worker_id.clone()
+    } else {
+        spec.run_id.clone()
+    }
+}
+
+fn follow_up_target_for_spec(spec: &AgentWorkerSpec) -> AgentRunFollowUpTarget {
+    AgentRunFollowUpTarget {
+        tool: default_agent_eval_tool(),
+        agent_id: spec.worker_id.clone(),
+        session_name: spec.session_name.clone(),
+        accepted_statuses: vec!["running".to_string(), "interrupted_continuable".to_string()],
+        latest_delivery: None,
+    }
+}
+
+fn takeover_target_for_spec(spec: &AgentWorkerSpec) -> AgentRunTakeoverTarget {
+    let agent_ref = spec
+        .session_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&spec.worker_id);
+    AgentRunTakeoverTarget {
+        kind: default_subagent_takeover_kind(),
+        supported: true,
+        agent_id: spec.worker_id.clone(),
+        session_name: spec.session_name.clone(),
+        instructions: format!(
+            "Use agent_eval with agent_id '{agent_ref}' to inspect or send follow-up input; use agent_close to cancel the lane."
+        ),
+        unsupported_reason: None,
+    }
+}
+
+fn default_subagent_artifacts(run_id: &str) -> Vec<AgentRunArtifactRef> {
+    vec![
+        AgentRunArtifactRef {
+            kind: "worker_events".to_string(),
+            name: "worker_record.events".to_string(),
+            target: run_id.to_string(),
+            description: "Bounded structured lifecycle events retained on the worker record."
+                .to_string(),
+        },
+        AgentRunArtifactRef {
+            kind: "transcript".to_string(),
+            name: "transcript_handle".to_string(),
+            target: format!("agent:{run_id}"),
+            description:
+                "Use the projection transcript_handle with handle_read for the child transcript."
+                    .to_string(),
+        },
+        AgentRunArtifactRef {
+            kind: "receipt".to_string(),
+            name: "result_summary".to_string(),
+            target: run_id.to_string(),
+            description: "Child final summary when present; verify before treating as fact."
+                .to_string(),
+        },
+    ]
+}
+
+fn message_preview(text: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 120;
+    let mut preview: String = text.chars().take(MAX_PREVIEW_CHARS).collect();
+    if text.chars().count() > MAX_PREVIEW_CHARS {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn normalize_worker_spec(mut spec: AgentWorkerSpec) -> AgentWorkerSpec {
+    if spec.run_id.is_empty() {
+        spec.run_id = spec.worker_id.clone();
+    }
+    spec
+}
+
+fn normalize_worker_record(mut record: AgentWorkerRecord) -> AgentWorkerRecord {
+    record.spec = normalize_worker_spec(record.spec);
+    let run_id = agent_worker_run_id(&record.spec);
+    if record.actor_kind.is_empty() {
+        record.actor_kind = default_subagent_actor_kind();
+    }
+    if record.parent_run_id.is_none() {
+        record.parent_run_id = record.spec.parent_run_id.clone();
+    }
+    if record.follow_up.agent_id.is_empty() {
+        record.follow_up = follow_up_target_for_spec(&record.spec);
+    }
+    if record.takeover.agent_id.is_empty() {
+        record.takeover = takeover_target_for_spec(&record.spec);
+    }
+    if record.artifacts.is_empty() {
+        record.artifacts = default_subagent_artifacts(&run_id);
+    }
+    if record.usage.status.is_empty() {
+        record.usage = default_agent_run_usage();
+    }
+    if record.verification.status.is_empty() {
+        record.verification = default_agent_run_verification();
+    }
+    record
+}
+
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -809,6 +1181,8 @@ struct PersistedSubAgent {
 struct PersistedSubAgentState {
     schema_version: u32,
     agents: Vec<PersistedSubAgent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    workers: Vec<AgentWorkerRecord>,
 }
 
 impl Default for PersistedSubAgentState {
@@ -816,13 +1190,19 @@ impl Default for PersistedSubAgentState {
         Self {
             schema_version: SUBAGENT_STATE_SCHEMA_VERSION,
             agents: Vec::new(),
+            workers: Vec::new(),
         }
     }
 }
 
 /// Default cap on sub-agent recursion depth. Override via
-/// `[runtime] max_spawn_depth = N` in `~/.deepseek/config.toml`.
-pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = 3;
+/// `[runtime] max_spawn_depth = N` in config.
+///
+/// Sourced from [`codewhale_config::DEFAULT_SPAWN_DEPTH`] so standalone
+/// sub-agents and fleet workers share ONE recursion axis (no "two moving
+/// targets"). Configured/requested depths clamp to
+/// [`codewhale_config::MAX_SPAWN_DEPTH_CEILING`].
+pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = codewhale_config::DEFAULT_SPAWN_DEPTH;
 
 /// Terminal-state notification emitted to the engine's parent turn loop
 /// when one of its direct children finishes (issue #756). Carries the
@@ -1221,6 +1601,8 @@ impl SubAgent {
 /// Manager for active sub-agents.
 pub struct SubAgentManager {
     agents: HashMap<String, SubAgent>,
+    worker_records: HashMap<String, AgentWorkerRecord>,
+    worker_event_seq: u64,
     #[allow(dead_code)] // Stored for future workspace-scoped operations
     workspace: PathBuf,
     state_path: Option<PathBuf>,
@@ -1234,6 +1616,13 @@ pub struct SubAgentManager {
     /// agents whose `session_boot_id` doesn't match this value as
     /// "from prior session" so `agent_list` can hide them by default.
     current_session_boot_id: String,
+    /// Launch gate for direct (depth-1) interactive fanout (#3095). Each
+    /// permit is one actively executing direct child; further direct
+    /// children spawn immediately but queue for a permit before starting,
+    /// publishing a visible "queued" reason instead of bursting. Deeper
+    /// descendants bypass the gate so a permit-holding parent waiting on
+    /// its own children cannot deadlock the tree.
+    launch_gate: Arc<Semaphore>,
 }
 
 impl SubAgentManager {
@@ -1242,6 +1631,8 @@ impl SubAgentManager {
     pub fn new(workspace: PathBuf, max_agents: usize) -> Self {
         Self {
             agents: HashMap::new(),
+            worker_records: HashMap::new(),
+            worker_event_seq: 0,
             workspace,
             state_path: None,
             max_steps: DEFAULT_MAX_STEPS,
@@ -1252,7 +1643,18 @@ impl SubAgentManager {
             // Fresh boot id per manager. Used by #405 to classify
             // re-loaded persisted agents as "prior session".
             current_session_boot_id: format!("boot_{}", &Uuid::new_v4().to_string()[..12]),
+            launch_gate: Arc::new(Semaphore::new(
+                crate::config::DEFAULT_INTERACTIVE_LAUNCH_LIMIT.min(max_agents),
+            )),
         }
+    }
+
+    /// Set the number of direct children that may execute concurrently
+    /// before further launches queue (#3095). Clamped to `1..=max_agents`.
+    #[must_use]
+    pub fn with_interactive_launch_limit(mut self, limit: usize) -> Self {
+        self.launch_gate = Arc::new(Semaphore::new(limit.clamp(1, self.max_agents)));
+        self
     }
 
     /// Return the boot id this manager stamps on agents it spawns.
@@ -1321,6 +1723,7 @@ impl SubAgentManager {
         let payload = PersistedSubAgentState {
             schema_version: SUBAGENT_STATE_SCHEMA_VERSION,
             agents,
+            workers: self.sorted_worker_records(),
         };
         write_json_atomic(path, &payload)
     }
@@ -1353,6 +1756,7 @@ impl SubAgentManager {
         }
 
         self.agents.clear();
+        self.worker_records.clear();
         for persisted in state.agents {
             let mut status = persisted.status;
             if matches!(status, SubAgentStatus::Running) {
@@ -1402,8 +1806,196 @@ impl SubAgentManager {
             };
             self.agents.insert(persisted.id, agent);
         }
+        for worker in state.workers {
+            let worker = normalize_worker_record(worker);
+            self.worker_event_seq = self.worker_event_seq.max(
+                worker
+                    .events
+                    .iter()
+                    .map(|event| event.seq)
+                    .max()
+                    .unwrap_or(0),
+            );
+            self.worker_records
+                .insert(worker.spec.worker_id.clone(), worker);
+        }
+        self.prune_worker_records();
 
         Ok(())
+    }
+
+    fn sorted_worker_records(&self) -> Vec<AgentWorkerRecord> {
+        let mut workers: Vec<_> = self.worker_records.values().cloned().collect();
+        workers.sort_by(|a, b| {
+            b.updated_at_ms
+                .cmp(&a.updated_at_ms)
+                .then_with(|| a.spec.worker_id.cmp(&b.spec.worker_id))
+        });
+        workers
+    }
+
+    fn prune_worker_records(&mut self) {
+        if self.worker_records.len() <= MAX_AGENT_WORKER_RECORDS {
+            return;
+        }
+        let keep_ids: std::collections::HashSet<String> = self
+            .sorted_worker_records()
+            .into_iter()
+            .take(MAX_AGENT_WORKER_RECORDS)
+            .map(|record| record.spec.worker_id)
+            .collect();
+        self.worker_records
+            .retain(|worker_id, _| keep_ids.contains(worker_id));
+    }
+
+    pub fn register_worker(&mut self, spec: AgentWorkerSpec) {
+        let worker_id = spec.worker_id.clone();
+        let now_ms = epoch_millis_now();
+        let mut record = AgentWorkerRecord::new(normalize_worker_spec(spec), now_ms);
+        self.push_worker_event(
+            &mut record,
+            AgentWorkerStatus::Starting,
+            Some("starting".to_string()),
+            None,
+            None,
+            now_ms,
+        );
+        self.worker_records.insert(worker_id, record);
+        self.prune_worker_records();
+    }
+
+    pub fn list_worker_records(&self) -> Vec<AgentWorkerRecord> {
+        self.sorted_worker_records()
+    }
+
+    pub fn get_worker_record(&self, worker_id: &str) -> Option<AgentWorkerRecord> {
+        self.worker_records.get(worker_id).cloned()
+    }
+
+    fn push_worker_event(
+        &mut self,
+        record: &mut AgentWorkerRecord,
+        status: AgentWorkerStatus,
+        message: Option<String>,
+        step: Option<u32>,
+        tool_name: Option<String>,
+        now_ms: u64,
+    ) {
+        self.worker_event_seq = self.worker_event_seq.saturating_add(1);
+        record.events.push_back(AgentWorkerEvent {
+            seq: self.worker_event_seq,
+            worker_id: record.spec.worker_id.clone(),
+            status,
+            timestamp_ms: now_ms,
+            message,
+            step,
+            tool_name,
+        });
+        while record.events.len() > MAX_AGENT_WORKER_EVENTS_PER_RECORD {
+            record.events.pop_front();
+        }
+    }
+
+    fn record_worker_event(
+        &mut self,
+        worker_id: &str,
+        status: AgentWorkerStatus,
+        message: Option<String>,
+        step: Option<u32>,
+        tool_name: Option<String>,
+    ) {
+        let now_ms = epoch_millis_now();
+        let Some(mut record) = self.worker_records.remove(worker_id) else {
+            return;
+        };
+        record.status = status;
+        record.updated_at_ms = now_ms;
+        record.latest_message = message.clone();
+        if matches!(
+            status,
+            AgentWorkerStatus::Starting | AgentWorkerStatus::Running
+        ) && record.started_at_ms.is_none()
+        {
+            record.started_at_ms = Some(now_ms);
+        }
+        if matches!(
+            status,
+            AgentWorkerStatus::Completed
+                | AgentWorkerStatus::Failed
+                | AgentWorkerStatus::Cancelled
+                | AgentWorkerStatus::Interrupted
+        ) {
+            record.completed_at_ms = Some(now_ms);
+        }
+        if let Some(step) = step {
+            record.steps_taken = step;
+        }
+        self.push_worker_event(&mut record, status, message, step, tool_name, now_ms);
+        self.worker_records.insert(worker_id.to_string(), record);
+    }
+
+    fn record_worker_progress(&mut self, worker_id: &str, message: String) {
+        let (status, step, tool_name) = worker_progress_event_parts(&message);
+        self.record_worker_event(worker_id, status, Some(message), step, tool_name);
+    }
+
+    fn complete_worker_from_result(&mut self, worker_id: &str, result: &SubAgentResult) {
+        let status = worker_status_from_subagent_result(result);
+        let message = match &result.status {
+            SubAgentStatus::Completed => Some("completed".to_string()),
+            SubAgentStatus::Failed(err) => Some(err.clone()),
+            SubAgentStatus::Interrupted(reason) => Some(reason.clone()),
+            SubAgentStatus::Cancelled => Some("cancelled".to_string()),
+            SubAgentStatus::Running => Some("running".to_string()),
+        };
+        self.record_worker_event(worker_id, status, message, Some(result.steps_taken), None);
+        if let Some(record) = self.worker_records.get_mut(worker_id) {
+            record.result_summary = result.result.clone();
+            record.steps_taken = result.steps_taken;
+            if let SubAgentStatus::Failed(err) = &result.status {
+                record.error = Some(err.clone());
+            }
+        }
+    }
+
+    fn record_follow_up_delivery(
+        &mut self,
+        worker_id: &str,
+        delivered: bool,
+        message: Option<&str>,
+        reason: Option<&str>,
+        interrupt: bool,
+        continued_from_checkpoint: bool,
+    ) {
+        let Some(record) = self.worker_records.get_mut(worker_id) else {
+            return;
+        };
+        let now_ms = epoch_millis_now();
+        record.updated_at_ms = now_ms;
+        record.follow_up.latest_delivery = Some(AgentRunFollowUpDelivery {
+            delivered,
+            timestamp_ms: now_ms,
+            message_preview: message.map(message_preview),
+            reason: reason.map(str::to_string),
+            interrupt,
+            continued_from_checkpoint,
+        });
+        if delivered {
+            record.latest_message = Some("follow-up delivered via agent_eval".to_string());
+        }
+    }
+
+    fn fail_worker(&mut self, worker_id: &str, error: String) {
+        self.record_worker_event(
+            worker_id,
+            AgentWorkerStatus::Failed,
+            Some(error.clone()),
+            None,
+            None,
+        );
+        if let Some(record) = self.worker_records.get_mut(worker_id) {
+            record.error = Some(error);
+        }
     }
 
     /// Count running agents.
@@ -1545,8 +2137,19 @@ impl SubAgentManager {
                 .values()
                 .find(|existing| existing.session_name == name)
             {
+                // #3020: Include elapsed time so the parent can distinguish a
+                // live worker from a stale/failed earlier spawn (#2656).
+                let elapsed = existing.started_at.elapsed();
+                let since = if elapsed.as_secs() < 120 {
+                    format!("{}s ago", elapsed.as_secs())
+                } else {
+                    let mins = elapsed.as_secs() / 60;
+                    let secs = elapsed.as_secs() % 60;
+                    format!("{mins}m{secs}s ago")
+                };
                 return Err(anyhow!(
-                    "Sub-agent session name '{name}' is already in use by agent_id '{}' (status: {}). \
+                    "Sub-agent session name '{name}' is already in use by agent_id '{}' \
+                     (status: {}, started {since}). \
                      Reuse that agent_id with agent_eval/agent_close, or open with a different name.",
                     existing.id,
                     subagent_status_name(&existing.status)
@@ -1557,7 +2160,36 @@ impl SubAgentManager {
         agent.fork_context = options.fork_context;
         let agent_id = agent.id.clone();
         let started_at = agent.started_at;
+        // [pinvou3-fork W12] per-spawn max_steps 覆盖优先于 manager 默认;该值同时喂给
+        // 下面上游的 worker_spec.max_steps,fleet worker 也尊重 registry 的 15/20/30 步数。
         let max_steps = options.max_steps.unwrap_or(self.max_steps);
+        let worker_spec = AgentWorkerSpec {
+            worker_id: agent_id.clone(),
+            run_id: agent_id.clone(),
+            parent_run_id: None,
+            session_name: Some(agent.session_name.clone()),
+            objective: assignment.objective.clone(),
+            role: assignment.role.clone(),
+            agent_type: agent_type.clone(),
+            model: agent.model.clone(),
+            workspace: agent.workspace.clone(),
+            git_branch: current_git_branch(&agent.workspace),
+            context_mode: if options.fork_context {
+                "forked"
+            } else {
+                "fresh"
+            }
+            .to_string(),
+            fork_context: options.fork_context,
+            tool_profile: match tools.clone() {
+                Some(tools) => AgentWorkerToolProfile::Explicit(tools),
+                None => AgentWorkerToolProfile::Inherited,
+            },
+            max_steps,
+            spawn_depth: runtime.spawn_depth,
+            max_spawn_depth: runtime.max_spawn_depth,
+        };
+        self.register_worker(worker_spec);
 
         if let Some(event_tx) = runtime.event_tx.clone() {
             let _ = event_tx.try_send(Event::AgentSpawned {
@@ -1566,6 +2198,7 @@ impl SubAgentManager {
             });
         }
 
+        let launch_gate = (runtime.spawn_depth == 1).then(|| self.launch_gate.clone());
         let task = SubAgentTask {
             manager_handle,
             runtime,
@@ -1578,6 +2211,7 @@ impl SubAgentManager {
             started_at,
             max_steps,
             input_rx,
+            launch_gate,
         };
         let handle = spawn_supervised(
             "subagent-task",
@@ -1648,6 +2282,13 @@ impl SubAgentManager {
         };
 
         if changed {
+            self.record_worker_event(
+                agent_id,
+                AgentWorkerStatus::Cancelled,
+                Some("cancelled".to_string()),
+                Some(snapshot.steps_taken),
+                None,
+            );
             self.persist_state_best_effort();
         }
         Ok(snapshot)
@@ -1696,6 +2337,7 @@ impl SubAgentManager {
             if !agent.model.trim().is_empty() && agent.model != "unknown" {
                 restart_runtime.model.clone_from(&agent.model);
             }
+            let launch_gate = (restart_runtime.spawn_depth == 1).then(|| self.launch_gate.clone());
             let task = SubAgentTask {
                 manager_handle,
                 runtime: restart_runtime,
@@ -1708,6 +2350,7 @@ impl SubAgentManager {
                 started_at: restarted_at,
                 max_steps: self.max_steps,
                 input_rx,
+                launch_gate,
             };
             let handle = spawn_supervised(
                 "subagent-task-resume",
@@ -1917,6 +2560,7 @@ impl SubAgentManager {
         let before = self.agents.len();
         let mut auto_cancelled = 0;
         let timeout = self.running_heartbeat_timeout;
+        let mut worker_cancellations = Vec::new();
         for agent in self.agents.values_mut() {
             if agent.status == SubAgentStatus::Running
                 && agent.task_handle.is_some()
@@ -1938,8 +2582,22 @@ impl SubAgentManager {
                     handle.abort();
                 }
                 agent.input_tx = None;
+                worker_cancellations.push((
+                    agent.id.clone(),
+                    agent.result.clone(),
+                    agent.steps_taken,
+                ));
                 auto_cancelled += 1;
             }
+        }
+        for (agent_id, message, steps_taken) in worker_cancellations {
+            self.record_worker_event(
+                &agent_id,
+                AgentWorkerStatus::Cancelled,
+                message,
+                Some(steps_taken),
+                None,
+            );
         }
         self.agents.retain(|_, agent| {
             if agent.status == SubAgentStatus::Running {
@@ -1957,14 +2615,15 @@ impl SubAgentManager {
     fn update_from_result(&mut self, agent_id: &str, result: SubAgentResult) {
         let mut changed = false;
         if let Some(agent) = self.agents.get_mut(agent_id) {
-            agent.status = result.status;
-            agent.assignment = result.assignment;
-            agent.result = result.result;
+            agent.status = result.status.clone();
+            agent.assignment = result.assignment.clone();
+            agent.result = result.result.clone();
             agent.steps_taken = result.steps_taken;
-            agent.checkpoint = result.checkpoint;
+            agent.checkpoint = result.checkpoint.clone();
             agent.task_handle = None;
             changed = true;
         }
+        self.complete_worker_from_result(agent_id, &result);
         if changed {
             self.persist_state_best_effort();
         }
@@ -1973,11 +2632,12 @@ impl SubAgentManager {
     fn update_failed(&mut self, agent_id: &str, error: String) {
         let mut changed = false;
         if let Some(agent) = self.agents.get_mut(agent_id) {
-            agent.status = SubAgentStatus::Failed(error);
+            agent.status = SubAgentStatus::Failed(error.clone());
             release_resident_leases_for(agent_id);
             agent.task_handle = None;
             changed = true;
         }
+        self.fail_worker(agent_id, error);
         if changed {
             self.persist_state_best_effort();
         }
@@ -2013,6 +2673,13 @@ impl SubAgentManager {
             release_resident_leases_for(agent_id);
             agent.snapshot()
         };
+        self.record_worker_event(
+            agent_id,
+            AgentWorkerStatus::Interrupted,
+            snapshot.result.clone(),
+            Some(snapshot.steps_taken),
+            None,
+        );
         self.persist_state_best_effort();
         Ok(snapshot)
     }
@@ -2056,6 +2723,13 @@ impl SubAgentManager {
             agent.last_activity_at = Instant::now();
             agent.snapshot()
         };
+        self.record_worker_event(
+            agent_id,
+            AgentWorkerStatus::Running,
+            Some("continued from checkpoint".to_string()),
+            Some(snapshot.steps_taken),
+            None,
+        );
         self.persist_state_best_effort();
         Ok(snapshot)
     }
@@ -2064,17 +2738,36 @@ impl SubAgentManager {
 /// Thread-safe wrapper for `SubAgentManager`.
 pub type SharedSubAgentManager = Arc<RwLock<SubAgentManager>>;
 
+pub fn load_persisted_agent_worker_records(workspace: &Path) -> Result<Vec<AgentWorkerRecord>> {
+    let mut manager = SubAgentManager::new(workspace.to_path_buf(), 1)
+        .with_state_path(default_state_path(workspace));
+    manager.load_state()?;
+    Ok(manager.list_worker_records())
+}
+
 /// Model-facing session projection returned by the v0.8.33 sub-agent API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubAgentSessionProjection {
     pub name: String,
     pub agent_id: String,
+    #[serde(default)]
+    pub run_id: String,
     pub status: String,
     pub terminal: bool,
     pub context_mode: String,
     pub fork_context: bool,
     pub prefix_cache: SubAgentPrefixCacheProjection,
     pub transcript_handle: VarHandle,
+    #[serde(default = "default_agent_run_follow_up")]
+    pub follow_up: AgentRunFollowUpTarget,
+    #[serde(default = "default_agent_run_takeover")]
+    pub takeover: AgentRunTakeoverTarget,
+    #[serde(default)]
+    pub artifacts: Vec<AgentRunArtifactRef>,
+    #[serde(default = "default_agent_run_usage")]
+    pub usage: AgentRunUsage,
+    #[serde(default = "default_agent_run_verification")]
+    pub verification: AgentRunVerificationSummary,
     pub snapshot: SubAgentResult,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<SubAgentCheckpoint>,
@@ -2082,6 +2775,8 @@ pub struct SubAgentSessionProjection {
     pub continuable: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub timed_out: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_record: Option<AgentWorkerRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2119,6 +2814,7 @@ async fn subagent_session_projection(
     snapshot: SubAgentResult,
     timed_out: bool,
     context: &ToolContext,
+    worker_record: Option<AgentWorkerRecord>,
 ) -> SubAgentSessionProjection {
     let transcript_session_id = format!("agent:{}", snapshot.agent_id);
     let transcript_payload = json!({
@@ -2154,20 +2850,67 @@ async fn subagent_session_projection(
             store.insert_json(transcript_session_id, "transcript", transcript_payload)
         }
     };
+    let run_id = worker_record
+        .as_ref()
+        .map(|record| agent_worker_run_id(&record.spec))
+        .unwrap_or_else(|| snapshot.agent_id.clone());
+    let follow_up = worker_record
+        .as_ref()
+        .map(|record| record.follow_up.clone())
+        .unwrap_or_else(|| AgentRunFollowUpTarget {
+            tool: default_agent_eval_tool(),
+            agent_id: snapshot.agent_id.clone(),
+            session_name: Some(snapshot.name.clone()),
+            accepted_statuses: vec!["running".to_string(), "interrupted_continuable".to_string()],
+            latest_delivery: None,
+        });
+    let takeover = worker_record
+        .as_ref()
+        .map(|record| record.takeover.clone())
+        .unwrap_or_else(|| AgentRunTakeoverTarget {
+            kind: default_subagent_takeover_kind(),
+            supported: true,
+            agent_id: snapshot.agent_id.clone(),
+            session_name: Some(snapshot.name.clone()),
+            instructions: format!(
+                "Use agent_eval with agent_id '{}' to inspect or send follow-up input; use agent_close to cancel the lane.",
+                snapshot.agent_id
+            ),
+            unsupported_reason: None,
+        });
+    let artifacts = worker_record
+        .as_ref()
+        .map(|record| record.artifacts.clone())
+        .unwrap_or_else(|| default_subagent_artifacts(&run_id));
+    let usage = worker_record
+        .as_ref()
+        .map(|record| record.usage.clone())
+        .unwrap_or_else(default_agent_run_usage);
+    let verification = worker_record
+        .as_ref()
+        .map(|record| record.verification.clone())
+        .unwrap_or_else(default_agent_run_verification);
 
     SubAgentSessionProjection {
         name: snapshot.name.clone(),
         agent_id: snapshot.agent_id.clone(),
+        run_id,
         status: subagent_status_name(&snapshot.status).to_string(),
         terminal: snapshot.status != SubAgentStatus::Running,
         context_mode: snapshot.context_mode.clone(),
         fork_context: snapshot.fork_context,
         prefix_cache: subagent_prefix_cache_projection(&snapshot),
         transcript_handle,
+        follow_up,
+        takeover,
+        artifacts,
+        usage,
+        verification,
         checkpoint: snapshot.checkpoint.clone(),
         continuable: subagent_checkpoint_is_continuable(&snapshot),
         snapshot,
         timed_out,
+        worker_record,
     }
 }
 
@@ -2214,6 +2957,7 @@ pub fn new_shared_subagent_manager(workspace: PathBuf, max_agents: usize) -> Sha
         workspace,
         max_agents,
         Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS),
+        crate::config::DEFAULT_INTERACTIVE_LAUNCH_LIMIT,
     )
 }
 
@@ -2224,11 +2968,13 @@ pub fn new_shared_subagent_manager_with_timeout(
     workspace: PathBuf,
     max_agents: usize,
     running_heartbeat_timeout: Duration,
+    interactive_launch_limit: usize,
 ) -> SharedSubAgentManager {
     let max_agents = max_agents.clamp(1, MAX_SUBAGENTS);
     let state_path = default_state_path(&workspace);
     let mut manager = SubAgentManager::new(workspace, max_agents)
         .with_running_heartbeat_timeout(running_heartbeat_timeout)
+        .with_interactive_launch_limit(interactive_launch_limit)
         .with_state_path(state_path);
     if let Err(err) = manager.load_state() {
         // Routed through tracing instead of stderr — see comment in
@@ -2363,7 +3109,11 @@ impl ToolSpec for AgentOpenTool {
         let snapshot: SubAgentResult = serde_json::from_str(&result.content).map_err(|e| {
             ToolError::execution_failed(format!("agent_open projection failed: {e}"))
         })?;
-        let projection = subagent_session_projection(snapshot, false, context).await;
+        let worker_record = {
+            let manager = self.manager.read().await;
+            manager.get_worker_record(&snapshot.agent_id)
+        };
+        let projection = subagent_session_projection(snapshot, false, context, worker_record).await;
         let mut tool_result = ToolResult::json(&projection)
             .map_err(|e| ToolError::execution_failed(e.to_string()))?;
         tool_result.metadata = Some(json!({
@@ -2531,7 +3281,7 @@ impl ToolSpec for AgentSpawnTool {
 
     fn description(&self) -> &'static str {
         concat!(
-            "Spawn a background sub-agent for a focused task. Returns an agent_id immediately; follow with agent_result to retrieve the final result. Default cap of 10 concurrent sub-agents (configurable via `[subagents].max_concurrent`); each is a full sub-agent loop, so cancel or wait if you hit the cap. For parallel one-shot LLM queries, just emit multiple tool calls in one turn — the dispatcher runs them in parallel.\n\n",
+            "Spawn a background sub-agent for a focused task. Returns an agent_id immediately; follow with agent_result to retrieve the final result. Default cap of 10 concurrent sub-agents (configurable via `[subagents].max_concurrent`); each is a full sub-agent loop, so cancel or wait if you hit the cap. Direct children beyond the interactive launch limit (default 4, `[subagents].interactive_max_launch`) queue for a slot instead of executing at once. For parallel one-shot LLM queries, just emit multiple tool calls in one turn — the dispatcher runs them in parallel.\n\n",
             "## Trust model: subagent results are self-reports, not verified facts\n\n",
             "`agent_result` returns the child's narrative summary of what happened. For operations with external side effects, the child's summary may be wrong. Re-verify before reporting success to the user:\n\n",
             "| Side effect | Re-verify with |\n|---|---|\n| URL claimed posted/written | `fetch_url` and check the response |\n| File claimed created | `read_file` or `list_dir` |\n| File claimed edited | `read_file` and check the change is present |\n| HTTP POST/PUT response | inspect status code and body |\n| Git operation | `git_status` / `git_diff` |\n| Test claimed passing | `run_tests` |\n| Process claimed started | `exec_shell` (e.g. `pgrep`, `lsof -i`) |\n\n",
@@ -2674,7 +3424,14 @@ impl ToolSpec for AgentSpawnTool {
             child_runtime.context.workspace = cwd;
         }
         let configured_model = match spawn_request.model.clone() {
-            Some(model) => Some(model),
+            // #3018 audit fix: spawn-time `model` must be validated and
+            // canonicalized here — passing it through raw turns a typo into
+            // an opaque provider 400 instead of a clear spawn-time error.
+            Some(model) => Some(normalize_requested_subagent_model(
+                &model,
+                "model",
+                self.runtime.client.api_provider(),
+            )?),
             None => configured_model_for_role_or_type(
                 &self.runtime,
                 spawn_request.assignment.role.as_deref(),
@@ -2815,7 +3572,7 @@ impl ToolSpec for AgentEvalTool {
     }
 
     fn description(&self) -> &'static str {
-        "Fetch or wait on a child sub-agent session. Optionally deliver a message/items to a running session, then return the latest session projection. With continue=true, resume only a checkpointed interrupted session. With block=true (default), waits for the session to reach a terminal boundary; block=false is a non-blocking status fetch. Terminal projections expose a handle_read-compatible transcript_handle for the full child transcript."
+        "Fetch the current projection for a child sub-agent session. Optionally deliver a message/items to a running session, then return immediately with the latest status. Set block=true only when you intentionally want to wait for a terminal boundary. With continue=true, resume only a checkpointed interrupted session; that resume waits by default unless block=false is explicit. Terminal projections expose a handle_read-compatible transcript_handle for the full child transcript."
     }
 
     fn input_schema(&self) -> Value {
@@ -2865,7 +3622,7 @@ impl ToolSpec for AgentEvalTool {
                 },
                 "block": {
                     "type": "boolean",
-                    "description": "Wait for a terminal boundary before returning (default true)"
+                    "description": "Wait for a terminal boundary before returning (default: false; default true only with continue=true/resume=true)"
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -2893,7 +3650,10 @@ impl ToolSpec for AgentEvalTool {
         let interrupt = optional_bool(&input, "interrupt", false);
         let continue_from_checkpoint =
             optional_bool(&input, "continue", false) || optional_bool(&input, "resume", false);
-        let block = optional_bool(&input, "block", true);
+        let block = input
+            .get("block")
+            .and_then(Value::as_bool)
+            .unwrap_or(continue_from_checkpoint);
         let timeout_ms = optional_u64(&input, "timeout_ms", DEFAULT_RESULT_TIMEOUT_MS)
             .clamp(1000, MAX_RESULT_TIMEOUT_MS);
 
@@ -2913,10 +3673,20 @@ impl ToolSpec for AgentEvalTool {
         // child output".
         let mut message_delivery: Option<Value> = None;
         if continue_from_checkpoint {
+            let delivery_preview = message.clone();
             let mut manager = self.manager.write().await;
             manager
                 .continue_checkpointed(&agent_id, message, interrupt)
                 .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+            manager.record_follow_up_delivery(
+                &agent_id,
+                true,
+                delivery_preview.as_deref(),
+                None,
+                interrupt,
+                true,
+            );
+            manager.persist_state_best_effort();
             message_delivery = Some(json!({
                 "delivered": true,
                 "continued_from_checkpoint": true
@@ -2930,16 +3700,36 @@ impl ToolSpec for AgentEvalTool {
                     .unwrap_or(false)
             };
             if terminal {
+                let reason = "session already terminated; follow-up not delivered";
+                let mut manager = self.manager.write().await;
+                manager.record_follow_up_delivery(
+                    &agent_id,
+                    false,
+                    Some(message.as_str()),
+                    Some(reason),
+                    interrupt,
+                    false,
+                );
+                manager.persist_state_best_effort();
                 message_delivery = Some(json!({
                     "delivered": false,
-                    "reason": "session already terminated; follow-up not delivered",
+                    "reason": reason,
                     "recover_full_output": "read the returned transcript_handle with handle_read"
                 }));
             } else {
                 let mut manager = self.manager.write().await;
                 manager
-                    .send_input(&agent_id, message, interrupt)
+                    .send_input(&agent_id, message.clone(), interrupt)
                     .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+                manager.record_follow_up_delivery(
+                    &agent_id,
+                    true,
+                    Some(message.as_str()),
+                    None,
+                    interrupt,
+                    false,
+                );
+                manager.persist_state_best_effort();
                 message_delivery = Some(json!({ "delivered": true }));
             }
         }
@@ -2956,7 +3746,12 @@ impl ToolSpec for AgentEvalTool {
             )
         };
 
-        let projection = subagent_session_projection(snapshot, timed_out, context).await;
+        let worker_record = {
+            let manager = self.manager.read().await;
+            manager.get_worker_record(&snapshot.agent_id)
+        };
+        let projection =
+            subagent_session_projection(snapshot, timed_out, context, worker_record).await;
         let mut result = ToolResult::json(&projection)
             .map_err(|e| ToolError::execution_failed(e.to_string()))?;
         result.metadata = Some(json!({
@@ -3200,11 +3995,15 @@ impl ToolSpec for AgentCloseTool {
                 .resolve_agent_ref(agent_id)
                 .map_err(|e| ToolError::execution_failed(e.to_string()))?
         };
-        let mut manager = self.manager.write().await;
-        let result = manager
-            .cancel(&agent_id)
-            .map_err(|e| ToolError::execution_failed(format!("Failed to close sub-agent: {e}")))?;
-        let projection = subagent_session_projection(result, false, context).await;
+        let (result, worker_record) = {
+            let mut manager = self.manager.write().await;
+            let result = manager.cancel(&agent_id).map_err(|e| {
+                ToolError::execution_failed(format!("Failed to close sub-agent: {e}"))
+            })?;
+            let worker_record = manager.get_worker_record(&result.agent_id);
+            (result, worker_record)
+        };
+        let projection = subagent_session_projection(result, false, context, worker_record).await;
         ToolResult::json(&projection).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
 }
@@ -3875,11 +4674,38 @@ struct SubAgentTask {
     started_at: Instant,
     max_steps: u32,
     input_rx: mpsc::UnboundedReceiver<SubAgentInput>,
+    /// Interactive launch gate (#3095). `Some` only for direct (depth-1)
+    /// children: the task acquires a permit before its first model step and
+    /// holds it until completion, so a fanout burst beyond the limit queues
+    /// with a visible reason instead of executing all at once.
+    launch_gate: Option<Arc<Semaphore>>,
 }
 
 #[allow(clippy::too_many_lines)]
 async fn run_subagent_task(task: SubAgentTask) {
     let role = task.assignment.role.clone();
+    // Interactive launch gate (#3095): direct children acquire a permit
+    // before their first model step so a fanout burst beyond the limit
+    // queues visibly instead of executing all at once. The permit is held
+    // for the lifetime of the task. Cancellation while queued is handled by
+    // `run_subagent`'s own first-step cancel check.
+    let mut _launch_permit = None;
+    if let Some(gate) = task.launch_gate.as_ref() {
+        match Arc::clone(gate).try_acquire_owned() {
+            Ok(permit) => _launch_permit = Some(permit),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                _launch_permit =
+                    acquire_queued_interactive_launch_permit(&task, Arc::clone(gate)).await;
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                crate::logging::warn(format!(
+                    "interactive launch gate closed for {}; proceeding without backpressure",
+                    task.agent_id
+                ));
+            }
+        }
+    }
+
     let result = run_subagent(
         &task.runtime,
         task.agent_id.clone(),
@@ -3964,6 +4790,113 @@ async fn run_subagent_task(task: SubAgentTask) {
             failed,
         });
     }
+}
+
+async fn acquire_queued_interactive_launch_permit(
+    task: &SubAgentTask,
+    gate: Arc<Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    record_queued_launch_progress(task).await;
+    let heartbeat = queued_launch_heartbeat_interval();
+    loop {
+        tokio::select! {
+            biased;
+            () = task.runtime.cancel_token.cancelled() => {
+                record_agent_progress(
+                    &task.runtime,
+                    &task.agent_id,
+                    "cancelled while queued for an interactive fanout slot".to_string(),
+                );
+                return None;
+            }
+            permit = Arc::clone(&gate).acquire_owned() => {
+                return permit.ok();
+            }
+            () = tokio::time::sleep(heartbeat) => {
+                record_queued_launch_progress(task).await;
+            }
+        }
+    }
+}
+
+async fn record_queued_launch_progress(task: &SubAgentTask) {
+    {
+        let mut manager = task.runtime.manager.write().await;
+        manager.touch(&task.agent_id);
+        manager.record_worker_event(
+            &task.agent_id,
+            AgentWorkerStatus::Queued,
+            Some(SUBAGENT_QUEUED_LAUNCH_REASON.to_string()),
+            None,
+            None,
+        );
+    }
+    emit_agent_progress(
+        task.runtime.event_tx.as_ref(),
+        task.runtime.mailbox.as_ref(),
+        &task.agent_id,
+        SUBAGENT_QUEUED_LAUNCH_REASON.to_string(),
+    );
+}
+
+#[cfg(test)]
+fn queued_launch_heartbeat_interval() -> Duration {
+    Duration::from_millis(10)
+}
+
+#[cfg(not(test))]
+fn queued_launch_heartbeat_interval() -> Duration {
+    Duration::from_secs(10)
+}
+
+struct SubAgentModelWaitHeartbeat {
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+impl SubAgentModelWaitHeartbeat {
+    fn start(runtime: SubAgentRuntime, agent_id: String, step_label: String) -> Self {
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let handle = spawn_supervised(
+            "subagent-model-wait-heartbeat",
+            std::panic::Location::caller(),
+            async move {
+                let heartbeat = subagent_model_wait_heartbeat_interval();
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = task_cancel.cancelled() => break,
+                        () = tokio::time::sleep(heartbeat) => {
+                            record_agent_progress(
+                                &runtime,
+                                &agent_id,
+                                format!("{step_label}: {SUBAGENT_MODEL_WAIT_REASON}"),
+                            );
+                        }
+                    }
+                }
+            },
+        );
+        Self { cancel, handle }
+    }
+}
+
+impl Drop for SubAgentModelWaitHeartbeat {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.handle.abort();
+    }
+}
+
+#[cfg(test)]
+fn subagent_model_wait_heartbeat_interval() -> Duration {
+    Duration::from_millis(10)
+}
+
+#[cfg(not(test))]
+fn subagent_model_wait_heartbeat_interval() -> Duration {
+    Duration::from_secs(10)
 }
 
 /// Notify the engine's parent turn loop that a direct child finished
@@ -4142,14 +5075,16 @@ async fn checkpoint_subagent_progress(
 }
 
 fn record_agent_progress(runtime: &SubAgentRuntime, agent_id: &str, message: impl Into<String>) {
+    let message = message.into();
     if let Ok(mut manager) = runtime.manager.try_write() {
         manager.touch(agent_id);
+        manager.record_worker_progress(agent_id, message.clone());
     }
     emit_agent_progress(
         runtime.event_tx.as_ref(),
         runtime.mailbox.as_ref(),
         agent_id,
-        message.into(),
+        message,
     );
 }
 
@@ -4306,7 +5241,7 @@ async fn run_subagent(
             record_agent_progress(
                 runtime,
                 &agent_id,
-                format!("step {steps}/{max_steps}: cancelled"),
+                format!("{}: cancelled", format_step_counter(steps, max_steps)),
             );
             if let Some(mb) = runtime.mailbox.as_ref() {
                 let _ = mb.send(MailboxMessage::Cancelled {
@@ -4358,7 +5293,10 @@ async fn run_subagent(
         record_agent_progress(
             runtime,
             &agent_id,
-            format!("step {steps}/{max_steps}: requesting model response"),
+            format!(
+                "{}: requesting model response",
+                format_step_counter(steps, max_steps)
+            ),
         );
 
         while let Ok(input) = input_rx.try_recv() {
@@ -4418,176 +5356,191 @@ async fn run_subagent(
         // Race the API call against the cancellation token so a parent
         // cancel during a long thinking turn doesn't have to wait for the
         // step timeout.
-        let response = tokio::select! {
-            biased;
-            () = runtime.cancel_token.cancelled() => {
-                record_agent_progress(
-                    runtime,
-                    &agent_id,
-                    format!("step {steps}/{max_steps}: cancelled mid-request"),
-                );
-                if let Some(mb) = runtime.mailbox.as_ref() {
-                    let _ = mb.send(MailboxMessage::Cancelled {
+        let response = {
+            let model_wait_heartbeat = SubAgentModelWaitHeartbeat::start(
+                runtime.clone(),
+                agent_id.clone(),
+                format_step_counter(steps, max_steps),
+            );
+            let response = tokio::select! {
+                biased;
+                () = runtime.cancel_token.cancelled() => {
+                    record_agent_progress(
+                        runtime,
+                        &agent_id,
+                        format!("{}: cancelled mid-request", format_step_counter(steps, max_steps)),
+                    );
+                    if let Some(mb) = runtime.mailbox.as_ref() {
+                        let _ = mb.send(MailboxMessage::Cancelled {
+                            agent_id: agent_id.clone(),
+                        });
+                    }
+                    let status = SubAgentStatus::Cancelled;
+                    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    insert_subagent_full_transcript_handle(
+                        runtime,
+                        &agent_id,
+                        &agent_type,
+                        &assignment,
+                        &status,
+                        None,
+                        latest_checkpoint.as_ref(),
+                        &messages,
+                        steps,
+                        duration_ms,
+                        fork_context_enabled,
+                    )
+                    .await;
+                    return Ok(SubAgentResult {
+                        name: agent_id.clone(),
                         agent_id: agent_id.clone(),
+                        context_mode: if fork_context_enabled { "forked" } else { "fresh" }.to_string(),
+                        fork_context: fork_context_enabled,
+                        workspace: Some(runtime.context.workspace.clone()),
+                        git_branch: current_git_branch(&runtime.context.workspace),
+                        agent_type: agent_type.clone(),
+                        assignment: assignment.clone(),
+                        model: runtime.model.clone(),
+                        nickname: None,
+                        status,
+                        result: None,
+                        steps_taken: steps,
+                        checkpoint: latest_checkpoint.clone(),
+                        duration_ms,
+                        from_prior_session: false,
                     });
                 }
-                let status = SubAgentStatus::Cancelled;
-                let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-                insert_subagent_full_transcript_handle(
-                    runtime,
-                    &agent_id,
-                    &agent_type,
-                    &assignment,
-                    &status,
-                    None,
-                    latest_checkpoint.as_ref(),
-                    &messages,
-                    steps,
-                    duration_ms,
-                    fork_context_enabled,
-                )
-                .await;
-                return Ok(SubAgentResult {
-                    name: agent_id.clone(),
-                    agent_id: agent_id.clone(),
-                    context_mode: if fork_context_enabled { "forked" } else { "fresh" }.to_string(),
-                    fork_context: fork_context_enabled,
-                    workspace: Some(runtime.context.workspace.clone()),
-                    git_branch: current_git_branch(&runtime.context.workspace),
-                    agent_type: agent_type.clone(),
-                    assignment: assignment.clone(),
-                    model: runtime.model.clone(),
-                    nickname: None,
-                    status,
-                    result: None,
-                    steps_taken: steps,
-                    checkpoint: latest_checkpoint.clone(),
-                    duration_ms,
-                    from_prior_session: false,
-                });
-            }
-            api = tokio::time::timeout(runtime.step_api_timeout, runtime.client.create_message(request)) => {
-                match api {
-                    Ok(response) => response?,
-                    Err(_) => {
-                        let reason = format!(
-                            "API call timed out after {}ms; checkpoint preserved for continuation",
-                            runtime.step_api_timeout.as_millis()
-                        );
-                        let checkpoint = checkpoint_subagent_progress(
-                            runtime,
-                            &agent_id,
-                            "api_timeout",
-                            &messages,
-                            steps,
-                            true,
-                        )
-                        .await;
-                        latest_checkpoint = Some(checkpoint.clone());
-                        record_agent_progress(
-                            runtime,
-                            &agent_id,
-                            format!("step {steps}/{max_steps}: interrupted; {reason}"),
-                        );
-                        let status = SubAgentStatus::Interrupted(reason.clone());
-                        let duration_ms =
-                            u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        insert_subagent_full_transcript_handle(
-                            runtime,
-                            &agent_id,
-                            &agent_type,
-                            &assignment,
-                            &status,
-                            Some(&reason),
-                            Some(&checkpoint),
-                            &messages,
-                            steps,
-                            duration_ms,
-                            fork_context_enabled,
-                        )
-                        .await;
-                        let interrupted_snapshot = {
-                            let mut manager = runtime.manager.write().await;
-                            manager.interrupt_with_checkpoint(
-                                &agent_id,
-                                reason.clone(),
-                                checkpoint.clone(),
-                            )?
-                        };
-
-                        let next_input = tokio::select! {
-                            biased;
-                            () = runtime.cancel_token.cancelled() => {
-                                record_agent_progress(
-                                    runtime,
-                                    &agent_id,
-                                    format!("step {steps}/{max_steps}: cancelled while interrupted"),
-                                );
-                                if let Some(mb) = runtime.mailbox.as_ref() {
-                                    let _ = mb.send(MailboxMessage::Cancelled {
-                                        agent_id: agent_id.clone(),
-                                    });
-                                }
-                                let status = SubAgentStatus::Cancelled;
-                                let duration_ms = u64::try_from(started_at.elapsed().as_millis())
-                                    .unwrap_or(u64::MAX);
-                                insert_subagent_full_transcript_handle(
-                                    runtime,
-                                    &agent_id,
-                                    &agent_type,
-                                    &assignment,
-                                    &status,
-                                    None,
-                                    latest_checkpoint.as_ref(),
-                                    &messages,
-                                    steps,
-                                    duration_ms,
-                                    fork_context_enabled,
-                                )
-                                .await;
-                                return Ok(SubAgentResult {
-                                    name: agent_id.clone(),
-                                    agent_id: agent_id.clone(),
-                                    context_mode: if fork_context_enabled { "forked" } else { "fresh" }.to_string(),
-                                    fork_context: fork_context_enabled,
-                                    workspace: Some(runtime.context.workspace.clone()),
-                                    git_branch: current_git_branch(&runtime.context.workspace),
-                                    agent_type: agent_type.clone(),
-                                    assignment: assignment.clone(),
-                                    model: runtime.model.clone(),
-                                    nickname: None,
-                                    status,
-                                    result: None,
-                                    steps_taken: steps,
-                                    checkpoint: latest_checkpoint.clone(),
-                                    duration_ms,
-                                    from_prior_session: false,
-                                });
-                            }
-                            input = input_rx.recv() => input,
-                        };
-                        let Some(input) = next_input else {
-                            return Ok(interrupted_snapshot);
-                        };
-                        if input.interrupt {
-                            pending_inputs.clear();
-                        }
-                        pending_inputs.push_back(input);
-                        latest_checkpoint = Some(
-                            checkpoint_subagent_progress(
+                api = tokio::time::timeout(runtime.step_api_timeout, runtime.client.create_message(request)) => {
+                    match api {
+                        Ok(response) => response?,
+                        Err(_) => {
+                            let reason = format!(
+                                "API call timed out after {}ms; checkpoint preserved for continuation",
+                                runtime.step_api_timeout.as_millis()
+                            );
+                            let checkpoint = checkpoint_subagent_progress(
                                 runtime,
                                 &agent_id,
-                                "continued_after_api_timeout",
+                                "api_timeout",
                                 &messages,
                                 steps,
                                 true,
                             )
-                            .await,
-                        );
-                        continue 'steps_loop;
+                            .await;
+                            latest_checkpoint = Some(checkpoint.clone());
+                            record_agent_progress(
+                                runtime,
+                                &agent_id,
+                                format!("{}: interrupted; {reason}", format_step_counter(steps, max_steps)),
+                            );
+                            let status = SubAgentStatus::Interrupted(reason.clone());
+                            let duration_ms =
+                                u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            insert_subagent_full_transcript_handle(
+                                runtime,
+                                &agent_id,
+                                &agent_type,
+                                &assignment,
+                                &status,
+                                Some(&reason),
+                                Some(&checkpoint),
+                                &messages,
+                                steps,
+                                duration_ms,
+                                fork_context_enabled,
+                            )
+                            .await;
+                            let interrupted_snapshot = {
+                                let mut manager = runtime.manager.write().await;
+                                manager.interrupt_with_checkpoint(
+                                    &agent_id,
+                                    reason.clone(),
+                                    checkpoint.clone(),
+                                )?
+                            };
+                            if let Some(mb) = runtime.mailbox.as_ref() {
+                                let _ = mb.send(MailboxMessage::Interrupted {
+                                    agent_id: agent_id.clone(),
+                                    reason: reason.clone(),
+                                });
+                            }
+
+                            let next_input = tokio::select! {
+                                biased;
+                                () = runtime.cancel_token.cancelled() => {
+                                    record_agent_progress(
+                                        runtime,
+                                        &agent_id,
+                                        format!("{}: cancelled while interrupted", format_step_counter(steps, max_steps)),
+                                    );
+                                    if let Some(mb) = runtime.mailbox.as_ref() {
+                                        let _ = mb.send(MailboxMessage::Cancelled {
+                                            agent_id: agent_id.clone(),
+                                        });
+                                    }
+                                    let status = SubAgentStatus::Cancelled;
+                                    let duration_ms = u64::try_from(started_at.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX);
+                                    insert_subagent_full_transcript_handle(
+                                        runtime,
+                                        &agent_id,
+                                        &agent_type,
+                                        &assignment,
+                                        &status,
+                                        None,
+                                        latest_checkpoint.as_ref(),
+                                        &messages,
+                                        steps,
+                                        duration_ms,
+                                        fork_context_enabled,
+                                    )
+                                    .await;
+                                    return Ok(SubAgentResult {
+                                        name: agent_id.clone(),
+                                        agent_id: agent_id.clone(),
+                                        context_mode: if fork_context_enabled { "forked" } else { "fresh" }.to_string(),
+                                        fork_context: fork_context_enabled,
+                                        workspace: Some(runtime.context.workspace.clone()),
+                                        git_branch: current_git_branch(&runtime.context.workspace),
+                                        agent_type: agent_type.clone(),
+                                        assignment: assignment.clone(),
+                                        model: runtime.model.clone(),
+                                        nickname: None,
+                                        status,
+                                        result: None,
+                                        steps_taken: steps,
+                                        checkpoint: latest_checkpoint.clone(),
+                                        duration_ms,
+                                        from_prior_session: false,
+                                    });
+                                }
+                                input = input_rx.recv() => input,
+                            };
+                            let Some(input) = next_input else {
+                                return Ok(interrupted_snapshot);
+                            };
+                            if input.interrupt {
+                                pending_inputs.clear();
+                            }
+                            pending_inputs.push_back(input);
+                            latest_checkpoint = Some(
+                                checkpoint_subagent_progress(
+                                    runtime,
+                                    &agent_id,
+                                    "continued_after_api_timeout",
+                                    &messages,
+                                    steps,
+                                    true,
+                                )
+                                .await,
+                            );
+                            continue 'steps_loop;
+                        }
                     }
                 }
-            }
+            };
+            drop(model_wait_heartbeat);
+            response
         };
 
         let mut tool_uses = Vec::new();
@@ -4655,7 +5608,7 @@ async fn run_subagent(
             record_agent_progress(
                 runtime,
                 &agent_id,
-                format!("step {steps}/{max_steps}: {progress}"),
+                format!("{}: {progress}", format_step_counter(steps, max_steps)),
             );
             messages.push(Message {
                 role: "user".to_string(),
@@ -4738,7 +5691,7 @@ async fn run_subagent(
                 record_agent_progress(
                     runtime,
                     &agent_id,
-                    format!("step {steps}/{max_steps}: complete"),
+                    format!("{}: complete", format_step_counter(steps, max_steps)),
                 );
                 break;
             }
@@ -4749,7 +5702,8 @@ async fn run_subagent(
             runtime,
             &agent_id,
             format!(
-                "step {steps}/{max_steps}: executing {} tool call(s)",
+                "{}: executing {} tool call(s)",
+                format_step_counter(steps, max_steps),
                 tool_uses.len()
             ),
         );
@@ -4758,10 +5712,14 @@ async fn run_subagent(
             .iter()
             .any(|(_, name, _)| name == SUBMIT_OUTPUT_TOOL);
         for (tool_id, tool_name, tool_input) in tool_uses {
+            let tool_display_name = subagent_progress_tool_display_name(&tool_name);
             record_agent_progress(
                 runtime,
                 &agent_id,
-                format!("step {steps}/{max_steps}: running tool '{tool_name}'"),
+                format!(
+                    "{}: running tool '{tool_display_name}'",
+                    format_step_counter(steps, max_steps)
+                ),
             );
             if let Some(mb) = runtime.mailbox.as_ref() {
                 let _ = mb.send(MailboxMessage::ToolCallStarted {
@@ -4864,7 +5822,10 @@ async fn run_subagent(
             record_agent_progress(
                 runtime,
                 &agent_id,
-                format!("step {steps}/{max_steps}: finished tool '{tool_name}'"),
+                format!(
+                    "{}: finished tool '{tool_display_name}'",
+                    format_step_counter(steps, max_steps)
+                ),
             );
             if let Some(mb) = runtime.mailbox.as_ref() {
                 let _ = mb.send(MailboxMessage::ToolCallCompleted {
@@ -5324,15 +6285,18 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         .or_else(|| input.get("max_spawn_depth"))
         .and_then(Value::as_u64)
         .map(|depth| {
+            let ceiling = codewhale_config::MAX_SPAWN_DEPTH_CEILING;
             u32::try_from(depth)
-                .map_err(|_| ToolError::invalid_input("max_depth must be between 0 and 3"))
+                .map_err(|_| {
+                    ToolError::invalid_input(format!("max_depth must be between 0 and {ceiling}"))
+                })
                 .and_then(|depth| {
-                    if depth <= 3 {
+                    if depth <= ceiling {
                         Ok(depth)
                     } else {
-                        Err(ToolError::invalid_input(
-                            "max_depth must be between 0 and 3",
-                        ))
+                        Err(ToolError::invalid_input(format!(
+                            "max_depth must be between 0 and {ceiling}"
+                        )))
                     }
                 })
         })
@@ -5396,16 +6360,37 @@ fn with_default_fork_context(mut input: Value, default: bool) -> Value {
 pub(crate) fn normalize_requested_subagent_model(
     value: &str,
     field: &str,
+    provider: crate::config::ApiProvider,
 ) -> Result<String, ToolError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(ToolError::invalid_input(format!("{field} cannot be blank")));
     }
-    crate::config::normalize_model_name(trimmed).ok_or_else(|| {
+    // #3018: Use provider-aware validation so non-DeepSeek providers can
+    // accept their own model IDs instead of failing with "Expected a
+    // DeepSeek model id".
+    crate::config::requested_model_for_provider(provider, trimmed).ok_or_else(|| {
+        let valid_names = crate::config::model_completion_names_for_provider(provider);
+        let valid_hint = if valid_names.is_empty() {
+            String::new()
+        } else {
+            format!(" (accepted: {})", valid_names.join(", "))
+        };
         ToolError::invalid_input(format!(
-            "Invalid {field} '{trimmed}'. Expected a DeepSeek model id such as deepseek-v4-pro or deepseek-v4-flash"
+            "Invalid {field} '{trimmed}' for provider {}{valid_hint}",
+            provider_name_for_error(provider)
         ))
     })
+}
+
+fn provider_name_for_error(provider: crate::config::ApiProvider) -> &'static str {
+    match provider {
+        crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN => "DeepSeek",
+        crate::config::ApiProvider::Openai | crate::config::ApiProvider::OpenaiCodex => "OpenAI",
+        crate::config::ApiProvider::Moonshot => "Moonshot",
+        crate::config::ApiProvider::Ollama => "Ollama",
+        _ => "this provider",
+    }
 }
 
 pub(crate) fn configured_model_for_role_or_type(
@@ -5422,8 +6407,12 @@ pub(crate) fn configured_model_for_role_or_type(
 
     for key in keys {
         if let Some(model) = runtime.role_models.get(&key) {
-            return normalize_requested_subagent_model(model, &format!("subagents.{key}.model"))
-                .map(Some);
+            return normalize_requested_subagent_model(
+                model,
+                &format!("subagents.{key}.model"),
+                runtime.client.api_provider(),
+            )
+            .map(Some);
         }
     }
     Ok(None)
@@ -5476,7 +6465,15 @@ fn tool_agent_route(parent_model: &str, configured_model: Option<String>) -> Sub
 }
 
 fn should_use_subagent_flash_router(runtime: &SubAgentRuntime) -> bool {
-    runtime.auto_model
+    // #3018: providers without a known cheap tier skip the network router
+    // entirely — there is no alternative model worth a round-trip.
+    runtime.auto_model && subagent_router_candidates(runtime).cheap.is_some()
+}
+
+/// Candidate pair for the sub-agent router, derived from the active
+/// provider and the (already provider-resolved) parent model (#3018).
+fn subagent_router_candidates(runtime: &SubAgentRuntime) -> crate::model_routing::RouterCandidates {
+    crate::model_routing::provider_router_candidates(runtime.client.api_provider(), &runtime.model)
 }
 
 fn fallback_subagent_assignment_route(
@@ -5487,7 +6484,13 @@ fn fallback_subagent_assignment_route(
     let model = if let Some(model) = configured_model {
         model
     } else if runtime.auto_model {
-        crate::model_routing::auto_model_heuristic(prompt, &runtime.model)
+        // #3018: candidate-aware — on providers without a cheap tier this
+        // always resolves to the parent model instead of a DeepSeek id.
+        crate::model_routing::auto_model_heuristic_for_candidates(
+            prompt,
+            &runtime.model,
+            &subagent_router_candidates(runtime),
+        )
     } else {
         runtime.model.clone()
     };
@@ -5518,8 +6521,15 @@ async fn subagent_flash_router(
         return Ok(None);
     }
 
+    let candidates = subagent_router_candidates(runtime);
+    let Some(cheap_model) = candidates.cheap.clone() else {
+        // should_use_subagent_flash_router already gates on this; defensive
+        // second gate so the router can never 400 a cheap-tier-less provider.
+        return Ok(None);
+    };
+
     let request = MessageRequest {
-        model: "deepseek-v4-flash".to_string(),
+        model: cheap_model,
         messages: vec![Message {
             role: "user".to_string(),
             content: vec![ContentBlock::Text {
@@ -5528,9 +6538,9 @@ async fn subagent_flash_router(
             }],
         }],
         max_tokens: 96,
-        system: Some(SystemPrompt::Text(
-            SUBAGENT_ROUTER_SYSTEM_PROMPT.to_string(),
-        )),
+        system: Some(SystemPrompt::Text(subagent_router_system_prompt(
+            &candidates,
+        ))),
         tools: None,
         tool_choice: None,
         metadata: None,
@@ -5546,21 +6556,31 @@ async fn subagent_flash_router(
         runtime.client.create_message(request),
     )
     .await??;
-    Ok(crate::model_routing::parse_auto_route_recommendation(
-        &message_response_text(&response.content),
-    ))
+    Ok(
+        crate::model_routing::parse_auto_route_recommendation_for_candidates(
+            &message_response_text(&response.content),
+            &candidates,
+        ),
+    )
 }
 
-const SUBAGENT_ROUTER_SYSTEM_PROMPT: &str = "\
-You are the codewhale sub-agent routing manager. Return only compact JSON: \
-{\"model\":\"deepseek-v4-flash|deepseek-v4-pro\",\"thinking\":\"off|high|max\"}. \
+/// Render the sub-agent router system prompt from the actual candidate ids
+/// (#3018) so the classifier answers with ids the active provider serves.
+fn subagent_router_system_prompt(candidates: &crate::model_routing::RouterCandidates) -> String {
+    let cheap = candidates.cheap_or_big();
+    let big = &candidates.big;
+    format!(
+        "You are the codewhale sub-agent routing manager. Return only compact JSON: \
+{{\"model\":\"{cheap}|{big}\",\"thinking\":\"off|high|max\"}}. \
 Treat each child assignment like a customer request entering a team queue: decide the least \
 sufficient worker and thinking budget for that assignment. Do not treat being a sub-agent as \
-important by itself. Use Flash for trivial, read-only, status, lookup, or single-step work. \
-Use Pro for coding, debugging, release work, multi-file changes, security, architecture, \
+important by itself. Use {cheap} for trivial, read-only, status, lookup, or single-step work. \
+Use {big} for coding, debugging, release work, multi-file changes, security, architecture, \
 high-risk decisions, ambiguous requests, or work likely to need tool-call judgment. Use thinking \
 off for trivial no-tool work, high for ordinary reasoning, and max only for hard, risky, \
-multi-step, uncertain, or tool-heavy work.";
+multi-step, uncertain, or tool-heavy work."
+    )
+}
 
 fn subagent_router_prompt(runtime: &SubAgentRuntime, prompt: &str) -> String {
     format!(
@@ -5597,7 +6617,7 @@ fn message_response_text(blocks: &[ContentBlock]) -> String {
                 }
                 out.push_str(text);
             }
-            ContentBlock::Thinking { thinking } => {
+            ContentBlock::Thinking { thinking, .. } => {
                 if !out.is_empty() {
                     out.push('\n');
                 }
@@ -5612,7 +6632,15 @@ fn message_response_text(blocks: &[ContentBlock]) -> String {
 fn parse_optional_subagent_model(input: &Value, key: &str) -> Result<Option<String>, ToolError> {
     match input.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) => normalize_requested_subagent_model(value, key).map(Some),
+        Some(Value::String(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(ToolError::invalid_input(format!("{key} cannot be blank")));
+            }
+            // #3018: Basic parsing only — provider-aware validation is deferred
+            // to the spawn path where the runtime's ApiProvider is available.
+            Ok(Some(trimmed.to_string()))
+        }
         Some(_) => Err(ToolError::invalid_input(format!("{key} must be a string"))),
     }
 }
@@ -5703,6 +6731,81 @@ fn build_assignment_prompt(
         agent_type.as_str(),
         prompt
     )
+}
+
+fn worker_status_from_subagent_status(status: &SubAgentStatus) -> AgentWorkerStatus {
+    match status {
+        SubAgentStatus::Running => AgentWorkerStatus::Running,
+        SubAgentStatus::Completed => AgentWorkerStatus::Completed,
+        SubAgentStatus::Failed(_) => AgentWorkerStatus::Failed,
+        SubAgentStatus::Cancelled => AgentWorkerStatus::Cancelled,
+        SubAgentStatus::Interrupted(_) => AgentWorkerStatus::Interrupted,
+    }
+}
+
+fn worker_status_from_subagent_result(result: &SubAgentResult) -> AgentWorkerStatus {
+    if subagent_checkpoint_is_continuable(result) {
+        AgentWorkerStatus::WaitingForUser
+    } else {
+        worker_status_from_subagent_status(&result.status)
+    }
+}
+
+fn worker_progress_event_parts(message: &str) -> (AgentWorkerStatus, Option<u32>, Option<String>) {
+    let step = parse_progress_step(message);
+    let lower = message.to_ascii_lowercase();
+    let status = if lower.contains("queued") {
+        AgentWorkerStatus::Queued
+    } else if lower.contains("waiting for user") || lower.contains("waiting for follow-up") {
+        AgentWorkerStatus::WaitingForUser
+    } else if lower.contains("requesting model response")
+        || lower.contains(SUBAGENT_MODEL_WAIT_REASON)
+    {
+        AgentWorkerStatus::ModelWait
+    } else if lower.contains("running tool") || lower.contains("executing") {
+        AgentWorkerStatus::RunningTool
+    } else if lower.contains("cancelled") {
+        AgentWorkerStatus::Cancelled
+    } else if lower.contains("interrupted") || lower.contains("timed out") {
+        AgentWorkerStatus::Interrupted
+    } else if lower.contains("complete") {
+        AgentWorkerStatus::Completed
+    } else if lower.contains("started") {
+        AgentWorkerStatus::Starting
+    } else {
+        AgentWorkerStatus::Running
+    };
+    (status, step, parse_progress_tool_name(message))
+}
+
+fn parse_progress_step(message: &str) -> Option<u32> {
+    let rest = message.strip_prefix("step ")?;
+    let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    (!digits.is_empty())
+        .then(|| digits.parse::<u32>().ok())
+        .flatten()
+}
+
+fn parse_progress_tool_name(message: &str) -> Option<String> {
+    let marker = "tool '";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let end = rest.find('\'')?;
+    let tool = rest[..end].trim();
+    (!tool.is_empty()).then(|| tool.to_string())
+}
+
+fn subagent_progress_tool_display_name(name: &str) -> &str {
+    match name {
+        "exec_shell"
+        | "exec_shell_wait"
+        | "exec_shell_interact"
+        | "exec_wait"
+        | "exec_interact"
+        | "task_shell_start"
+        | "task_shell_wait" => "Bash",
+        _ => name,
+    }
 }
 
 fn emit_agent_progress(
@@ -5967,7 +7070,26 @@ fn annotate_child_model_error(err: &str, model: &str) -> String {
             "{err}\n(child model `{model}` may be unavailable under the current access profile — \
              retry agent_open with a different `model`, or remove `model` to inherit the parent's)"
         ),
-        _ => err.to_string(),
+        _ => {
+            // #3020 (#2653): Provider rejections like "Model Not Exist" or
+            // "does not exist or you do not have access" often classify as
+            // `Internal` rather than `Authorization`/`State`.  Catch these
+            // patterns in the raw error text and annotate anyway.
+            let lower = err.to_ascii_lowercase();
+            if lower.contains("model not exist")
+                || lower.contains("model_not_found")
+                || lower.contains("does not exist")
+                || lower.contains("no such model")
+                || lower.contains("invalid model")
+            {
+                format!(
+                    "{err}\n(child model `{model}` may be unavailable under the current access profile — \
+                     retry agent_open with a different `model`, or remove `model` to inherit the parent's)"
+                )
+            } else {
+                err.to_string()
+            }
+        }
     }
 }
 

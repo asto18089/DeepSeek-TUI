@@ -1,5 +1,14 @@
 {
+  "private": true,
+  "workspaces": [
+    "npm/codewhale",
+    "npm/deepseek-tui",
+    "npm/runtime-sdk"
+  ],
   "devDependencies": {
     "wrangler": "^4.94.0"
+  },
+  "overrides": {
+    "esbuild": "0.28.1"
   }
 }

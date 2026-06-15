@@ -195,6 +195,47 @@ pub struct JobStateRecord {
     pub updated_at: i64,
 }
 
+/// Persisted lifecycle status for a thread goal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadGoalStatus {
+    /// Goal is active and should continue receiving work.
+    Active,
+    /// Goal is paused by the user.
+    Paused,
+    /// Goal is blocked and cannot make meaningful progress.
+    Blocked,
+    /// Goal stopped because account/service usage limits were reached.
+    UsageLimited,
+    /// Goal stopped because its explicit token budget was reached.
+    BudgetLimited,
+    /// Goal has been completed.
+    Complete,
+}
+
+/// Persisted goal state attached to a thread.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadGoalRecord {
+    /// Thread this goal belongs to.
+    pub thread_id: String,
+    /// Stable identifier for this goal revision.
+    pub goal_id: String,
+    /// User-visible objective.
+    pub objective: String,
+    /// Current lifecycle status.
+    pub status: ThreadGoalStatus,
+    /// Optional token budget requested by the user.
+    pub token_budget: Option<i64>,
+    /// Tokens consumed while pursuing the goal.
+    pub tokens_used: i64,
+    /// Elapsed wall-clock work time in seconds.
+    pub time_used_seconds: i64,
+    /// Unix timestamp (seconds) when the goal was created.
+    pub created_at: i64,
+    /// Unix timestamp (seconds) when the goal was last updated.
+    pub updated_at: i64,
+}
+
 /// Filters for listing conversation threads.
 #[derive(Debug, Clone)]
 pub struct ThreadListFilters {
@@ -234,7 +275,8 @@ pub struct StateStore {
 impl StateStore {
     /// Open (or create) a state store at the given database path.
     ///
-    /// If `path` is `None`, the default location (`~/.deepseek/state.db`) is used.
+    /// If `path` is `None`, the default location (`~/.codewhale/state.db`, with
+    /// `~/.deepseek/state.db` as a legacy fallback) is used.
     /// The database schema is created automatically if it does not exist.
     pub fn open(path: Option<PathBuf>) -> Result<Self> {
         let db_path = path.unwrap_or_else(default_state_db_path);
@@ -474,6 +516,37 @@ impl StateStore {
                 "#,
             )
             .context("failed to initialize workflow trace schema")?;
+            user_version = 2;
+        }
+        if user_version < 3 {
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                CREATE TABLE IF NOT EXISTS thread_goals (
+                    thread_id TEXT PRIMARY KEY NOT NULL,
+                    goal_id TEXT NOT NULL,
+                    objective TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN (
+                        'active',
+                        'paused',
+                        'blocked',
+                        'usage_limited',
+                        'budget_limited',
+                        'complete'
+                    )),
+                    token_budget INTEGER,
+                    tokens_used INTEGER NOT NULL DEFAULT 0,
+                    time_used_seconds INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+                );
+
+                PRAGMA user_version = 3;
+                COMMIT;
+                "#,
+            )
+            .context("failed to initialize thread goal schema")?;
         }
         Ok(())
     }
@@ -658,6 +731,82 @@ impl StateStore {
         .optional()
         .context("failed to read thread memory mode")
         .map(Option::flatten)
+    }
+
+    /// Insert or replace the persisted goal for a thread.
+    pub fn upsert_thread_goal(&self, goal: &ThreadGoalRecord) -> Result<()> {
+        let conn = self.conn()?;
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM threads WHERE id = ?1",
+                params![goal.thread_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to verify thread before saving goal")?;
+        if exists.is_none() {
+            anyhow::bail!("thread {} not found", goal.thread_id);
+        }
+
+        conn.execute(
+            r#"
+            INSERT INTO thread_goals (
+                thread_id, goal_id, objective, status, token_budget, tokens_used,
+                time_used_seconds, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                goal_id=excluded.goal_id,
+                objective=excluded.objective,
+                status=excluded.status,
+                token_budget=excluded.token_budget,
+                tokens_used=excluded.tokens_used,
+                time_used_seconds=excluded.time_used_seconds,
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at
+            "#,
+            params![
+                goal.thread_id,
+                goal.goal_id,
+                goal.objective,
+                thread_goal_status_to_str(&goal.status),
+                goal.token_budget,
+                goal.tokens_used,
+                goal.time_used_seconds,
+                goal.created_at,
+                goal.updated_at,
+            ],
+        )
+        .context("failed to upsert thread goal")?;
+        Ok(())
+    }
+
+    /// Retrieve the persisted goal for a thread.
+    pub fn get_thread_goal(&self, thread_id: &str) -> Result<Option<ThreadGoalRecord>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            r#"
+            SELECT thread_id, goal_id, objective, status, token_budget, tokens_used,
+                   time_used_seconds, created_at, updated_at
+            FROM thread_goals
+            WHERE thread_id = ?1
+            "#,
+            params![thread_id],
+            row_to_thread_goal,
+        )
+        .optional()
+        .context("failed to read thread goal")
+    }
+
+    /// Delete the persisted goal for a thread.
+    pub fn delete_thread_goal(&self, thread_id: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let changed = conn
+            .execute(
+                "DELETE FROM thread_goals WHERE thread_id = ?1",
+                params![thread_id],
+            )
+            .context("failed to delete thread goal")?;
+        Ok(changed > 0)
     }
 
     /// List all leaf messages in a thread.
@@ -1344,10 +1493,15 @@ impl StateStore {
 }
 
 fn default_state_db_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".deepseek")
-        .join("state.db")
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    // Prefer the CodeWhale directory, falling back to legacy DeepSeek path
+    // so existing installs don't lose their session history.
+    let primary = home.join(".codewhale").join("state.db");
+    if primary.exists() || !home.join(".deepseek").join("state.db").exists() {
+        primary
+    } else {
+        home.join(".deepseek").join("state.db")
+    }
 }
 
 fn bool_to_i64(value: bool) -> i64 {
@@ -1426,6 +1580,29 @@ fn job_state_status_from_str(value: &str) -> JobStateStatus {
     }
 }
 
+fn thread_goal_status_to_str(status: &ThreadGoalStatus) -> &'static str {
+    match status {
+        ThreadGoalStatus::Active => "active",
+        ThreadGoalStatus::Paused => "paused",
+        ThreadGoalStatus::Blocked => "blocked",
+        ThreadGoalStatus::UsageLimited => "usage_limited",
+        ThreadGoalStatus::BudgetLimited => "budget_limited",
+        ThreadGoalStatus::Complete => "complete",
+    }
+}
+
+fn thread_goal_status_from_str(value: &str) -> ThreadGoalStatus {
+    match value {
+        "active" => ThreadGoalStatus::Active,
+        "paused" => ThreadGoalStatus::Paused,
+        "blocked" => ThreadGoalStatus::Blocked,
+        "usage_limited" => ThreadGoalStatus::UsageLimited,
+        "budget_limited" => ThreadGoalStatus::BudgetLimited,
+        "complete" => ThreadGoalStatus::Complete,
+        _ => ThreadGoalStatus::Active,
+    }
+}
+
 fn row_to_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadMetadata> {
     let status_raw: String = row.get(7)?;
     let source_raw: String = row.get(11)?;
@@ -1455,4 +1632,128 @@ fn row_to_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadMetadata> {
         memory_mode: row.get(20)?,
         current_leaf_id: row.get(21)?,
     })
+}
+
+fn row_to_thread_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadGoalRecord> {
+    let status_raw: String = row.get(3)?;
+    Ok(ThreadGoalRecord {
+        thread_id: row.get(0)?,
+        goal_id: row.get(1)?,
+        objective: row.get(2)?,
+        status: thread_goal_status_from_str(&status_raw),
+        token_budget: row.get(4)?,
+        tokens_used: row.get(5)?,
+        time_used_seconds: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_state_store(name: &str) -> StateStore {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "codewhale-state-{name}-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp state dir");
+        StateStore::open(Some(dir.join("state.db"))).expect("open state store")
+    }
+
+    fn test_thread(id: &str) -> ThreadMetadata {
+        ThreadMetadata {
+            id: id.to_string(),
+            rollout_path: None,
+            preview: "test thread".to_string(),
+            ephemeral: false,
+            model_provider: "deepseek".to_string(),
+            created_at: 10,
+            updated_at: 10,
+            status: ThreadStatus::Running,
+            path: None,
+            cwd: PathBuf::from("/tmp/codewhale"),
+            cli_version: "0.0.0-test".to_string(),
+            source: SessionSource::Interactive,
+            name: None,
+            sandbox_policy: None,
+            approval_mode: None,
+            archived: false,
+            archived_at: None,
+            git_sha: None,
+            git_branch: None,
+            git_origin_url: None,
+            memory_mode: None,
+            current_leaf_id: None,
+        }
+    }
+
+    fn test_goal(thread_id: &str, objective: &str) -> ThreadGoalRecord {
+        ThreadGoalRecord {
+            thread_id: thread_id.to_string(),
+            goal_id: "goal-1".to_string(),
+            objective: objective.to_string(),
+            status: ThreadGoalStatus::Active,
+            token_budget: Some(123),
+            tokens_used: 7,
+            time_used_seconds: 11,
+            created_at: 100,
+            updated_at: 101,
+        }
+    }
+
+    #[test]
+    fn thread_goal_crud_round_trips_and_replaces() {
+        let store = temp_state_store("thread-goal-crud");
+        store
+            .upsert_thread(&test_thread("thread-1"))
+            .expect("upsert thread");
+
+        let goal = test_goal("thread-1", "Ship v0.8.59");
+        store.upsert_thread_goal(&goal).expect("upsert goal");
+        assert_eq!(
+            store
+                .get_thread_goal("thread-1")
+                .expect("read goal")
+                .as_ref(),
+            Some(&goal)
+        );
+
+        let mut replacement = test_goal("thread-1", "Ship v0.8.59 safely");
+        replacement.goal_id = "goal-2".to_string();
+        replacement.status = ThreadGoalStatus::BudgetLimited;
+        replacement.token_budget = None;
+        replacement.updated_at = 202;
+        store
+            .upsert_thread_goal(&replacement)
+            .expect("replace goal");
+        assert_eq!(
+            store.get_thread_goal("thread-1").expect("read replacement"),
+            Some(replacement)
+        );
+
+        assert!(store.delete_thread_goal("thread-1").expect("delete goal"));
+        assert!(
+            store
+                .get_thread_goal("thread-1")
+                .expect("read empty")
+                .is_none()
+        );
+        assert!(!store.delete_thread_goal("thread-1").expect("delete empty"));
+    }
+
+    #[test]
+    fn thread_goal_requires_existing_thread() {
+        let store = temp_state_store("thread-goal-missing-thread");
+        let err = store
+            .upsert_thread_goal(&test_goal("missing-thread", "nope"))
+            .expect_err("goal without a thread should fail");
+        assert!(err.to_string().contains("thread missing-thread not found"));
+    }
 }

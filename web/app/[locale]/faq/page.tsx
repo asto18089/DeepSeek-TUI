@@ -200,8 +200,10 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
     q: "What does /goal do?",
     a: (
       <>
-        <code className="inline">/goal</code> is a simple goal-setter for the current session.
-        It does not add another app mode; the mode switcher remains Plan, Agent, and YOLO.
+        <code className="inline">/goal</code> sets a goal for the current TUI session.
+        App-server clients can also persist a thread-scoped goal through the
+        <code className="inline">thread/goal/*</code> methods. It does not add another
+        app mode; the mode switcher remains Plan, Agent, and YOLO.
         Track progress in <a href="https://github.com/Hmbown/CodeWhale/issues/891" className="body-link">#891</a>.
       </>
     ),
@@ -514,7 +516,8 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
     a: (
       <>
         Goal 模式是未来的工作流/标签页方向，用于长时间运行的多步目标——不是当前的 <code className="inline">/goal</code> 命令。
-        当前的 <code className="inline">/goal</code> 是一个简单的目标设置器。完整的 Goal 模式（自主多回合任务执行，支持检查点/恢复）已规划但尚未实现。
+        当前的 <code className="inline">/goal</code> 是当前 TUI 会话的目标设置器；app-server 客户端也可以通过 <code className="inline">thread/goal/*</code> 方法持久化线程目标。
+        完整的 Goal 工作区（自主多回合任务执行，带更完整的检查点/恢复 UI）仍在规划中。
         关注 <a href="https://github.com/Hmbown/CodeWhale/issues/891" className="body-link">#891</a> 的进展。
       </>
     ),

@@ -70,6 +70,41 @@ fn apply_provider_token_limit(body: &mut Value, provider: ApiProvider, max_token
     body["max_completion_tokens"] = json!(max_tokens);
 }
 
+fn mirror_minimax_reasoning_details_for_messages(messages: &mut [Value]) {
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if message.get("reasoning_details").is_some() {
+            continue;
+        }
+        let Some(reasoning) = message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .filter(|reasoning| !reasoning.trim().is_empty())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        message["reasoning_details"] = json!([
+            {
+                "type": "text",
+                "text": reasoning,
+            }
+        ]);
+    }
+}
+
+fn mirror_minimax_reasoning_details_for_body(body: &mut Value, provider: ApiProvider) {
+    if provider != ApiProvider::Minimax {
+        return;
+    }
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    mirror_minimax_reasoning_details_for_messages(messages);
+}
+
 impl DeepSeekClient {
     pub(super) async fn create_message_chat(
         &self,
@@ -121,6 +156,7 @@ impl DeepSeekClient {
             request.reasoning_effort.as_deref(),
             self.api_provider,
         );
+        mirror_minimax_reasoning_details_for_body(&mut body, self.api_provider);
 
         let response_cache_key = if cacheable {
             let wire_body =
@@ -258,6 +294,7 @@ impl DeepSeekClient {
             request.reasoning_effort.as_deref(),
             self.api_provider,
         );
+        mirror_minimax_reasoning_details_for_body(&mut body, self.api_provider);
 
         let url = api_url_with_suffix(
             &self.base_url,
@@ -323,6 +360,7 @@ impl DeepSeekClient {
             let mut text_started = false;
             let mut thinking_started = false;
             let mut tool_indices: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            let mut reasoning_detail_buffers: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
             let is_reasoning_model = is_reasoning_model_for_stream(api_provider, &model);
 
             let mut byte_stream = std::pin::pin!(byte_stream);
@@ -421,6 +459,7 @@ impl DeepSeekClient {
                                 &mut text_started,
                                 &mut thinking_started,
                                 &mut tool_indices,
+                                &mut reasoning_detail_buffers,
                                 is_reasoning_model,
                             ) {
                                 SseDataFrame::Done => break 'stream,
@@ -447,7 +486,7 @@ impl DeepSeekClient {
                         continue;
                     }
 
-                    if let Some(data) = line.strip_prefix("data: ") {
+                    if let Some(data) = super::extract_sse_data_value(&line) {
                         line_buf.push_str(data);
                     }
                     // Ignore other SSE fields (event:, id:, retry:)
@@ -559,6 +598,9 @@ impl<'a> PromptBuilder<'a> {
         );
         if provider == ApiProvider::Arcee {
             apply_arcee_waf_safe_message_encoding(&mut messages);
+        }
+        if provider == ApiProvider::Minimax {
+            mirror_minimax_reasoning_details_for_messages(&mut messages);
         }
         messages
     }
@@ -1425,7 +1467,7 @@ fn build_chat_messages_with_reasoning(
                         },
                     }));
                 }
-                ContentBlock::Thinking { thinking } => thinking_parts.push(thinking.clone()),
+                ContentBlock::Thinking { thinking, .. } => thinking_parts.push(thinking.clone()),
                 ContentBlock::ToolUse {
                     id,
                     name,
@@ -1953,7 +1995,23 @@ fn should_replay_reasoning_content_for_provider(
     model: &str,
     effort: Option<&str>,
 ) -> bool {
-    if !provider_accepts_reasoning_content(provider) && !requires_reasoning_content(model) {
+    if effort
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "off" | "disabled" | "none" | "false"
+            )
+        })
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    if requires_reasoning_content(model) {
+        return true;
+    }
+
+    if !provider_accepts_reasoning_content(provider) {
         // Generic non-DeepSeek model on a provider that rejects the field:
         // keep stripping it (preserves the #1542 fix). But a known DeepSeek
         // reasoning model pointed at a DeepSeek-compatible endpoint via the
@@ -1961,7 +2019,8 @@ fn should_replay_reasoning_content_for_provider(
         // or the thinking-mode API returns 400 (#1739 / #1694).
         return false;
     }
-    should_replay_reasoning_content(model, effort)
+
+    model_supports_reasoning(model)
 }
 
 /// Should the SSE parser treat incoming `reasoning_content` deltas as thinking
@@ -2005,7 +2064,10 @@ fn provider_accepts_reasoning_content(provider: ApiProvider) -> bool {
             | ApiProvider::SiliconflowCn
             | ApiProvider::Volcengine
             | ApiProvider::Arcee
+            | ApiProvider::Minimax
             | ApiProvider::Sglang
+            | ApiProvider::Zai
+            | ApiProvider::Moonshot // #3016: Kimi thinking traces use reasoning_content
     )
 }
 
@@ -2019,11 +2081,54 @@ fn has_deepseek_r_series_marker(model_lower: &str) -> bool {
     })
 }
 
-fn reasoning_field(value: &Value) -> Option<&str> {
-    value
+fn reasoning_delta(
+    value: &Value,
+    choice_index: u32,
+    reasoning_detail_buffers: &mut std::collections::HashMap<u32, String>,
+) -> Option<String> {
+    if let Some(reasoning) = value
         .get("reasoning_content")
         .or_else(|| value.get("reasoning"))
         .and_then(Value::as_str)
+    {
+        return Some(reasoning.to_string());
+    }
+
+    let details = value.get("reasoning_details").and_then(Value::as_array)?;
+    let full_text = details
+        .iter()
+        .filter_map(|detail| detail.get("text").and_then(Value::as_str))
+        .collect::<String>();
+    if full_text.is_empty() {
+        return None;
+    }
+
+    let previous = reasoning_detail_buffers.entry(choice_index).or_default();
+    let delta = full_text
+        .strip_prefix(previous.as_str())
+        .unwrap_or(&full_text)
+        .to_string();
+    *previous = full_text;
+    Some(delta)
+}
+
+fn reasoning_message_text(value: &Value) -> Option<String> {
+    if let Some(reasoning) = value
+        .get("reasoning_content")
+        .or_else(|| value.get("reasoning"))
+        .and_then(Value::as_str)
+    {
+        return Some(reasoning.to_string());
+    }
+    value
+        .get("reasoning_details")
+        .and_then(Value::as_array)
+        .map(|details| {
+            details
+                .iter()
+                .filter_map(|detail| detail.get("text").and_then(Value::as_str))
+                .collect::<String>()
+        })
 }
 
 pub(super) fn parse_chat_message(payload: &Value) -> Result<MessageResponse> {
@@ -2051,9 +2156,10 @@ pub(super) fn parse_chat_message(payload: &Value) -> Result<MessageResponse> {
 
     let mut content_blocks = Vec::new();
     if let Some(reasoning) =
-        reasoning_field(message).filter(|reasoning| !reasoning.trim().is_empty())
+        reasoning_message_text(message).filter(|reasoning| !reasoning.trim().is_empty())
     {
         content_blocks.push(ContentBlock::Thinking {
+            signature: None,
             thinking: reasoning.to_string(),
         });
     }
@@ -2152,7 +2258,7 @@ fn build_stream_events(response: &MessageResponse) -> Vec<StreamEvent> {
                 }
                 events.push(StreamEvent::ContentBlockStop { index });
             }
-            ContentBlock::Thinking { thinking } => {
+            ContentBlock::Thinking { thinking, .. } => {
                 events.push(StreamEvent::ContentBlockStart {
                     index,
                     content_block: ContentBlockStart::Thinking {
@@ -2227,6 +2333,7 @@ fn parse_sse_data_frame(
     text_started: &mut bool,
     thinking_started: &mut bool,
     tool_indices: &mut std::collections::HashMap<u32, u32>,
+    reasoning_detail_buffers: &mut std::collections::HashMap<u32, String>,
     is_reasoning_model: bool,
 ) -> SseDataFrame {
     if data.trim() == "[DONE]" {
@@ -2241,6 +2348,7 @@ fn parse_sse_data_frame(
                 text_started,
                 thinking_started,
                 tool_indices,
+                reasoning_detail_buffers,
                 is_reasoning_model,
             )
         },
@@ -2256,6 +2364,7 @@ pub(super) fn parse_sse_chunk(
     text_started: &mut bool,
     thinking_started: &mut bool,
     tool_indices: &mut std::collections::HashMap<u32, u32>,
+    reasoning_detail_buffers: &mut std::collections::HashMap<u32, String>,
     is_reasoning_model: bool,
 ) -> Vec<StreamEvent> {
     let mut events = Vec::new();
@@ -2290,6 +2399,7 @@ pub(super) fn parse_sse_chunk(
     }
 
     for choice in choices {
+        let choice_index = choice.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
         let delta = choice.get("delta");
         let finish_reason = choice
             .get("finish_reason")
@@ -2297,14 +2407,16 @@ pub(super) fn parse_sse_chunk(
             .map(str::to_string);
 
         if let Some(delta) = delta {
-            let reasoning_text = reasoning_field(delta).filter(|s| !s.is_empty());
+            let reasoning_text = reasoning_delta(delta, choice_index, reasoning_detail_buffers)
+                .filter(|s| !s.is_empty());
             let content_text = delta
                 .get("content")
                 .and_then(Value::as_str)
-                .filter(|s| !s.is_empty());
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
 
             // Handle reasoning_content / reasoning thinking deltas.
-            if is_reasoning_model && let Some(reasoning) = reasoning_text {
+            if is_reasoning_model && let Some(reasoning) = reasoning_text.as_deref() {
                 if !*thinking_started {
                     events.push(StreamEvent::ContentBlockStart {
                         index: *content_index,
@@ -2353,9 +2465,7 @@ pub(super) fn parse_sse_chunk(
                 }
                 events.push(StreamEvent::ContentBlockDelta {
                     index: *content_index,
-                    delta: Delta::TextDelta {
-                        text: content.to_string(),
-                    },
+                    delta: Delta::TextDelta { text: content },
                 });
             }
 
@@ -2667,6 +2777,69 @@ mod arcee_waf_message_encoding_tests {
     }
 }
 
+#[cfg(test)]
+mod minimax_reasoning_replay_tests {
+    use super::build_chat_messages_for_request_and_provider;
+    use crate::config::{ApiProvider, DEFAULT_MINIMAX_MODEL};
+    use crate::models::{ContentBlock, Message, MessageRequest};
+
+    fn request_with_assistant_thinking() -> MessageRequest {
+        MessageRequest {
+            model: DEFAULT_MINIMAX_MODEL.to_string(),
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "Inspect tool state".to_string(),
+                        signature: None,
+                    },
+                    ContentBlock::Text {
+                        text: "Done.".to_string(),
+                        cache_control: None,
+                    },
+                ],
+            }],
+            max_tokens: 16,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: None,
+            stream: None,
+            temperature: None,
+            top_p: None,
+        }
+    }
+
+    #[test]
+    fn minimax_history_replays_thinking_as_reasoning_details() {
+        let request = request_with_assistant_thinking();
+
+        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Minimax);
+        let assistant = &messages[0];
+
+        assert_eq!(
+            assistant
+                .get("reasoning_content")
+                .and_then(|value| value.as_str()),
+            Some("Inspect tool state")
+        );
+        assert_eq!(
+            assistant
+                .pointer("/reasoning_details/0/type")
+                .and_then(|value| value.as_str()),
+            Some("text")
+        );
+        assert_eq!(
+            assistant
+                .pointer("/reasoning_details/0/text")
+                .and_then(|value| value.as_str()),
+            Some("Inspect tool state")
+        );
+    }
+}
+
 // === #103 Phase 4: SSE decoder behavior on canned chunk sequences ============
 
 #[cfg(test)]
@@ -2691,12 +2864,14 @@ mod stream_decoder_tests {
         let mut text_started = false;
         let mut thinking_started = false;
         let mut tool_indices = std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
         parse_sse_chunk(
             &chunk,
             &mut content_index,
             &mut text_started,
             &mut thinking_started,
             &mut tool_indices,
+            &mut reasoning_detail_buffers,
             is_reasoning_model,
         )
     }
@@ -2756,6 +2931,78 @@ mod stream_decoder_tests {
     }
 
     #[test]
+    fn decoder_streams_moonshot_multi_chunk_reasoning_as_thinking() {
+        // #3016: recorded shape from Moonshot's native endpoint — kimi-k2.6
+        // streams `reasoning_content` deltas before the answer text. The
+        // thinking deltas must accumulate into ONE thinking block and the
+        // answer must arrive as text, not be glued into the trace.
+        let chunks = [
+            r#"{"id":"cmpl-kimi","model":"kimi-k2.6","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let me check"}}]}"#,
+            r#"{"id":"cmpl-kimi","model":"kimi-k2.6","choices":[{"index":0,"delta":{"reasoning_content":" the config."}}]}"#,
+            r#"{"id":"cmpl-kimi","model":"kimi-k2.6","choices":[{"index":0,"delta":{"content":"The answer is 42."}}]}"#,
+        ];
+
+        let is_reasoning =
+            is_reasoning_model_for_stream(crate::config::ApiProvider::Moonshot, "kimi-k2.6");
+        let mut content_index = 0u32;
+        let mut text_started = false;
+        let mut thinking_started = false;
+        let mut tool_indices = std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
+        let mut events = Vec::new();
+        for chunk in chunks {
+            let value: Value = serde_json::from_str(chunk).expect("valid SSE JSON");
+            events.extend(parse_sse_chunk(
+                &value,
+                &mut content_index,
+                &mut text_started,
+                &mut thinking_started,
+                &mut tool_indices,
+                &mut reasoning_detail_buffers,
+                is_reasoning,
+            ));
+        }
+
+        let thinking: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockDelta {
+                    delta: Delta::ThinkingDelta { thinking },
+                    ..
+                } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, "Let me check the config.");
+
+        let thinking_starts = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    StreamEvent::ContentBlockStart {
+                        content_block: ContentBlockStart::Thinking { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(thinking_starts, 1, "one thinking block: {events:?}");
+
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockDelta {
+                    delta: Delta::TextDelta { text },
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "The answer is 42.");
+    }
+
+    #[test]
     fn decoder_accepts_openrouter_reasoning_delta_with_extra_fields() {
         let events = decode_chunk(
             r#"{"id":"or-1","choices":[{"delta":{"reasoning":"openrouter thought","reasoning_details":[{"type":"summary","text":"extra"}],"native_finish_reason":null}}],"usage":{"completion_tokens_details":{"reasoning_tokens":3}}}"#,
@@ -2774,11 +3021,64 @@ mod stream_decoder_tests {
     }
 
     #[test]
+    fn decoder_streams_minimax_reasoning_details_as_incremental_thinking() {
+        // MiniMax's reasoning_split stream reports reasoning_details text as
+        // a cumulative buffer. Emit only the suffix so the Thinking cell does
+        // not duplicate earlier reasoning chunks.
+        let chunks = [
+            r#"{"id":"minimax-1","choices":[{"index":0,"delta":{"reasoning_details":[{"type":"text","text":"Inspect"}]}}]}"#,
+            r#"{"id":"minimax-1","choices":[{"index":0,"delta":{"reasoning_details":[{"type":"text","text":"Inspect config"}]}}]}"#,
+            r#"{"id":"minimax-1","choices":[{"index":0,"delta":{"content":"Done."}}]}"#,
+        ];
+
+        let is_reasoning = is_reasoning_model_for_stream(ApiProvider::Minimax, "MiniMax-M3");
+        let mut content_index = 0u32;
+        let mut text_started = false;
+        let mut thinking_started = false;
+        let mut tool_indices = std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
+        let mut events = Vec::new();
+        for chunk in chunks {
+            let value: Value = serde_json::from_str(chunk).expect("valid SSE JSON");
+            events.extend(parse_sse_chunk(
+                &value,
+                &mut content_index,
+                &mut text_started,
+                &mut thinking_started,
+                &mut tool_indices,
+                &mut reasoning_detail_buffers,
+                is_reasoning,
+            ));
+        }
+
+        let thinking: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockDelta {
+                    delta: Delta::ThinkingDelta { thinking },
+                    ..
+                } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, "Inspect config");
+
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta {
+                delta: Delta::TextDelta { text },
+                ..
+            } if text == "Inspect" || text == "Inspect config"
+        )));
+    }
+
+    #[test]
     fn decoder_does_not_render_reasoning_as_text_for_known_provider_models() {
         let mut content_index = 0u32;
         let mut text_started = false;
         let mut thinking_started = false;
         let mut tool_indices = std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
         let is_reasoning_model =
             is_reasoning_model_for_stream(ApiProvider::XiaomiMimo, "mimo-v2.5-pro");
         let events = parse_sse_chunk(
@@ -2793,6 +3093,7 @@ mod stream_decoder_tests {
             &mut text_started,
             &mut thinking_started,
             &mut tool_indices,
+            &mut reasoning_detail_buffers,
             is_reasoning_model,
         );
 
@@ -2870,6 +3171,7 @@ mod stream_decoder_tests {
         let mut text_started = false;
         let mut thinking_started = false;
         let mut tool_indices = std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
 
         let outcome = parse_sse_data_frame(
             "  [DONE]  ",
@@ -2877,6 +3179,7 @@ mod stream_decoder_tests {
             &mut text_started,
             &mut thinking_started,
             &mut tool_indices,
+            &mut reasoning_detail_buffers,
             true,
         );
 
@@ -3659,6 +3962,53 @@ mod alias_thinking_detection_tests {
         assert!(provider_accepts_reasoning_content(ApiProvider::NvidiaNim));
         assert!(provider_accepts_reasoning_content(ApiProvider::XiaomiMimo));
         assert!(provider_accepts_reasoning_content(ApiProvider::Arcee));
+        assert!(provider_accepts_reasoning_content(ApiProvider::Minimax));
+        assert!(provider_accepts_reasoning_content(ApiProvider::Zai));
+        // #3016: Moonshot's native endpoint streams Kimi thinking as
+        // reasoning_content.
+        assert!(provider_accepts_reasoning_content(ApiProvider::Moonshot));
+    }
+
+    #[test]
+    fn stream_classifies_moonshot_kimi_as_reasoning() {
+        // #3016: without this, Kimi thinking leaked into answer text.
+        assert!(is_reasoning_model_for_stream(
+            ApiProvider::Moonshot,
+            "kimi-k2.6"
+        ));
+        assert!(
+            is_reasoning_model_for_stream(ApiProvider::Moonshot, "kimi-for-coding"),
+            "Kimi Code's stable model id now maps to K2.7 Code and streams reasoning_content"
+        );
+    }
+
+    #[test]
+    fn moonshot_and_minimax_replay_reasoning_content_for_supported_models() {
+        assert!(should_replay_reasoning_content_for_provider(
+            ApiProvider::Moonshot,
+            "kimi-k2.7-code",
+            None,
+        ));
+        assert!(should_replay_reasoning_content_for_provider(
+            ApiProvider::Moonshot,
+            "kimi-for-coding",
+            None,
+        ));
+        assert!(should_replay_reasoning_content_for_provider(
+            ApiProvider::Minimax,
+            "MiniMax-M3",
+            None,
+        ));
+        assert!(should_replay_reasoning_content_for_provider(
+            ApiProvider::Zai,
+            "GLM-5.2",
+            None,
+        ));
+        assert!(!should_replay_reasoning_content_for_provider(
+            ApiProvider::Moonshot,
+            "kimi-for-coding",
+            Some("off"),
+        ));
     }
 
     #[test]
@@ -3762,6 +4112,10 @@ mod alias_thinking_detection_tests {
         assert!(
             is_reasoning_model_for_stream(ApiProvider::Arcee, "trinity-large-thinking"),
             "trinity-large-thinking should stream reasoning as thinking on direct Arcee"
+        );
+        assert!(
+            is_reasoning_model_for_stream(ApiProvider::Zai, "GLM-5.2"),
+            "GLM-5.2 should stream reasoning_content as thinking on direct Z.ai"
         );
         for model in [
             "arcee-ai/trinity-large-thinking",

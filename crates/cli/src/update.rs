@@ -17,6 +17,7 @@ use codewhale_release::{
 };
 use reqwest::Proxy;
 use std::io::Write;
+use std::time::Duration;
 
 /// Run the self-update workflow.
 pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Result<()> {
@@ -28,6 +29,10 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
 
     let current_exe =
         std::env::current_exe().context("failed to determine current executable path")?;
+    if is_legacy_binary(&current_exe) {
+        bail!("{}", legacy_binary_message(&current_exe));
+    }
+
     let targets = update_targets_for_exe(&current_exe);
     let channel = ReleaseChannel::from_beta_flag(beta);
     let current_version = env!("CARGO_PKG_VERSION");
@@ -187,12 +192,55 @@ pub(crate) fn release_arch_for_rust_arch(arch: &str) -> &str {
     }
 }
 
+/// Returns true when the binary name belongs to the pre-rebrand `deepseek-tui` era.
+pub(crate) fn is_legacy_binary(current_exe: &Path) -> bool {
+    let exe_name = current_exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    exe_name.starts_with("deepseek")
+}
+
+fn legacy_binary_message(current_exe: &Path) -> String {
+    format!(
+        "\
+this binary ({exe}) is using the legacy deepseek/deepseek-tui command name.
+
+The package has been renamed to `codewhale`. Self-update cannot continue from
+the old binary name, but DeepSeek provider support is unchanged.
+
+Reinstall using your original install method:
+
+  npm:
+    npm uninstall -g deepseek-tui
+    npm install -g codewhale
+
+  Cargo:
+    cargo uninstall deepseek-tui-cli 2>/dev/null || true
+    cargo uninstall deepseek-tui 2>/dev/null || true
+    cargo install codewhale-cli --locked
+    cargo install codewhale-tui --locked
+
+  Homebrew:
+    brew upgrade deepseek-tui
+
+  Manual binary:
+    download the matched codewhale and codewhale-tui assets from
+    https://github.com/Hmbown/CodeWhale/releases/latest
+
+Once `codewhale` is on your PATH, run `codewhale update` for future updates.",
+        exe = current_exe.display(),
+    )
+}
+
 pub(crate) fn binary_prefix_for_exe(current_exe: &Path) -> &'static str {
     let exe_name = current_exe
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("codewhale");
-    if exe_name.contains("codewhale-tui") {
+        .unwrap_or("codewhale")
+        .to_ascii_lowercase();
+    if exe_name.contains("codewhale-tui") || exe_name.contains("deepseek-tui") {
         "codewhale-tui"
     } else {
         "codewhale"
@@ -367,6 +415,7 @@ fn update_http_client(proxy: Option<&Proxy>) -> Result<reqwest::blocking::Client
     }
     builder
         .user_agent(UPDATE_USER_AGENT)
+        .timeout(Duration::from_secs(5 * 60))
         .build()
         .context("failed to build update HTTP client")
 }
@@ -620,6 +669,10 @@ mod tests {
             "codewhale-tui"
         );
         assert_eq!(
+            binary_prefix_for_exe(Path::new("CodeWhale-TUI.exe")),
+            "codewhale-tui"
+        );
+        assert_eq!(
             binary_prefix_for_exe(Path::new("/usr/local/bin/codewhale-tui")),
             "codewhale-tui"
         );
@@ -640,6 +693,50 @@ mod tests {
             binary_prefix_for_exe(Path::new("other-binary")),
             "codewhale"
         );
+
+        // Legacy names still map to the canonical update asset prefixes.
+        assert_eq!(
+            binary_prefix_for_exe(Path::new("deepseek-tui")),
+            "codewhale-tui"
+        );
+        assert_eq!(
+            binary_prefix_for_exe(Path::new("/usr/local/bin/deepseek-tui")),
+            "codewhale-tui"
+        );
+        assert_eq!(
+            binary_prefix_for_exe(Path::new("DeepSeek-TUI.exe")),
+            "codewhale-tui"
+        );
+        assert_eq!(binary_prefix_for_exe(Path::new("deepseek")), "codewhale");
+    }
+
+    #[test]
+    fn test_is_legacy_binary_detection() {
+        assert!(is_legacy_binary(Path::new("deepseek")));
+        assert!(is_legacy_binary(Path::new("deepseek-tui")));
+        assert!(is_legacy_binary(Path::new("/usr/local/bin/deepseek")));
+        assert!(is_legacy_binary(Path::new("/usr/local/bin/deepseek-tui")));
+        assert!(is_legacy_binary(Path::new("DeepSeek.exe")));
+        assert!(is_legacy_binary(Path::new("DeepSeek-TUI.exe")));
+        assert!(!is_legacy_binary(Path::new("codewhale")));
+        assert!(!is_legacy_binary(Path::new("codewhale-tui")));
+        assert!(!is_legacy_binary(Path::new("codew")));
+    }
+
+    #[test]
+    fn legacy_binary_message_gives_copy_pasteable_migration_steps() {
+        let message = legacy_binary_message(Path::new("/usr/local/bin/deepseek-tui"));
+
+        assert!(message.contains("legacy deepseek/deepseek-tui command name"));
+        assert!(message.contains("DeepSeek provider support is unchanged"));
+        assert!(message.contains("npm uninstall -g deepseek-tui"));
+        assert!(message.contains("npm install -g codewhale"));
+        assert!(message.contains("cargo uninstall deepseek-tui-cli 2>/dev/null || true"));
+        assert!(message.contains("cargo uninstall deepseek-tui 2>/dev/null || true"));
+        assert!(message.contains("cargo install codewhale-cli --locked"));
+        assert!(message.contains("cargo install codewhale-tui --locked"));
+        assert!(message.contains("brew upgrade deepseek-tui"));
+        assert!(message.contains("https://github.com/Hmbown/CodeWhale/releases/latest"));
     }
 
     #[test]

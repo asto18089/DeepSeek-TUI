@@ -16,7 +16,7 @@ fn assert_workflow_trace_schema(conn: &Connection) {
     let user_version: u32 = conn
         .query_row("PRAGMA user_version;", [], |row| row.get(0))
         .expect("read user_version");
-    assert_eq!(user_version, 2);
+    assert_eq!(user_version, 3);
 
     for table in [
         "workflow_runs",
@@ -24,6 +24,7 @@ fn assert_workflow_trace_schema(conn: &Connection) {
         "leaf_runs",
         "control_node_runs",
         "teacher_candidates",
+        "thread_goals",
     ] {
         let exists: bool = conn
             .query_row(

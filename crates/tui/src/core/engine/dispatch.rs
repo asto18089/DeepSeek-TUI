@@ -47,6 +47,7 @@ pub(super) struct ToolExecutionPlan {
     pub(super) approval_description: String,
     pub(super) supports_parallel: bool,
     pub(super) read_only: bool,
+    pub(super) detached_start: bool,
     pub(super) blocked_error: Option<ToolError>,
     pub(super) guard_result: Option<ToolResult>,
 }
@@ -99,6 +100,15 @@ pub(super) fn caller_allowed_for_tool(
     requested == "direct"
 }
 
+/// Whole-word check for "mode"/"modes" — a plain `contains("mode")` also
+/// matched "model", letting provider model errors skip the actionable-hint
+/// suffix (#3020).
+fn mentions_mode_word(lower: &str) -> bool {
+    lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|word| word == "mode" || word == "modes")
+}
+
 pub(super) fn format_tool_error(err: &ToolError, tool_name: &str) -> String {
     match err {
         ToolError::InvalidInput { message } => {
@@ -117,7 +127,16 @@ pub(super) fn format_tool_error(err: &ToolError, tool_name: &str) -> String {
         ),
         ToolError::NotAvailable { message } => {
             let lower = message.to_ascii_lowercase();
-            if lower.contains("current tool catalog") || lower.contains("did you mean:") {
+            // #3020: Pass through self-explanatory messages that already name the
+            // cause (mode switch, allow_shell, feature flag).  Avoids appending a
+            // conflicting "Check mode, feature flags" suffix on top of
+            // "switch to Agent or YOLO mode" which already gives the recovery path.
+            if lower.contains("current tool catalog")
+                || lower.contains("did you mean:")
+                || mentions_mode_word(&lower)
+                || lower.contains("allow_shell")
+                || lower.contains("feature flag")
+            {
                 message.clone()
             } else {
                 format!(
@@ -125,9 +144,20 @@ pub(super) fn format_tool_error(err: &ToolError, tool_name: &str) -> String {
                 )
             }
         }
-        ToolError::PermissionDenied { message } => format!(
-            "Tool '{tool_name}' was denied: {message}. Adjust approval mode or request permission."
-        ),
+        ToolError::PermissionDenied { message } => {
+            let lower = message.to_ascii_lowercase();
+            // #3020: Pass through messages that already name the denial cause.
+            if mentions_mode_word(&lower)
+                || lower.contains("allow_shell")
+                || lower.contains("denied by user")
+            {
+                message.clone()
+            } else {
+                format!(
+                    "Tool '{tool_name}' was denied: {message}. Adjust approval mode or request permission."
+                )
+            }
+        }
     }
 }
 
@@ -312,11 +342,17 @@ pub(super) fn parse_parallel_tool_calls(
 
 #[cfg(test)]
 pub(super) fn should_parallelize_tool_batch(plans: &[ToolExecutionPlan]) -> bool {
-    !plans.is_empty() && plans.iter().all(tool_plan_is_parallel_safe)
+    !plans.is_empty() && plans.iter().all(tool_plan_can_join_parallel_batch)
 }
 
 pub(super) fn tool_plan_is_parallel_safe(plan: &ToolExecutionPlan) -> bool {
     plan.read_only && plan.supports_parallel && !plan.approval_required && !plan.interactive
+}
+
+pub(super) fn tool_plan_can_join_parallel_batch(plan: &ToolExecutionPlan) -> bool {
+    plan.blocked_error.is_none()
+        && (tool_plan_is_parallel_safe(plan)
+            || (plan.detached_start && !plan.approval_required && !plan.interactive))
 }
 
 pub(super) fn plan_tool_execution_batches(
@@ -326,7 +362,7 @@ pub(super) fn plan_tool_execution_batches(
     let mut parallel_chunk = Vec::new();
 
     for plan in plans {
-        if tool_plan_is_parallel_safe(&plan) {
+        if tool_plan_can_join_parallel_batch(&plan) {
             parallel_chunk.push(plan);
             continue;
         }

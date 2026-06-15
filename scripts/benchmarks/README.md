@@ -17,6 +17,11 @@ export DEEPSEEK_API_KEY="sk-..."
 ./scripts/benchmarks/run-terminal-bench.sh \
   --model deepseek/deepseek-chat
 
+# CodeWhale vs Codex comparison rows
+python scripts/benchmarks/cli-compare.py \
+  --task prove-plus-comm \
+  --model deepseek/deepseek-chat
+
 # PinchBench (auto-install + run)
 ./scripts/benchmarks/run-pinchbench.sh \
   --install \
@@ -28,8 +33,10 @@ export DEEPSEEK_API_KEY="sk-..."
 - `run-swebench.sh` — SWE-bench batch driver and evaluator
 - `run-terminal-bench.sh` — Terminal-Bench runner via Harbor
 - `run-pinchbench.sh` — PinchBench runner with auto-install
+- `cli-compare.py` — CodeWhale/Codex Terminal-Bench comparison harness
 - `harbor/__init__.py` — Harbor adapter for CodeWhale (Python)
 - `harbor/codewhale_agent.py` — Adapter entry point
+- `harbor/codex_agent.py` — Codex adapter for paired CLI comparisons
 
 ## Documentation
 

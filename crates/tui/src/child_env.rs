@@ -35,6 +35,8 @@ where
             value.as_ref().to_os_string(),
         );
     }
+    #[cfg(windows)]
+    fill_windows_common_program_files(&mut env);
     env
 }
 
@@ -184,6 +186,9 @@ fn is_allowed_parent_env_key(key: &OsStr) -> bool {
             | "PROGRAMFILES"
             | "PROGRAMFILES(X86)"
             | "PROGRAMW6432"
+            | "COMMONPROGRAMFILES"
+            | "COMMONPROGRAMFILES(X86)"
+            | "COMMONPROGRAMW6432"
             | "PROCESSOR_ARCHITECTURE"
             | "NUGET_PACKAGES"
             | "NUGET_HTTP_CACHE_PATH"
@@ -264,6 +269,26 @@ fn upsert_env(env: &mut Vec<(OsString, OsString)>, key: OsString, value: OsStrin
     let normalized = normalize_key(&key);
     env.retain(|(existing, _)| normalize_key(existing) != normalized);
     env.push((key, value));
+}
+
+#[cfg(any(windows, test))]
+fn fill_windows_common_program_files(env: &mut Vec<(OsString, OsString)>) {
+    for (key, default) in [
+        ("CommonProgramFiles", r"C:\Program Files\Common Files"),
+        (
+            "CommonProgramFiles(x86)",
+            r"C:\Program Files (x86)\Common Files",
+        ),
+        ("CommonProgramW6432", r"C:\Program Files\Common Files"),
+    ] {
+        let existing = env
+            .iter()
+            .find(|(existing, _)| normalize_key(existing) == normalize_key(OsStr::new(key)))
+            .map(|(_, value)| value.to_string_lossy().trim().is_empty());
+        if existing.unwrap_or(true) {
+            upsert_env(env, OsString::from(key), OsString::from(default));
+        }
+    }
 }
 
 fn normalize_key(key: &OsStr) -> String {
@@ -387,6 +412,9 @@ mod tests {
             "PROGRAMFILES",
             "PROGRAMFILES(X86)",
             "PROGRAMW6432",
+            "COMMONPROGRAMFILES",
+            "COMMONPROGRAMFILES(X86)",
+            "COMMONPROGRAMW6432",
             "PROCESSOR_ARCHITECTURE",
             "NUGET_PACKAGES",
             "DOTNET_ROOT",
@@ -405,6 +433,41 @@ mod tests {
         assert!(
             !is_allowed_parent_env_key(OsStr::new("NuGetPackageSourceCredentials_feed")),
             "NuGet credential vars must not be exported to child processes"
+        );
+    }
+
+    #[test]
+    fn windows_common_program_files_defaults_replace_empty_values() {
+        let mut env = vec![
+            (OsString::from("CommonProgramFiles"), OsString::new()),
+            (
+                OsString::from("CommonProgramFiles(x86)"),
+                OsString::from(" "),
+            ),
+            (
+                OsString::from("CommonProgramW6432"),
+                OsString::from(r"D:\Common Files"),
+            ),
+        ];
+
+        fill_windows_common_program_files(&mut env);
+
+        let get = |name: &str| {
+            env.iter()
+                .find(|(key, _)| normalize_key(key) == normalize_key(OsStr::new(name)))
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            get("CommonProgramFiles").as_deref(),
+            Some(r"C:\Program Files\Common Files")
+        );
+        assert_eq!(
+            get("CommonProgramFiles(x86)").as_deref(),
+            Some(r"C:\Program Files (x86)\Common Files")
+        );
+        assert_eq!(
+            get("CommonProgramW6432").as_deref(),
+            Some(r"D:\Common Files")
         );
     }
 

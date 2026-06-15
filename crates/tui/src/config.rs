@@ -20,6 +20,11 @@ use crate::hooks::HooksConfig;
 
 pub const DEFAULT_MAX_SUBAGENTS: usize = 10;
 pub const MAX_SUBAGENTS: usize = 20;
+/// Default number of direct (depth-1) sub-agents that may execute
+/// concurrently in an interactive session before further launches queue
+/// for a slot (#3095). Deliberately lower than `DEFAULT_MAX_SUBAGENTS`,
+/// which caps total live agents across the whole spawn tree.
+pub const DEFAULT_INTERACTIVE_LAUNCH_LIMIT: usize = 4;
 /// Default per-step DeepSeek API timeout for sub-agent requests, in seconds.
 /// Matches the legacy hardcoded value so existing configs keep their old
 /// behavior when `[subagents] api_timeout_secs` is unset (#1806, #1808).
@@ -66,6 +71,8 @@ pub const OPENROUTER_ARCEE_TRINITY_LARGE_THINKING_MODEL: &str = "arcee-ai/trinit
 pub const OPENROUTER_GEMMA_4_31B_MODEL: &str = "google/gemma-4-31b-it";
 pub const OPENROUTER_GEMMA_4_26B_A4B_MODEL: &str = "google/gemma-4-26b-a4b-it";
 pub const OPENROUTER_GLM_5_1_MODEL: &str = "z-ai/glm-5.1";
+pub const OPENROUTER_GLM_5_2_MODEL: &str = "z-ai/glm-5.2";
+pub const OPENROUTER_KIMI_K2_7_CODE_MODEL: &str = "moonshotai/kimi-k2.7-code";
 pub const OPENROUTER_KIMI_K2_6_MODEL: &str = "moonshotai/kimi-k2.6";
 pub const OPENROUTER_MINIMAX_M3_MODEL: &str = "minimax/minimax-m3";
 pub const OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL: &str =
@@ -77,7 +84,7 @@ pub const OPENROUTER_QWEN_3_6_27B_MODEL: &str = "qwen/qwen3.6-27b";
 pub const OPENROUTER_QWEN_3_6_PLUS_MODEL: &str = "qwen/qwen3.6-plus";
 pub const OPENROUTER_QWEN_3_7_MAX_MODEL: &str = "qwen/qwen3.7-max";
 pub const OPENROUTER_MINIMAX_2_7_MODEL: &str = "minimax/minimax-2.7";
-pub const OPENROUTER_NEMOTRON_3_ULTRA_MODEL: &str = "nvidia/nemotron-3-ultra";
+pub const OPENROUTER_NEMOTRON_3_ULTRA_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b";
 pub const OPENROUTER_TENCENT_HY3_PREVIEW_MODEL: &str = "tencent/hy3-preview";
 pub const OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL: &str = "xiaomi/mimo-v2.5-pro";
 pub const OPENROUTER_XIAOMI_MIMO_V2_5_MODEL: &str = "xiaomi/mimo-v2.5";
@@ -94,8 +101,10 @@ pub const RECENT_OPENROUTER_LARGE_MODELS: &[&str] = &[
     OPENROUTER_QWEN_3_7_MAX_MODEL,
     OPENROUTER_MINIMAX_2_7_MODEL,
     OPENROUTER_NEMOTRON_3_ULTRA_MODEL,
+    OPENROUTER_KIMI_K2_7_CODE_MODEL,
     OPENROUTER_KIMI_K2_6_MODEL,
     OPENROUTER_GLM_5_1_MODEL,
+    OPENROUTER_GLM_5_2_MODEL,
     OPENROUTER_TENCENT_HY3_PREVIEW_MODEL,
     OPENROUTER_GEMMA_4_31B_MODEL,
     OPENROUTER_GEMMA_4_26B_A4B_MODEL,
@@ -127,7 +136,8 @@ pub const DEFAULT_ARCEE_MODEL: &str = "trinity-large-thinking";
 pub const ARCEE_TRINITY_LARGE_PREVIEW_MODEL: &str = "trinity-large-preview";
 pub const ARCEE_TRINITY_MINI_MODEL: &str = "trinity-mini";
 pub const DEFAULT_ARCEE_BASE_URL: &str = "https://api.arcee.ai/api/v1";
-pub const DEFAULT_MOONSHOT_MODEL: &str = "kimi-k2.6";
+pub const DEFAULT_MOONSHOT_MODEL: &str = "kimi-k2.7-code";
+pub const MOONSHOT_KIMI_K2_6_MODEL: &str = "kimi-k2.6";
 pub const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 pub const DEFAULT_KIMI_CODE_MODEL: &str = "kimi-for-coding";
 pub const DEFAULT_KIMI_CODE_BASE_URL: &str = "https://api.kimi.com/coding/v1";
@@ -146,6 +156,7 @@ pub const DEFAULT_TOGETHER_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
 pub const DEFAULT_OPENAI_CODEX_MODEL: &str = "gpt-5.5";
 pub const DEFAULT_OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
+pub const OPENAI_CODEX_EFFECTIVE_CONTEXT_WINDOW_TOKENS: u32 = 400_000;
 /// Legacy `deepseek-cn` provider alias.
 ///
 /// DeepSeek's official API host is the same worldwide. Keep this alias for
@@ -163,6 +174,24 @@ pub const COMMON_DEEPSEEK_MODELS: &[&str] = &[
     "deepseek/deepseek-v4-flash",
 ];
 pub const OFFICIAL_DEEPSEEK_MODELS: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash"];
+pub const DEFAULT_ZAI_MODEL: &str = "GLM-5.1";
+pub const ZAI_GLM_5_2_MODEL: &str = "GLM-5.2";
+pub const DEFAULT_ZAI_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
+pub const DEFAULT_STEPFUN_MODEL: &str = "step-3.7-flash";
+pub const DEFAULT_STEPFUN_BASE_URL: &str = "https://api.stepfun.ai/v1";
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
+pub const ANTHROPIC_OPUS_MODEL: &str = "claude-opus-4-8";
+pub const ANTHROPIC_HAIKU_MODEL: &str = "claude-haiku-4-5";
+pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+pub const DEFAULT_MINIMAX_MODEL: &str = "MiniMax-M3";
+pub const MINIMAX_M2_7_MODEL: &str = "MiniMax-M2.7";
+pub const MINIMAX_M2_7_HIGHSPEED_MODEL: &str = "MiniMax-M2.7-highspeed";
+pub const MINIMAX_M2_5_MODEL: &str = "MiniMax-M2.5";
+pub const MINIMAX_M2_5_HIGHSPEED_MODEL: &str = "MiniMax-M2.5-highspeed";
+pub const MINIMAX_M2_1_MODEL: &str = "MiniMax-M2.1";
+pub const MINIMAX_M2_1_HIGHSPEED_MODEL: &str = "MiniMax-M2.1-highspeed";
+pub const MINIMAX_M2_MODEL: &str = "MiniMax-M2";
+pub const DEFAULT_MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -188,6 +217,10 @@ pub enum ApiProvider {
     Huggingface,
     Together,
     OpenaiCodex,
+    Anthropic,
+    Zai,
+    Stepfun,
+    Minimax,
 }
 
 impl ApiProvider {
@@ -207,122 +240,111 @@ impl ApiProvider {
 
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "deepseek" | "deep-seek" => Some(Self::Deepseek),
-            "deepseek-cn" | "deepseek_china" | "deepseekcn" | "deepseek-china" => {
-                Some(Self::DeepseekCN)
-            }
-            "nvidia" | "nvidia-nim" | "nvidia_nim" | "nim" => Some(Self::NvidiaNim),
-            "openai" | "open-ai" => Some(Self::Openai),
-            "atlascloud" | "atlas-cloud" | "atlas_cloud" | "atlas" => Some(Self::Atlascloud),
-            "wanjie" | "wanjie-ark" | "wanjie_ark" | "ark-wanjie" | "ark_wanjie" | "wanjieark"
-            | "wanjie-maas" | "wanjie_maas" | "wanjiemaas" => Some(Self::WanjieArk),
-            "volcengine" | "volcengine-ark" | "volcengine_ark" | "ark" | "volc-ark"
-            | "volcengineark" => Some(Self::Volcengine),
-            "openrouter" | "open_router" => Some(Self::Openrouter),
-            "xiaomi-mimo" | "xiaomi_mimo" | "xiaomimimo" | "mimo" | "xiaomi" => {
-                Some(Self::XiaomiMimo)
-            }
-            "novita" => Some(Self::Novita),
-            "fireworks" | "fireworks-ai" => Some(Self::Fireworks),
-            "siliconflow" | "silicon-flow" | "silicon_flow" => Some(Self::Siliconflow),
-            "siliconflow-cn" | "siliconflow-CN" | "silicon-flow-cn" | "silicon-flow-CN"
-            | "silicon_flow_cn" | "silicon_flow_CN" | "siliconflow-china" => {
-                Some(Self::SiliconflowCn)
-            }
-            "arcee" | "arcee-ai" | "arcee_ai" => Some(Self::Arcee),
-            "moonshot" | "moonshot-ai" | "kimi" | "kimi-k2" => Some(Self::Moonshot),
-            "sglang" | "sg-lang" => Some(Self::Sglang),
-            "vllm" | "v-llm" => Some(Self::Vllm),
-            "ollama" | "ollama-local" => Some(Self::Ollama),
-            "huggingface" | "hugging-face" | "hugging_face" | "hf" => Some(Self::Huggingface),
-            "together" | "together-ai" | "together_ai" => Some(Self::Together),
-            "openai-codex" | "openai_codex" | "openaicodex" | "codex" | "chatgpt"
-            | "chatgpt-codex" | "chatgpt_codex" | "chatgptcodex" => Some(Self::OpenaiCodex),
-            _ => None,
+        let trimmed = value.trim();
+        // ApiProvider-specific: "deepseek-cn" is a legacy variant here,
+        // while ProviderKind treats it as a Deepseek alias.
+        if trimmed.eq_ignore_ascii_case("deepseek-cn")
+            || trimmed.eq_ignore_ascii_case("deepseek_china")
+            || trimmed.eq_ignore_ascii_case("deepseekcn")
+            || trimmed.eq_ignore_ascii_case("deepseek-china")
+        {
+            return Some(Self::DeepseekCN);
         }
+        codewhale_config::ProviderKind::parse(value).map(Self::from_kind)
     }
 
     #[must_use]
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Deepseek => "deepseek",
-            Self::DeepseekCN => "deepseek-cn",
-            Self::NvidiaNim => "nvidia-nim",
-            Self::Openai => "openai",
-            Self::Atlascloud => "atlascloud",
-            Self::WanjieArk => "wanjie-ark",
-            Self::Volcengine => "volcengine",
-            Self::Openrouter => "openrouter",
-            Self::XiaomiMimo => "xiaomi-mimo",
-            Self::Novita => "novita",
-            Self::Fireworks => "fireworks",
-            Self::Siliconflow => "siliconflow",
-            Self::SiliconflowCn => "siliconflow-CN",
-            Self::Arcee => "arcee",
-            Self::Moonshot => "moonshot",
-            Self::Sglang => "sglang",
-            Self::Vllm => "vllm",
-            Self::Ollama => "ollama",
-            Self::Huggingface => "huggingface",
-            Self::Together => "together",
-            Self::OpenaiCodex => "openai-codex",
+        match self.kind() {
+            Some(kind) => kind.as_str(),
+            None => "deepseek-cn",
         }
     }
 
     /// Human-friendly label for picker UIs / status chips.
     #[must_use]
     pub fn display_name(self) -> &'static str {
-        match self {
-            Self::Deepseek => "DeepSeek",
-            Self::DeepseekCN => "DeepSeek (legacy alias)",
-            Self::NvidiaNim => "NVIDIA NIM",
-            Self::Openai => "OpenAI-compatible",
-            Self::Atlascloud => "AtlasCloud",
-            Self::WanjieArk => "Wanjie Ark",
-            Self::Volcengine => "Volcengine Ark",
-            Self::Openrouter => "OpenRouter",
-            Self::XiaomiMimo => "Xiaomi MiMo",
-            Self::Novita => "Novita AI",
-            Self::Fireworks => "Fireworks AI",
-            Self::Siliconflow => "SiliconFlow",
-            Self::SiliconflowCn => "SiliconFlow (China)",
-            Self::Arcee => "Arcee AI",
-            Self::Moonshot => "Moonshot/Kimi",
-            Self::Sglang => "SGLang",
-            Self::Vllm => "vLLM",
-            Self::Ollama => "Ollama",
-            Self::Huggingface => "Hugging Face",
-            Self::Together => "Together AI",
-            Self::OpenaiCodex => "OpenAI Codex (ChatGPT)",
+        match self.kind() {
+            Some(kind) => kind.provider().display_name(),
+            None => "DeepSeek (legacy alias)",
         }
     }
 
     /// All providers, in the order shown in the picker.
     #[must_use]
     pub fn all() -> &'static [Self] {
-        &[
-            Self::Deepseek,
-            Self::NvidiaNim,
-            Self::Openai,
-            Self::Atlascloud,
-            Self::WanjieArk,
-            Self::Volcengine,
-            Self::Openrouter,
-            Self::XiaomiMimo,
-            Self::Novita,
-            Self::Fireworks,
-            Self::Siliconflow,
-            Self::SiliconflowCn,
-            Self::Arcee,
-            Self::Moonshot,
-            Self::Sglang,
-            Self::Vllm,
-            Self::Ollama,
-            Self::Huggingface,
-            Self::Together,
-            Self::OpenaiCodex,
-        ]
+        &Self::FROM_KIND_LOOKUP
+    }
+
+    /// `ApiProvider` discriminant → `ProviderKind` lookup.
+    /// Index 1 is `None` for the legacy `DeepseekCN` variant.
+    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 25] = [
+        Some(codewhale_config::ProviderKind::Deepseek),
+        None, // DeepseekCN
+        Some(codewhale_config::ProviderKind::NvidiaNim),
+        Some(codewhale_config::ProviderKind::Openai),
+        Some(codewhale_config::ProviderKind::Atlascloud),
+        Some(codewhale_config::ProviderKind::WanjieArk),
+        Some(codewhale_config::ProviderKind::Volcengine),
+        Some(codewhale_config::ProviderKind::Openrouter),
+        Some(codewhale_config::ProviderKind::XiaomiMimo),
+        Some(codewhale_config::ProviderKind::Novita),
+        Some(codewhale_config::ProviderKind::Fireworks),
+        Some(codewhale_config::ProviderKind::Siliconflow),
+        Some(codewhale_config::ProviderKind::SiliconflowCN),
+        Some(codewhale_config::ProviderKind::Arcee),
+        Some(codewhale_config::ProviderKind::Moonshot),
+        Some(codewhale_config::ProviderKind::Sglang),
+        Some(codewhale_config::ProviderKind::Vllm),
+        Some(codewhale_config::ProviderKind::Ollama),
+        Some(codewhale_config::ProviderKind::Huggingface),
+        Some(codewhale_config::ProviderKind::Together),
+        Some(codewhale_config::ProviderKind::OpenaiCodex),
+        Some(codewhale_config::ProviderKind::Anthropic),
+        Some(codewhale_config::ProviderKind::Zai),
+        Some(codewhale_config::ProviderKind::Stepfun),
+        Some(codewhale_config::ProviderKind::Minimax),
+    ];
+
+    /// `ProviderKind` discriminant → `ApiProvider` lookup.
+    const FROM_KIND_LOOKUP: [Self; 24] = [
+        Self::Deepseek,
+        Self::NvidiaNim,
+        Self::Openai,
+        Self::Atlascloud,
+        Self::WanjieArk,
+        Self::Volcengine,
+        Self::Openrouter,
+        Self::XiaomiMimo,
+        Self::Novita,
+        Self::Fireworks,
+        Self::Siliconflow,
+        Self::Arcee,
+        Self::SiliconflowCn,
+        Self::Moonshot,
+        Self::Sglang,
+        Self::Vllm,
+        Self::Ollama,
+        Self::Huggingface,
+        Self::Together,
+        Self::OpenaiCodex,
+        Self::Anthropic,
+        Self::Zai,
+        Self::Stepfun,
+        Self::Minimax,
+    ];
+
+    /// Map to the config-level `ProviderKind`.
+    /// Returns `None` for the legacy `DeepseekCN` variant.
+    #[must_use]
+    pub fn kind(self) -> Option<codewhale_config::ProviderKind> {
+        Self::KIND_LOOKUP[self as usize]
+    }
+
+    /// Construct from a config-level `ProviderKind`.
+    #[must_use]
+    pub fn from_kind(kind: codewhale_config::ProviderKind) -> Self {
+        Self::FROM_KIND_LOOKUP[kind as usize]
     }
 }
 
@@ -378,6 +400,10 @@ pub struct ModelAliasDeprecation {
 pub enum RequestPayloadMode {
     /// Standard OpenAI-compatible `/v1/chat/completions` payload.
     ChatCompletions,
+    /// OpenAI Responses API payload.
+    Responses,
+    /// Native Anthropic Messages API `/v1/messages` payload (#3014).
+    AnthropicMessages,
 }
 
 /// Resolve the provider capability for a given [`ApiProvider`] and resolved
@@ -387,22 +413,41 @@ pub enum RequestPayloadMode {
 /// in the API payload (after normalization / provider-specific mapping).
 #[must_use]
 pub fn provider_capability(provider: ApiProvider, resolved_model: &str) -> ProviderCapability {
-    if matches!(
-        provider,
-        ApiProvider::Openai | ApiProvider::Atlascloud | ApiProvider::Moonshot
-    ) {
+    if matches!(provider, ApiProvider::Anthropic) {
         return ProviderCapability {
             provider,
             resolved_model: resolved_model.to_string(),
-            context_window: crate::models::LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS,
-            max_output: 4096,
-            thinking_supported: false,
-            cache_telemetry_supported: false,
-            request_payload_mode: RequestPayloadMode::ChatCompletions,
+            // 200K is the conservative Anthropic floor; 4.6+ models resolve
+            // their 1M windows from models.rs rows (#3014).
+            context_window: crate::models::context_window_for_model(resolved_model)
+                .unwrap_or(200_000),
+            max_output: crate::models::max_output_tokens_for_model(resolved_model)
+                .unwrap_or(64_000),
+            thinking_supported: crate::models::model_supports_reasoning(resolved_model),
+            cache_telemetry_supported: true,
+            request_payload_mode: RequestPayloadMode::AnthropicMessages,
             alias_deprecation: None,
         };
     }
 
+    if matches!(provider, ApiProvider::OpenaiCodex) {
+        return ProviderCapability {
+            provider,
+            resolved_model: resolved_model.to_string(),
+            context_window: OPENAI_CODEX_EFFECTIVE_CONTEXT_WINDOW_TOKENS,
+            max_output: crate::models::max_output_tokens_for_model(resolved_model).unwrap_or(4096),
+            thinking_supported: true,
+            cache_telemetry_supported: false,
+            request_payload_mode: RequestPayloadMode::Responses,
+            alias_deprecation: None,
+        };
+    }
+
+    // #3023: Delete the Openai/Atlascloud/Moonshot early-return so these
+    // providers use the generic model-based path below, which correctly
+    // resolves context windows, output limits, and thinking support from
+    // models.rs lookups.  Ollama also falls through to model-based lookups
+    // with 8192 as the last-resort fallback instead of a hardcoded floor.
     if matches!(provider, ApiProvider::XiaomiMimo) {
         return ProviderCapability {
             provider,
@@ -411,19 +456,6 @@ pub fn provider_capability(provider: ApiProvider, resolved_model: &str) -> Provi
                 .unwrap_or(crate::models::LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS),
             max_output: crate::models::max_output_tokens_for_model(resolved_model).unwrap_or(4096),
             thinking_supported: crate::models::model_supports_reasoning(resolved_model),
-            cache_telemetry_supported: false,
-            request_payload_mode: RequestPayloadMode::ChatCompletions,
-            alias_deprecation: None,
-        };
-    }
-
-    if matches!(provider, ApiProvider::Ollama) {
-        return ProviderCapability {
-            provider,
-            resolved_model: resolved_model.to_string(),
-            context_window: 8192,
-            max_output: 4096,
-            thinking_supported: false,
             cache_telemetry_supported: false,
             request_payload_mode: RequestPayloadMode::ChatCompletions,
             alias_deprecation: None,
@@ -459,12 +491,16 @@ pub fn provider_capability(provider: ApiProvider, resolved_model: &str) -> Provi
         && (model_lower.contains("reasoner") || model_lower.contains("r1"));
 
     // Context window: V4-class models get 1M, everything else falls through
-    // to the model's own lookup or a default.
+    // to the model's own lookup or a default.  Ollama defaults to 8192
+    // (conservative for small local models) instead of 128K.
     let context_window = if is_v4_pro || is_v4_flash {
         crate::models::DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS
+    } else if let Some(window) = crate::models::context_window_for_model(resolved_model) {
+        window
+    } else if matches!(provider, ApiProvider::Ollama) {
+        8192
     } else {
-        crate::models::context_window_for_model(resolved_model)
-            .unwrap_or(crate::models::LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS)
+        crate::models::LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS
     };
 
     // Max output tokens: official DeepSeek V4 API metadata lists 384K;
@@ -575,6 +611,19 @@ pub(crate) fn normalize_custom_model_id(model: &str) -> Option<String> {
     }
 }
 
+/// Validate a user-requested model id against the active provider (#3018).
+///
+/// DeepSeek providers use the strict `normalize_model_name` gate (official
+/// API only accepts DeepSeek IDs).  All other providers pass any non-empty,
+/// non-control-character string through — the provider API is the authority.
+#[must_use]
+pub fn requested_model_for_provider(provider: ApiProvider, model: &str) -> Option<String> {
+    match provider {
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN => normalize_model_name(model),
+        _ => normalize_custom_model_id(model),
+    }
+}
+
 fn canonical_official_deepseek_model_id(model: &str) -> Option<&'static str> {
     match model.trim().to_ascii_lowercase().as_str() {
         "deepseek-v4-pro"
@@ -611,15 +660,41 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
         OPENROUTER_GLM_5_1_MODEL | "glm-5.1" | "glm-5-1" | "zai-glm-5.1" | "zai-glm-5-1" => {
             Some(OPENROUTER_GLM_5_1_MODEL)
         }
+        OPENROUTER_GLM_5_2_MODEL | "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => {
+            Some(OPENROUTER_GLM_5_2_MODEL)
+        }
+        OPENROUTER_KIMI_K2_7_CODE_MODEL
+        | "kimi"
+        | "kimi-k2"
+        | "kimi-k2.7"
+        | "kimi-k2-7"
+        | "kimi-k2.7-code"
+        | "kimi-k2-7-code"
+        | "kimi-code"
+        | "moonshot-kimi-k2.7-code"
+        | "openrouter-kimi-k2.7-code" => Some(OPENROUTER_KIMI_K2_7_CODE_MODEL),
         OPENROUTER_KIMI_K2_6_MODEL | "kimi-k2.6" | "kimi-k2-6" | "moonshot-kimi-k2.6" => {
             Some(OPENROUTER_KIMI_K2_6_MODEL)
         }
         OPENROUTER_MINIMAX_M3_MODEL | "minimax-m3" | "minimax-m-3" => {
             Some(OPENROUTER_MINIMAX_M3_MODEL)
         }
+        OPENROUTER_MINIMAX_2_7_MODEL
+        | "minimax-2.7"
+        | "minimax-2-7"
+        | "minimax-m2.7"
+        | "minimax-m2-7"
+        | "minimax-m-2.7"
+        | "minimax-m-2-7" => Some(OPENROUTER_MINIMAX_2_7_MODEL),
         OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL
         | "nemotron-3-nano-omni"
         | "nemotron-3-nano-omni-reasoning" => Some(OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL),
+        OPENROUTER_NEMOTRON_3_ULTRA_MODEL
+        | "nvidia/nemotron-3-ultra"
+        | "nemotron-3-ultra"
+        | "nemotron-3-ultra-550b-a55b"
+        | "nvidia-nemotron-3-ultra"
+        | "nvidia-nemotron-3-ultra-550b-a55b" => Some(OPENROUTER_NEMOTRON_3_ULTRA_MODEL),
         OPENROUTER_QWEN_3_6_35B_A3B_MODEL
         | "qwen3.6-35b-a3b"
         | "qwen-3.6-35b-a3b"
@@ -718,6 +793,66 @@ fn canonical_arcee_model_id(model: &str) -> Option<&'static str> {
     }
 }
 
+fn canonical_moonshot_model_id(model: &str) -> Option<&'static str> {
+    let normalized = model.trim().to_ascii_lowercase();
+    let normalized = normalized.replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "kimi"
+        | "kimi-k2"
+        | "kimi-k2.7"
+        | "kimi-k2-7"
+        | "kimi-k2.7-code"
+        | "kimi-k2-7-code"
+        | "kimi-code"
+        | "moonshot-kimi-k2.7-code" => Some(DEFAULT_MOONSHOT_MODEL),
+        "kimi-k2.6" | "kimi-k2-6" | "moonshot-kimi-k2.6" => Some(MOONSHOT_KIMI_K2_6_MODEL),
+        _ => None,
+    }
+}
+
+fn canonical_zai_model_id(model: &str) -> Option<&'static str> {
+    let normalized = model.trim().to_ascii_lowercase();
+    let normalized = normalized.replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "glm-5.1" | "glm-5-1" | "zai-glm-5.1" | "zai-glm-5-1" => Some(DEFAULT_ZAI_MODEL),
+        "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => Some(ZAI_GLM_5_2_MODEL),
+        _ => None,
+    }
+}
+
+fn canonical_minimax_model_id(model: &str) -> Option<&'static str> {
+    let normalized = model.trim().to_ascii_lowercase();
+    let normalized = normalized.replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "minimax" | "minimax-m3" | "minimax-m-3" | "minimax-m-3-thinking" => {
+            Some(DEFAULT_MINIMAX_MODEL)
+        }
+        "minimax-m2.7" | "minimax-m2-7" | "minimax-m-2.7" | "minimax-m-2-7" => {
+            Some(MINIMAX_M2_7_MODEL)
+        }
+        "minimax-m2.7-highspeed"
+        | "minimax-m2-7-highspeed"
+        | "minimax-m-2.7-highspeed"
+        | "minimax-m-2-7-highspeed" => Some(MINIMAX_M2_7_HIGHSPEED_MODEL),
+        "minimax-m2.5" | "minimax-m2-5" | "minimax-m-2.5" | "minimax-m-2-5" => {
+            Some(MINIMAX_M2_5_MODEL)
+        }
+        "minimax-m2.5-highspeed"
+        | "minimax-m2-5-highspeed"
+        | "minimax-m-2.5-highspeed"
+        | "minimax-m-2-5-highspeed" => Some(MINIMAX_M2_5_HIGHSPEED_MODEL),
+        "minimax-m2.1" | "minimax-m2-1" | "minimax-m-2.1" | "minimax-m-2-1" => {
+            Some(MINIMAX_M2_1_MODEL)
+        }
+        "minimax-m2.1-highspeed"
+        | "minimax-m2-1-highspeed"
+        | "minimax-m-2.1-highspeed"
+        | "minimax-m-2-1-highspeed" => Some(MINIMAX_M2_1_HIGHSPEED_MODEL),
+        "minimax-m2" | "minimax-m-2" => Some(MINIMAX_M2_MODEL),
+        _ => None,
+    }
+}
+
 /// Normalize a model selected through the TUI for the active provider.
 ///
 /// Official DeepSeek endpoints require bare model IDs. Provider-prefixed
@@ -744,6 +879,24 @@ pub fn normalize_model_name_for_provider(provider: ApiProvider, model: &str) -> 
 
     if matches!(provider, ApiProvider::Arcee) {
         return canonical_arcee_model_id(model)
+            .map(ToString::to_string)
+            .or_else(|| normalize_custom_model_id(model));
+    }
+
+    if matches!(provider, ApiProvider::Moonshot) {
+        return canonical_moonshot_model_id(model)
+            .map(ToString::to_string)
+            .or_else(|| normalize_custom_model_id(model));
+    }
+
+    if matches!(provider, ApiProvider::Zai) {
+        return canonical_zai_model_id(model)
+            .map(ToString::to_string)
+            .or_else(|| normalize_custom_model_id(model));
+    }
+
+    if matches!(provider, ApiProvider::Minimax) {
+        return canonical_minimax_model_id(model)
             .map(ToString::to_string)
             .or_else(|| normalize_custom_model_id(model));
     }
@@ -826,6 +979,23 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
         ApiProvider::Openai | ApiProvider::Atlascloud => OFFICIAL_DEEPSEEK_MODELS.to_vec(),
         ApiProvider::Together => vec![DEFAULT_TOGETHER_MODEL],
         ApiProvider::OpenaiCodex => vec![DEFAULT_OPENAI_CODEX_MODEL],
+        ApiProvider::Zai => vec![DEFAULT_ZAI_MODEL, ZAI_GLM_5_2_MODEL],
+        ApiProvider::Stepfun => vec![DEFAULT_STEPFUN_MODEL],
+        ApiProvider::Anthropic => vec![
+            ANTHROPIC_OPUS_MODEL,
+            DEFAULT_ANTHROPIC_MODEL,
+            ANTHROPIC_HAIKU_MODEL,
+        ],
+        ApiProvider::Minimax => vec![
+            DEFAULT_MINIMAX_MODEL,
+            MINIMAX_M2_7_MODEL,
+            MINIMAX_M2_7_HIGHSPEED_MODEL,
+            MINIMAX_M2_5_MODEL,
+            MINIMAX_M2_5_HIGHSPEED_MODEL,
+            MINIMAX_M2_1_MODEL,
+            MINIMAX_M2_1_HIGHSPEED_MODEL,
+            MINIMAX_M2_MODEL,
+        ],
     }
 }
 
@@ -1508,6 +1678,12 @@ pub struct SubagentsConfig {
     /// setting. Clamped to [1, MAX_SUBAGENTS].
     #[serde(default)]
     pub max_concurrent: Option<usize>,
+    /// Number of direct (depth-1) sub-agents that may execute concurrently
+    /// before further interactive fanout launches queue for a slot (#3095).
+    /// Defaults to `DEFAULT_INTERACTIVE_LAUNCH_LIMIT` (4) and is clamped to
+    /// [1, max_subagents].
+    #[serde(default)]
+    pub interactive_max_launch: Option<usize>,
     /// Per-step DeepSeek API timeout for sub-agent requests, in seconds. The
     /// timeout wraps `client.create_message` so a stuck single step cannot
     /// pin the parent's parent-completion wakeup channel indefinitely.
@@ -1611,7 +1787,10 @@ pub struct Config {
     pub prompt_suggestion: Option<bool>,
     pub approval_policy: Option<String>,
     pub sandbox_mode: Option<String>,
+    #[serde(default)]
+    pub fallback_providers: Vec<codewhale_config::ProviderKind>,
     pub yolo: Option<bool>,
+    pub verbosity: Option<String>,
     /// External sandbox backend: `"none"` or `"opensandbox"`.
     /// When set, exec_shell routes commands through the backend's HTTP API
     /// instead of spawning a local process.
@@ -1685,8 +1864,8 @@ pub struct Config {
     #[serde(default)]
     pub auto: Option<AutoConfig>,
 
-    /// Optional 1-8 hotbar slot bindings (#2064). When absent, future hotbar
-    /// UI slices use the built-in defaults from `codewhale_config`.
+    /// Optional 1-8 hotbar slot bindings (#2064). When absent, hotbar UI and
+    /// dispatch layers use the built-in defaults from `codewhale_config`.
     #[serde(default)]
     pub hotbar: Option<Vec<codewhale_config::HotbarBindingToml>>,
 
@@ -1703,6 +1882,10 @@ pub struct Config {
     /// Append-only layered context management with Flash seam manager (#159).
     #[serde(default)]
     pub context: ContextConfig,
+
+    /// Agent Fleet trust/security/role/exec config.
+    #[serde(default)]
+    pub fleet: Option<codewhale_config::FleetConfigToml>,
 
     /// Sub-agent model overrides.
     #[serde(default)]
@@ -1953,6 +2136,8 @@ pub struct ProvidersConfig {
     pub fireworks: ProviderConfig,
     #[serde(default)]
     pub siliconflow: ProviderConfig,
+    #[serde(default, alias = "siliconflow-CN", alias = "siliconflow-cn")]
+    pub siliconflow_cn: ProviderConfig,
     #[serde(default)]
     pub arcee: ProviderConfig,
     #[serde(default)]
@@ -1969,6 +2154,14 @@ pub struct ProvidersConfig {
     pub together: ProviderConfig,
     #[serde(default, alias = "openai-codex", alias = "codex", alias = "chatgpt")]
     pub openai_codex: ProviderConfig,
+    #[serde(default, alias = "claude")]
+    pub anthropic: ProviderConfig,
+    #[serde(default)]
+    pub zai: ProviderConfig,
+    #[serde(default)]
+    pub stepfun: ProviderConfig,
+    #[serde(default)]
+    pub minimax: ProviderConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -2123,7 +2316,8 @@ impl Config {
             ApiProvider::XiaomiMimo => "providers.xiaomi_mimo",
             ApiProvider::Novita => "providers.novita",
             ApiProvider::Fireworks => "providers.fireworks",
-            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => "providers.siliconflow",
+            ApiProvider::Siliconflow => "providers.siliconflow",
+            ApiProvider::SiliconflowCn => "providers.siliconflow_cn",
             ApiProvider::Arcee => "providers.arcee",
             ApiProvider::Moonshot => "providers.moonshot",
             ApiProvider::Sglang => "providers.sglang",
@@ -2134,6 +2328,10 @@ impl Config {
             ApiProvider::NvidiaNim => "providers.nvidia_nim",
             ApiProvider::Together => "providers.together",
             ApiProvider::OpenaiCodex => "providers.openai_codex",
+            ApiProvider::Anthropic => "providers.anthropic",
+            ApiProvider::Zai => "providers.zai",
+            ApiProvider::Stepfun => "providers.stepfun",
+            ApiProvider::Minimax => "providers.minimax",
             ApiProvider::Deepseek | ApiProvider::DeepseekCN => return,
         };
         tracing::warn!(
@@ -2184,6 +2382,12 @@ impl Config {
                 anyhow::bail!(
                     "Invalid approval_policy '{policy}': expected on-request, untrusted, never, auto, or suggest."
                 );
+            }
+        }
+        if let Some(v) = self.verbosity.as_deref() {
+            let normalized = v.trim().to_ascii_lowercase();
+            if !matches!(normalized.as_str(), "normal" | "concise") {
+                anyhow::bail!("Invalid verbosity '{v}': expected normal or concise.");
             }
         }
         if let Some(mode) = self.sandbox_mode.as_deref() {
@@ -2273,7 +2477,8 @@ impl Config {
             ApiProvider::XiaomiMimo => &providers.xiaomi_mimo,
             ApiProvider::Novita => &providers.novita,
             ApiProvider::Fireworks => &providers.fireworks,
-            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => &providers.siliconflow,
+            ApiProvider::Siliconflow => &providers.siliconflow,
+            ApiProvider::SiliconflowCn => &providers.siliconflow_cn,
             ApiProvider::Arcee => &providers.arcee,
             ApiProvider::Moonshot => &providers.moonshot,
             ApiProvider::Sglang => &providers.sglang,
@@ -2283,6 +2488,10 @@ impl Config {
             ApiProvider::Huggingface => &providers.huggingface,
             ApiProvider::Together => &providers.together,
             ApiProvider::OpenaiCodex => &providers.openai_codex,
+            ApiProvider::Anthropic => &providers.anthropic,
+            ApiProvider::Zai => &providers.zai,
+            ApiProvider::Stepfun => &providers.stepfun,
+            ApiProvider::Minimax => &providers.minimax,
         })
     }
 
@@ -2299,7 +2508,8 @@ impl Config {
             ApiProvider::XiaomiMimo => &mut providers.xiaomi_mimo,
             ApiProvider::Novita => &mut providers.novita,
             ApiProvider::Fireworks => &mut providers.fireworks,
-            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => &mut providers.siliconflow,
+            ApiProvider::Siliconflow => &mut providers.siliconflow,
+            ApiProvider::SiliconflowCn => &mut providers.siliconflow_cn,
             ApiProvider::Arcee => &mut providers.arcee,
             ApiProvider::Moonshot => &mut providers.moonshot,
             ApiProvider::Sglang => &mut providers.sglang,
@@ -2309,11 +2519,34 @@ impl Config {
             ApiProvider::Huggingface => &mut providers.huggingface,
             ApiProvider::Together => &mut providers.together,
             ApiProvider::OpenaiCodex => &mut providers.openai_codex,
+            ApiProvider::Anthropic => &mut providers.anthropic,
+            ApiProvider::Zai => &mut providers.zai,
+            ApiProvider::Stepfun => &mut providers.stepfun,
+            ApiProvider::Minimax => &mut providers.minimax,
         }
     }
 
     pub(crate) fn provider_config(&self) -> Option<&ProviderConfig> {
         self.provider_config_for(self.api_provider())
+    }
+
+    fn provider_config_string_with_runtime_fallback<F>(
+        &self,
+        provider: ApiProvider,
+        get: F,
+    ) -> Option<String>
+    where
+        F: Fn(&ProviderConfig) -> Option<String>,
+    {
+        if let Some(value) = self.provider_config_for(provider).and_then(&get) {
+            return Some(value);
+        }
+        if provider == ApiProvider::SiliconflowCn {
+            return self
+                .provider_config_for(ApiProvider::Siliconflow)
+                .and_then(get);
+        }
+        None
     }
 
     #[must_use]
@@ -2339,14 +2572,14 @@ impl Config {
     #[must_use]
     pub fn default_model(&self) -> String {
         let provider = self.api_provider();
-        if let Some(model) = self
-            .provider_config()
-            .and_then(|provider| provider.model.as_deref())
+        if let Some(model) =
+            self.provider_config_string_with_runtime_fallback(provider, |entry| entry.model.clone())
         {
+            let model = model.trim();
             if provider_passes_model_through(provider)
                 || self.active_provider_preserves_custom_base_url_model()
             {
-                return model.trim().to_string();
+                return model.to_string();
             }
             if let Some(normalized) = normalize_model_for_provider(provider, model) {
                 return normalized;
@@ -2356,11 +2589,10 @@ impl Config {
             // provider (e.g. `MiniMax-M2.7` on an OpenAI-compatible endpoint).
             // It must pass through verbatim rather than fall back to a
             // DeepSeek/provider default (issue #1714).
-            if !matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
-                let trimmed = model.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_string();
-                }
+            if !matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
+                && !model.is_empty()
+            {
+                return model.to_string();
             }
         }
         // The Codex Responses backend only serves its own model family, and a
@@ -2407,6 +2639,7 @@ impl Config {
             return model.trim().to_string();
         }
         if let Some(model) = self.default_text_model.as_deref()
+            && !root_deepseek_model_is_foreign_to_direct_provider(provider, model)
             && let Some(normalized) = normalize_model_name_for_provider(provider, model)
         {
             return normalized;
@@ -2432,6 +2665,10 @@ impl Config {
             ApiProvider::Huggingface => DEFAULT_HUGGINGFACE_MODEL,
             ApiProvider::Together => DEFAULT_TOGETHER_MODEL,
             ApiProvider::OpenaiCodex => DEFAULT_OPENAI_CODEX_MODEL,
+            ApiProvider::Zai => DEFAULT_ZAI_MODEL,
+            ApiProvider::Stepfun => DEFAULT_STEPFUN_MODEL,
+            ApiProvider::Anthropic => DEFAULT_ANTHROPIC_MODEL,
+            ApiProvider::Minimax => DEFAULT_MINIMAX_MODEL,
         }
         .to_string()
     }
@@ -2441,8 +2678,7 @@ impl Config {
     pub fn deepseek_base_url(&self) -> String {
         let provider = self.api_provider();
         let provider_base = self
-            .provider_config_for(provider)
-            .and_then(|provider| provider.base_url.clone());
+            .provider_config_string_with_runtime_fallback(provider, |entry| entry.base_url.clone());
         // Root `base_url` is the legacy DeepSeek field; only NvidiaNim has a
         // back-compat sniff (integrate.api.nvidia.com). OpenRouter / Novita
         // were added in v0.6.7 and require explicit `[providers.<name>]`
@@ -2455,6 +2691,7 @@ impl Config {
                 .filter(|base| base.contains("integrate.api.nvidia.com"))
                 .cloned(),
             ApiProvider::Openai
+            | ApiProvider::Anthropic
             | ApiProvider::Atlascloud
             | ApiProvider::WanjieArk
             | ApiProvider::Openrouter
@@ -2471,7 +2708,10 @@ impl Config {
             | ApiProvider::Volcengine
             | ApiProvider::Huggingface
             | ApiProvider::Together
-            | ApiProvider::OpenaiCodex => None,
+            | ApiProvider::OpenaiCodex
+            | ApiProvider::Zai
+            | ApiProvider::Stepfun
+            | ApiProvider::Minimax => None,
         };
         let configured_base_url = provider_base.or(root_base);
         let base = if provider == ApiProvider::XiaomiMimo {
@@ -2518,6 +2758,10 @@ impl Config {
                     ApiProvider::Huggingface => DEFAULT_HUGGINGFACE_BASE_URL,
                     ApiProvider::Together => DEFAULT_TOGETHER_BASE_URL,
                     ApiProvider::OpenaiCodex => DEFAULT_OPENAI_CODEX_BASE_URL,
+                    ApiProvider::Zai => DEFAULT_ZAI_BASE_URL,
+                    ApiProvider::Stepfun => DEFAULT_STEPFUN_BASE_URL,
+                    ApiProvider::Anthropic => DEFAULT_ANTHROPIC_BASE_URL,
+                    ApiProvider::Minimax => DEFAULT_MINIMAX_BASE_URL,
                 }
                 .to_string()
             })
@@ -2567,6 +2811,10 @@ impl Config {
             ApiProvider::Huggingface => "huggingface",
             ApiProvider::Together => "together",
             ApiProvider::OpenaiCodex => "openai_codex",
+            ApiProvider::Zai => "zai",
+            ApiProvider::Stepfun => "stepfun",
+            ApiProvider::Anthropic => "anthropic",
+            ApiProvider::Minimax => "minimax",
         };
 
         // 0. DeepSeek compatibility slot. The legacy top-level `api_key`
@@ -2614,8 +2862,7 @@ impl Config {
         // 1. Config file (provider-scoped slot). This intentionally wins
         // over ambient env so `codewhale auth set` fixes stale shell exports.
         if let Some(configured) = self
-            .provider_config_for(provider)
-            .and_then(|provider| provider.api_key.clone())
+            .provider_config_string_with_runtime_fallback(provider, |entry| entry.api_key.clone())
             && !configured.trim().is_empty()
         {
             return Ok(configured);
@@ -2711,9 +2958,14 @@ impl Config {
                 "Fireworks AI API key not found. Run 'codewhale auth set --provider fireworks', \
                  set FIREWORKS_API_KEY, or add [providers.fireworks] api_key in ~/.codewhale/config.toml."
             ),
-            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => anyhow::bail!(
+            ApiProvider::Siliconflow => anyhow::bail!(
                 "SiliconFlow API key not found. Run 'codewhale auth set --provider siliconflow', \
                  set SILICONFLOW_API_KEY, or add [providers.siliconflow] api_key in ~/.codewhale/config.toml."
+            ),
+            ApiProvider::SiliconflowCn => anyhow::bail!(
+                "SiliconFlow China API key not found. Run 'codewhale auth set --provider siliconflow-CN', \
+                 set SILICONFLOW_API_KEY, or add [providers.siliconflow_cn] api_key in ~/.codewhale/config.toml. \
+                 [providers.siliconflow] remains a fallback when the CN table omits api_key."
             ),
             ApiProvider::Arcee => anyhow::bail!(
                 "Arcee AI API key not found. Run 'codewhale auth set --provider arcee', \
@@ -2733,6 +2985,19 @@ impl Config {
                 "Together AI API key not found. Run 'codewhale auth set --provider together', \
                  set TOGETHER_API_KEY, or add [providers.together] api_key in ~/.codewhale/config.toml."
             ),
+            ApiProvider::Zai => anyhow::bail!(
+                "Z.ai (GLM Coding) API key not found. Run 'codewhale auth set --provider zai', \
+                 set ZAI_API_KEY, or add [providers.zai] api_key in ~/.codewhale/config.toml."
+            ),
+            ApiProvider::Stepfun => anyhow::bail!(
+                "StepFun API key not found. Run 'codewhale auth set --provider stepfun', \
+                 set STEPFUN_API_KEY, or add [providers.stepfun] api_key in ~/.codewhale/config.toml."
+            ),
+            ApiProvider::Anthropic => anyhow::bail!(
+                "Anthropic API key not found. Run 'codewhale auth set --provider anthropic', \
+                 set ANTHROPIC_API_KEY, or add [providers.anthropic] api_key in ~/.codewhale/config.toml. \
+                 Keys are created at https://platform.claude.com/."
+            ),
             ApiProvider::OpenaiCodex => anyhow::bail!(
                 "OpenAI Codex OAuth credentials not found.\n\
                  \n\
@@ -2745,6 +3010,10 @@ impl Config {
             ),
             // Self-hosted deployments commonly run without auth on localhost.
             // Return an empty key and let the client omit the Authorization header.
+            ApiProvider::Minimax => anyhow::bail!(
+                "MiniMax API key not found. Run 'codewhale auth set --provider minimax', \
+                 set MINIMAX_API_KEY, or add [providers.minimax] api_key in ~/.codewhale/config.toml."
+            ),
             ApiProvider::Sglang | ApiProvider::Vllm | ApiProvider::Ollama => Ok(String::new()),
         }
     }
@@ -2880,6 +3149,20 @@ impl Config {
         self.max_subagents
             .unwrap_or(DEFAULT_MAX_SUBAGENTS)
             .clamp(1, MAX_SUBAGENTS)
+    }
+
+    /// Number of direct (depth-1) sub-agents that may execute concurrently
+    /// before further interactive fanout launches queue for a slot (#3095).
+    /// Reads `[subagents] interactive_max_launch`, defaults to
+    /// `DEFAULT_INTERACTIVE_LAUNCH_LIMIT`, and clamps to
+    /// `[1, max_subagents]`.
+    #[must_use]
+    pub fn interactive_launch_limit(&self) -> usize {
+        self.subagents
+            .as_ref()
+            .and_then(|cfg| cfg.interactive_max_launch)
+            .unwrap_or(DEFAULT_INTERACTIVE_LAUNCH_LIMIT)
+            .clamp(1, self.max_subagents())
     }
 
     /// Resolved per-step DeepSeek API timeout for sub-agents, in seconds.
@@ -3022,7 +3305,7 @@ impl Config {
         self.update.clone().unwrap_or_default()
     }
 
-    /// Resolve durable hotbar bindings for future render/dispatch layers.
+    /// Resolve durable hotbar bindings for render/dispatch layers.
     #[must_use]
     pub fn resolve_hotbar_bindings(
         &self,
@@ -3074,6 +3357,31 @@ impl Config {
             exponential_base: cfg.exponential_base.unwrap_or(defaults.exponential_base),
         }
     }
+}
+
+fn root_deepseek_model_is_foreign_to_direct_provider(provider: ApiProvider, model: &str) -> bool {
+    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
+        || provider_passes_model_through(provider)
+    {
+        return false;
+    }
+    if matches!(
+        provider,
+        ApiProvider::NvidiaNim
+            | ApiProvider::Openrouter
+            | ApiProvider::Novita
+            | ApiProvider::Fireworks
+            | ApiProvider::Siliconflow
+            | ApiProvider::SiliconflowCn
+            | ApiProvider::Sglang
+            | ApiProvider::Vllm
+            | ApiProvider::Volcengine
+            | ApiProvider::Atlascloud
+            | ApiProvider::WanjieArk
+    ) {
+        return false;
+    }
+    normalize_model_name(model).is_some()
 }
 
 // === Defaults ===
@@ -3444,6 +3752,13 @@ fn apply_env_overrides(config: &mut Config) {
                     .openai
                     .base_url = Some(value);
             }
+            ApiProvider::Anthropic => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .anthropic
+                    .base_url = Some(value);
+            }
             ApiProvider::Openrouter => {
                 config
                     .providers
@@ -3479,11 +3794,18 @@ fn apply_env_overrides(config: &mut Config) {
                     .fireworks
                     .base_url = Some(value);
             }
-            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => {
+            ApiProvider::Siliconflow => {
                 config
                     .providers
                     .get_or_insert_with(ProvidersConfig::default)
                     .siliconflow
+                    .base_url = Some(value);
+            }
+            ApiProvider::SiliconflowCn => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .siliconflow_cn
                     .base_url = Some(value);
             }
             ApiProvider::Arcee => {
@@ -3554,6 +3876,27 @@ fn apply_env_overrides(config: &mut Config) {
                     .providers
                     .get_or_insert_with(ProvidersConfig::default)
                     .openai_codex
+                    .base_url = Some(value);
+            }
+            ApiProvider::Zai => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .zai
+                    .base_url = Some(value);
+            }
+            ApiProvider::Stepfun => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .stepfun
+                    .base_url = Some(value);
+            }
+            ApiProvider::Minimax => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .minimax
                     .base_url = Some(value);
             }
         }
@@ -3667,17 +4010,14 @@ fn apply_env_overrides(config: &mut Config) {
             .fireworks
             .base_url = Some(value);
     }
+    let active_provider = config.api_provider();
     if matches!(
-        config.api_provider(),
+        active_provider,
         ApiProvider::Siliconflow | ApiProvider::SiliconflowCn
     ) && let Ok(value) = std::env::var("SILICONFLOW_BASE_URL")
         && !value.trim().is_empty()
     {
-        config
-            .providers
-            .get_or_insert_with(ProvidersConfig::default)
-            .siliconflow
-            .base_url = Some(value);
+        config.provider_config_for_mut(active_provider).base_url = Some(value);
     }
     if matches!(config.api_provider(), ApiProvider::Arcee)
         && let Ok(value) = std::env::var("ARCEE_BASE_URL")
@@ -3754,7 +4094,8 @@ fn apply_env_overrides(config: &mut Config) {
             ApiProvider::XiaomiMimo => &mut providers.xiaomi_mimo,
             ApiProvider::Novita => &mut providers.novita,
             ApiProvider::Fireworks => &mut providers.fireworks,
-            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => &mut providers.siliconflow,
+            ApiProvider::Siliconflow => &mut providers.siliconflow,
+            ApiProvider::SiliconflowCn => &mut providers.siliconflow_cn,
             ApiProvider::Arcee => &mut providers.arcee,
             ApiProvider::Moonshot => &mut providers.moonshot,
             ApiProvider::Sglang => &mut providers.sglang,
@@ -3764,6 +4105,10 @@ fn apply_env_overrides(config: &mut Config) {
             ApiProvider::Huggingface => &mut providers.huggingface,
             ApiProvider::Together => &mut providers.together,
             ApiProvider::OpenaiCodex => &mut providers.openai_codex,
+            ApiProvider::Anthropic => &mut providers.anthropic,
+            ApiProvider::Zai => &mut providers.zai,
+            ApiProvider::Stepfun => &mut providers.stepfun,
+            ApiProvider::Minimax => &mut providers.minimax,
         };
         let mut provider_headers = entry.http_headers.clone().unwrap_or_default();
         provider_headers.extend(headers);
@@ -3883,17 +4228,14 @@ fn apply_env_overrides(config: &mut Config) {
             .moonshot
             .model = Some(value);
     }
+    let active_provider = config.api_provider();
     if matches!(
-        config.api_provider(),
+        active_provider,
         ApiProvider::Siliconflow | ApiProvider::SiliconflowCn
     ) && let Ok(value) = std::env::var("SILICONFLOW_MODEL")
         && !value.trim().is_empty()
     {
-        config
-            .providers
-            .get_or_insert_with(ProvidersConfig::default)
-            .siliconflow
-            .model = Some(value);
+        config.provider_config_for_mut(active_provider).model = Some(value);
     }
     if matches!(config.api_provider(), ApiProvider::Arcee)
         && let Ok(value) = std::env::var("ARCEE_MODEL")
@@ -3950,7 +4292,8 @@ fn apply_env_overrides(config: &mut Config) {
                 ApiProvider::XiaomiMimo => &mut providers.xiaomi_mimo,
                 ApiProvider::Novita => &mut providers.novita,
                 ApiProvider::Fireworks => &mut providers.fireworks,
-                ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => &mut providers.siliconflow,
+                ApiProvider::Siliconflow => &mut providers.siliconflow,
+                ApiProvider::SiliconflowCn => &mut providers.siliconflow_cn,
                 ApiProvider::Arcee => &mut providers.arcee,
                 ApiProvider::Moonshot => &mut providers.moonshot,
                 ApiProvider::Sglang => &mut providers.sglang,
@@ -3960,6 +4303,10 @@ fn apply_env_overrides(config: &mut Config) {
                 ApiProvider::Huggingface => &mut providers.huggingface,
                 ApiProvider::Together => &mut providers.together,
                 ApiProvider::OpenaiCodex => &mut providers.openai_codex,
+                ApiProvider::Anthropic => &mut providers.anthropic,
+                ApiProvider::Zai => &mut providers.zai,
+                ApiProvider::Stepfun => &mut providers.stepfun,
+                ApiProvider::Minimax => &mut providers.minimax,
             };
             entry.model = Some(value);
         }
@@ -4002,6 +4349,11 @@ fn apply_env_overrides(config: &mut Config) {
     }
     if let Ok(value) = std::env::var("DEEPSEEK_YOLO") {
         config.yolo = Some(value == "1" || value.eq_ignore_ascii_case("true"));
+    }
+    if let Ok(value) =
+        std::env::var("CODEWHALE_VERBOSITY").or_else(|_| std::env::var("DEEPSEEK_VERBOSITY"))
+    {
+        config.verbosity = Some(value);
     }
     if let Ok(value) = std::env::var("DEEPSEEK_SANDBOX_BACKEND") {
         config.sandbox_backend = Some(value);
@@ -4207,6 +4559,16 @@ fn normalize_model_config(config: &mut Config) {
         {
             providers.siliconflow.model = Some(normalized);
         }
+        if let Some(model) = providers.siliconflow_cn.model.as_deref()
+            && !provider_entry_uses_custom_base_url(
+                ApiProvider::SiliconflowCn,
+                &providers.siliconflow_cn,
+            )
+            && let Some(normalized) =
+                normalize_model_for_provider(ApiProvider::SiliconflowCn, model)
+        {
+            providers.siliconflow_cn.model = Some(normalized);
+        }
         if let Some(model) = providers.moonshot.model.as_deref()
             && !provider_entry_uses_custom_base_url(ApiProvider::Moonshot, &providers.moonshot)
             && let Some(normalized) = normalize_model_for_provider(ApiProvider::Moonshot, model)
@@ -4284,6 +4646,10 @@ fn default_base_url_for_provider(provider: ApiProvider) -> &'static str {
         ApiProvider::Huggingface => DEFAULT_HUGGINGFACE_BASE_URL,
         ApiProvider::Together => DEFAULT_TOGETHER_BASE_URL,
         ApiProvider::OpenaiCodex => DEFAULT_OPENAI_CODEX_BASE_URL,
+        ApiProvider::Zai => DEFAULT_ZAI_BASE_URL,
+        ApiProvider::Stepfun => DEFAULT_STEPFUN_BASE_URL,
+        ApiProvider::Anthropic => DEFAULT_ANTHROPIC_BASE_URL,
+        ApiProvider::Minimax => DEFAULT_MINIMAX_BASE_URL,
     }
 }
 
@@ -4517,6 +4883,20 @@ fn model_for_provider(provider: ApiProvider, normalized: String) -> String {
         (ApiProvider::Sglang, "deepseek-v4-flash") => DEFAULT_SGLANG_FLASH_MODEL.to_string(),
         (ApiProvider::Vllm, "deepseek-v4-pro") => DEFAULT_VLLM_MODEL.to_string(),
         (ApiProvider::Vllm, "deepseek-v4-flash") => DEFAULT_VLLM_FLASH_MODEL.to_string(),
+        (
+            ApiProvider::Moonshot,
+            "kimi"
+            | "kimi-k2"
+            | "kimi-k2.7"
+            | "kimi-k2-7"
+            | "kimi-k2.7-code"
+            | "kimi-k2-7-code"
+            | "kimi-code"
+            | "moonshot-kimi-k2.7-code",
+        ) => DEFAULT_MOONSHOT_MODEL.to_string(),
+        (ApiProvider::Moonshot, "kimi-k2.6" | "kimi-k2-6" | "moonshot-kimi-k2.6") => {
+            MOONSHOT_KIMI_K2_6_MODEL.to_string()
+        }
         _ => normalized,
     }
 }
@@ -4604,8 +4984,14 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         allow_shell: override_cfg.allow_shell.or(base.allow_shell),
         prompt_suggestion: override_cfg.prompt_suggestion.or(base.prompt_suggestion),
         yolo: override_cfg.yolo.or(base.yolo),
+        verbosity: override_cfg.verbosity.or(base.verbosity),
         approval_policy: override_cfg.approval_policy.or(base.approval_policy),
         sandbox_mode: override_cfg.sandbox_mode.or(base.sandbox_mode),
+        fallback_providers: if override_cfg.fallback_providers.is_empty() {
+            base.fallback_providers
+        } else {
+            override_cfg.fallback_providers
+        },
         sandbox_backend: override_cfg.sandbox_backend.or(base.sandbox_backend),
         sandbox_url: override_cfg.sandbox_url.or(base.sandbox_url),
         sandbox_api_key: override_cfg.sandbox_api_key.or(base.sandbox_api_key),
@@ -4656,6 +5042,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
                 .or(base.context.l3_threshold),
             seam_model: override_cfg.context.seam_model.or(base.context.seam_model),
         },
+        fleet: override_cfg.fleet.or(base.fleet),
         subagents: override_cfg.subagents.or(base.subagents),
         strict_tool_mode: override_cfg.strict_tool_mode.or(base.strict_tool_mode),
         runtime_api: override_cfg.runtime_api.or(base.runtime_api),
@@ -4691,6 +5078,7 @@ fn merge_providers(
             deepseek_cn: merge_provider_config(base.deepseek_cn, override_cfg.deepseek_cn),
             nvidia_nim: merge_provider_config(base.nvidia_nim, override_cfg.nvidia_nim),
             openai: merge_provider_config(base.openai, override_cfg.openai),
+            anthropic: merge_provider_config(base.anthropic, override_cfg.anthropic),
             atlascloud: merge_provider_config(base.atlascloud, override_cfg.atlascloud),
             wanjie_ark: merge_provider_config(base.wanjie_ark, override_cfg.wanjie_ark),
             openrouter: merge_provider_config(base.openrouter, override_cfg.openrouter),
@@ -4698,6 +5086,7 @@ fn merge_providers(
             novita: merge_provider_config(base.novita, override_cfg.novita),
             fireworks: merge_provider_config(base.fireworks, override_cfg.fireworks),
             siliconflow: merge_provider_config(base.siliconflow, override_cfg.siliconflow),
+            siliconflow_cn: merge_provider_config(base.siliconflow_cn, override_cfg.siliconflow_cn),
             arcee: merge_provider_config(base.arcee, override_cfg.arcee),
             moonshot: merge_provider_config(base.moonshot, override_cfg.moonshot),
             sglang: merge_provider_config(base.sglang, override_cfg.sglang),
@@ -4707,6 +5096,9 @@ fn merge_providers(
             huggingface: merge_provider_config(base.huggingface, override_cfg.huggingface),
             together: merge_provider_config(base.together, override_cfg.together),
             openai_codex: merge_provider_config(base.openai_codex, override_cfg.openai_codex),
+            zai: merge_provider_config(base.zai, override_cfg.zai),
+            stepfun: merge_provider_config(base.stepfun, override_cfg.stepfun),
+            minimax: merge_provider_config(base.minimax, override_cfg.minimax),
         }),
     }
 }
@@ -4732,7 +5124,12 @@ fn warn_on_misplaced_top_level_keys(raw: &str) -> Option<String> {
     // Sections CodeWhale does not recognize but users nest settings under.
     const UNKNOWN_SECTIONS: &[&str] = &["general", "sandbox"];
     // Keys that are only ever read from the top level of the config.
-    const TOP_LEVEL_KEYS: &[&str] = &["allow_shell", "sandbox_mode", "approval_policy"];
+    const TOP_LEVEL_KEYS: &[&str] = &[
+        "allow_shell",
+        "sandbox_mode",
+        "approval_policy",
+        "verbosity",
+    ];
 
     let mut hits: Vec<String> = Vec::new();
     for section in UNKNOWN_SECTIONS {
@@ -5134,8 +5531,7 @@ pub fn active_provider_has_config_api_key(config: &Config) -> bool {
     }
 
     if config
-        .provider_config_for(provider)
-        .and_then(|entry| entry.api_key.as_ref())
+        .provider_config_string_with_runtime_fallback(provider, |entry| entry.api_key.clone())
         .is_some_and(|k| !k.trim().is_empty() && k != API_KEYRING_SENTINEL)
     {
         return true;
@@ -5159,6 +5555,9 @@ pub fn active_provider_has_env_api_key(config: &Config) -> bool {
                 || std::env::var("NVIDIA_NIM_API_KEY").is_ok_and(|k| !k.trim().is_empty())
         }
         ApiProvider::Openai => std::env::var("OPENAI_API_KEY").is_ok_and(|k| !k.trim().is_empty()),
+        ApiProvider::Anthropic => {
+            std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.trim().is_empty())
+        }
         ApiProvider::Atlascloud => {
             std::env::var("ATLASCLOUD_API_KEY").is_ok_and(|k| !k.trim().is_empty())
         }
@@ -5206,6 +5605,17 @@ pub fn active_provider_has_env_api_key(config: &Config) -> bool {
             std::env::var("OPENAI_CODEX_ACCESS_TOKEN").is_ok_and(|k| !k.trim().is_empty())
                 || std::env::var("CODEX_ACCESS_TOKEN").is_ok_and(|k| !k.trim().is_empty())
         }
+        ApiProvider::Zai => {
+            std::env::var("ZAI_API_KEY").is_ok_and(|k| !k.trim().is_empty())
+                || std::env::var("Z_AI_API_KEY").is_ok_and(|k| !k.trim().is_empty())
+        }
+        ApiProvider::Stepfun => {
+            std::env::var("STEPFUN_API_KEY").is_ok_and(|k| !k.trim().is_empty())
+                || std::env::var("STEP_API_KEY").is_ok_and(|k| !k.trim().is_empty())
+        }
+        ApiProvider::Minimax => {
+            std::env::var("MINIMAX_API_KEY").is_ok_and(|k| !k.trim().is_empty())
+        }
     }
 }
 
@@ -5223,6 +5633,7 @@ pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
         ApiProvider::Deepseek | ApiProvider::DeepseekCN => "DEEPSEEK_API_KEY",
         ApiProvider::NvidiaNim => "NVIDIA_API_KEY",
         ApiProvider::Openai => "OPENAI_API_KEY",
+        ApiProvider::Anthropic => "ANTHROPIC_API_KEY",
         ApiProvider::Atlascloud => "ATLASCLOUD_API_KEY",
         ApiProvider::WanjieArk => "WANJIE_ARK_API_KEY",
         ApiProvider::Openrouter => "OPENROUTER_API_KEY",
@@ -5239,6 +5650,9 @@ pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
         ApiProvider::Vllm => "VLLM_API_KEY",
         ApiProvider::Ollama => "OLLAMA_API_KEY",
         ApiProvider::Volcengine => "VOLCENGINE_API_KEY",
+        ApiProvider::Zai => "ZAI_API_KEY",
+        ApiProvider::Stepfun => "STEPFUN_API_KEY",
+        ApiProvider::Minimax => "MINIMAX_API_KEY",
     };
     if std::env::var(env_var).is_ok_and(|k| !k.trim().is_empty()) {
         return true;
@@ -5306,8 +5720,7 @@ pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
     }
 
     if config
-        .provider_config_for(provider)
-        .and_then(|entry| entry.api_key.as_ref())
+        .provider_config_string_with_runtime_fallback(provider, |entry| entry.api_key.clone())
         .is_some_and(|k| !k.trim().is_empty() && k != API_KEYRING_SENTINEL)
     {
         return true;
@@ -5349,13 +5762,15 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
         }
         ApiProvider::NvidiaNim => "providers.nvidia_nim",
         ApiProvider::Openai => "providers.openai",
+        ApiProvider::Anthropic => "providers.anthropic",
         ApiProvider::Atlascloud => "providers.atlascloud",
         ApiProvider::WanjieArk => "providers.wanjie_ark",
         ApiProvider::Openrouter => "providers.openrouter",
         ApiProvider::XiaomiMimo => "providers.xiaomi_mimo",
         ApiProvider::Novita => "providers.novita",
         ApiProvider::Fireworks => "providers.fireworks",
-        ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => "providers.siliconflow",
+        ApiProvider::Siliconflow => "providers.siliconflow",
+        ApiProvider::SiliconflowCn => "providers.siliconflow_cn",
         ApiProvider::Arcee => "providers.arcee",
         ApiProvider::Huggingface => "providers.huggingface",
         ApiProvider::Moonshot => "providers.moonshot",
@@ -5365,6 +5780,9 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
         ApiProvider::Volcengine => "providers.volcengine",
         ApiProvider::Together => "providers.together",
         ApiProvider::OpenaiCodex => "providers.openai_codex",
+        ApiProvider::Zai => "providers.zai",
+        ApiProvider::Stepfun => "providers.stepfun",
+        ApiProvider::Minimax => "providers.minimax",
     };
 
     // Parse existing TOML (or start fresh) so we can edit the right table
@@ -5393,6 +5811,7 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
         }
         ApiProvider::NvidiaNim => "nvidia_nim",
         ApiProvider::Openai => "openai",
+        ApiProvider::Anthropic => "anthropic",
         ApiProvider::Atlascloud => "atlascloud",
         ApiProvider::WanjieArk => "wanjie_ark",
         ApiProvider::Openrouter => "openrouter",
@@ -5400,7 +5819,7 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
         ApiProvider::Novita => "novita",
         ApiProvider::Fireworks => "fireworks",
         ApiProvider::Siliconflow => "siliconflow",
-        ApiProvider::SiliconflowCn => "siliconflow",
+        ApiProvider::SiliconflowCn => "siliconflow_cn",
         ApiProvider::Arcee => "arcee",
         ApiProvider::Huggingface => "huggingface",
         ApiProvider::Moonshot => "moonshot",
@@ -5410,6 +5829,9 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
         ApiProvider::Volcengine => "volcengine",
         ApiProvider::Together => "together",
         ApiProvider::OpenaiCodex => "openai_codex",
+        ApiProvider::Zai => "zai",
+        ApiProvider::Stepfun => "stepfun",
+        ApiProvider::Minimax => "minimax",
     };
     let entry = providers
         .entry(key_inside.to_string())
@@ -5490,6 +5912,7 @@ fn provider_config_key(provider: ApiProvider) -> Result<&'static str> {
         }
         ApiProvider::NvidiaNim => Ok("nvidia_nim"),
         ApiProvider::Openai => Ok("openai"),
+        ApiProvider::Anthropic => Ok("anthropic"),
         ApiProvider::Atlascloud => Ok("atlascloud"),
         ApiProvider::WanjieArk => Ok("wanjie_ark"),
         ApiProvider::Volcengine => Ok("volcengine"),
@@ -5498,7 +5921,7 @@ fn provider_config_key(provider: ApiProvider) -> Result<&'static str> {
         ApiProvider::Novita => Ok("novita"),
         ApiProvider::Fireworks => Ok("fireworks"),
         ApiProvider::Siliconflow => Ok("siliconflow"),
-        ApiProvider::SiliconflowCn => Ok("siliconflow"),
+        ApiProvider::SiliconflowCn => Ok("siliconflow_cn"),
         ApiProvider::Arcee => Ok("arcee"),
         ApiProvider::Huggingface => Ok("huggingface"),
         ApiProvider::Moonshot => Ok("moonshot"),
@@ -5507,6 +5930,9 @@ fn provider_config_key(provider: ApiProvider) -> Result<&'static str> {
         ApiProvider::Ollama => Ok("ollama"),
         ApiProvider::Together => Ok("together"),
         ApiProvider::OpenaiCodex => Ok("openai_codex"),
+        ApiProvider::Zai => Ok("zai"),
+        ApiProvider::Stepfun => Ok("stepfun"),
+        ApiProvider::Minimax => Ok("minimax"),
     }
 }
 
@@ -5607,17 +6033,45 @@ fn refresh_kimi_oauth_token(refresh_token: &str) -> Result<KimiOAuthCredential> 
 }
 
 fn kimi_cli_oauth_credentials_path() -> Result<PathBuf> {
-    let share_dir = std::env::var("KIMI_SHARE_DIR")
+    if let Some(kimi_code_home) = kimi_code_home_override() {
+        return Ok(kimi_oauth_credential_path(kimi_code_home));
+    }
+
+    let modern_path = effective_home_dir()
+        .map(|home| kimi_oauth_credential_path(home.join(".kimi-code")))
+        .context("Failed to resolve Kimi Code home directory")?;
+    if modern_path.exists() {
+        return Ok(modern_path);
+    }
+
+    if let Some(legacy_share_dir) = kimi_legacy_share_dir_override() {
+        return Ok(kimi_oauth_credential_path(legacy_share_dir));
+    }
+
+    if let Some(legacy_path) = effective_home_dir()
+        .map(|home| kimi_oauth_credential_path(home.join(".kimi")))
+        .filter(|path| path.exists())
+    {
+        return Ok(legacy_path);
+    }
+
+    Ok(modern_path)
+}
+
+fn kimi_code_home_override() -> Option<PathBuf> {
+    std::env::var_os("KIMI_CODE_HOME")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|_| {
-            effective_home_dir()
-                .map(|home| home.join(".kimi"))
-                .ok_or(std::env::VarError::NotPresent)
-        })
-        .context("Failed to resolve Kimi share directory")?;
-    Ok(share_dir
-        .join("credentials")
-        .join(KIMI_CODE_CREDENTIAL_FILE))
+}
+
+fn kimi_legacy_share_dir_override() -> Option<PathBuf> {
+    std::env::var_os("KIMI_SHARE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn kimi_oauth_credential_path(home: PathBuf) -> PathBuf {
+    home.join("credentials").join(KIMI_CODE_CREDENTIAL_FILE)
 }
 
 fn write_kimi_oauth_credential(path: &Path, credential: &KimiOAuthCredential) -> Result<()> {
@@ -6290,6 +6744,7 @@ action = "session.compact"
         kimi_base_url: Option<OsString>,
         kimi_model: Option<OsString>,
         kimi_model_name: Option<OsString>,
+        kimi_code_home: Option<OsString>,
         kimi_share_dir: Option<OsString>,
         kimi_code_oauth_host: Option<OsString>,
         kimi_oauth_host: Option<OsString>,
@@ -6393,6 +6848,7 @@ action = "session.compact"
             let kimi_base_url_prev = env::var_os("KIMI_BASE_URL");
             let kimi_model_prev = env::var_os("KIMI_MODEL");
             let kimi_model_name_prev = env::var_os("KIMI_MODEL_NAME");
+            let kimi_code_home_prev = env::var_os("KIMI_CODE_HOME");
             let kimi_share_dir_prev = env::var_os("KIMI_SHARE_DIR");
             let kimi_code_oauth_host_prev = env::var_os("KIMI_CODE_OAUTH_HOST");
             let kimi_oauth_host_prev = env::var_os("KIMI_OAUTH_HOST");
@@ -6491,6 +6947,7 @@ action = "session.compact"
                 env::remove_var("KIMI_BASE_URL");
                 env::remove_var("KIMI_MODEL");
                 env::remove_var("KIMI_MODEL_NAME");
+                env::remove_var("KIMI_CODE_HOME");
                 env::remove_var("KIMI_SHARE_DIR");
                 env::remove_var("KIMI_CODE_OAUTH_HOST");
                 env::remove_var("KIMI_OAUTH_HOST");
@@ -6589,6 +7046,7 @@ action = "session.compact"
                 kimi_base_url: kimi_base_url_prev,
                 kimi_model: kimi_model_prev,
                 kimi_model_name: kimi_model_name_prev,
+                kimi_code_home: kimi_code_home_prev,
                 kimi_share_dir: kimi_share_dir_prev,
                 kimi_code_oauth_host: kimi_code_oauth_host_prev,
                 kimi_oauth_host: kimi_oauth_host_prev,
@@ -6711,6 +7169,7 @@ action = "session.compact"
                 Self::restore_var("KIMI_BASE_URL", self.kimi_base_url.take());
                 Self::restore_var("KIMI_MODEL", self.kimi_model.take());
                 Self::restore_var("KIMI_MODEL_NAME", self.kimi_model_name.take());
+                Self::restore_var("KIMI_CODE_HOME", self.kimi_code_home.take());
                 Self::restore_var("KIMI_SHARE_DIR", self.kimi_share_dir.take());
                 Self::restore_var("KIMI_CODE_OAUTH_HOST", self.kimi_code_oauth_host.take());
                 Self::restore_var("KIMI_OAUTH_HOST", self.kimi_oauth_host.take());
@@ -6751,6 +7210,35 @@ action = "session.compact"
     fn max_subagents_defaults_to_ten() {
         assert_eq!(Config::default().max_subagents(), DEFAULT_MAX_SUBAGENTS);
         assert_eq!(DEFAULT_MAX_SUBAGENTS, 10);
+    }
+
+    #[test]
+    fn interactive_launch_limit_defaults_and_clamps_to_max_subagents() {
+        assert_eq!(
+            Config::default().interactive_launch_limit(),
+            DEFAULT_INTERACTIVE_LAUNCH_LIMIT
+        );
+
+        let mut config = Config {
+            subagents: Some(SubagentsConfig {
+                interactive_max_launch: Some(50),
+                ..SubagentsConfig::default()
+            }),
+            ..Config::default()
+        };
+        assert_eq!(config.interactive_launch_limit(), config.max_subagents());
+
+        config.subagents = Some(SubagentsConfig {
+            interactive_max_launch: Some(0),
+            ..SubagentsConfig::default()
+        });
+        assert_eq!(config.interactive_launch_limit(), 1);
+
+        config.subagents = Some(SubagentsConfig {
+            interactive_max_launch: Some(2),
+            ..SubagentsConfig::default()
+        });
+        assert_eq!(config.interactive_launch_limit(), 2);
     }
 
     #[test]
@@ -7892,6 +8380,25 @@ api_key = "old-openrouter-key"
     }
 
     #[test]
+    fn requested_model_for_provider_is_permissive_off_deepseek() {
+        // #3018: the provider API is the authority for non-DeepSeek routes.
+        assert_eq!(
+            requested_model_for_provider(ApiProvider::Moonshot, "kimi-k2.5").as_deref(),
+            Some("kimi-k2.5")
+        );
+        assert_eq!(
+            requested_model_for_provider(ApiProvider::Ollama, "qwen3:32b").as_deref(),
+            Some("qwen3:32b")
+        );
+        // The official DeepSeek API stays strict.
+        assert!(requested_model_for_provider(ApiProvider::Deepseek, "kimi-k2.5").is_none());
+        assert_eq!(
+            requested_model_for_provider(ApiProvider::Deepseek, "deepseek-v4-pro").as_deref(),
+            Some("deepseek-v4-pro")
+        );
+    }
+
+    #[test]
     fn wire_model_for_provider_matches_active_provider_shape() {
         assert_eq!(
             wire_model_for_provider(ApiProvider::Deepseek, DEFAULT_OPENROUTER_MODEL),
@@ -7976,13 +8483,53 @@ api_key = "old-openrouter-key"
             ("qwen3.6-max-preview", OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL),
             ("qwen3.6-plus", OPENROUTER_QWEN_3_6_PLUS_MODEL),
             ("mimo-v2.5-pro", OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL),
+            ("kimi-k2.7-code", OPENROUTER_KIMI_K2_7_CODE_MODEL),
+            ("kimi", OPENROUTER_KIMI_K2_7_CODE_MODEL),
             ("kimi-k2.6", OPENROUTER_KIMI_K2_6_MODEL),
             ("minimax-m3", OPENROUTER_MINIMAX_M3_MODEL),
+            ("minimax-2.7", OPENROUTER_MINIMAX_2_7_MODEL),
             ("gemma-4-31b-it", OPENROUTER_GEMMA_4_31B_MODEL),
             ("glm-5.1", OPENROUTER_GLM_5_1_MODEL),
+            ("glm-5.2", OPENROUTER_GLM_5_2_MODEL),
         ] {
             assert_eq!(
                 normalize_model_name_for_provider(ApiProvider::Openrouter, alias).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_model_name_for_provider_maps_moonshot_aliases() {
+        for (alias, expected) in [
+            ("kimi", DEFAULT_MOONSHOT_MODEL),
+            ("kimi-k2.7", DEFAULT_MOONSHOT_MODEL),
+            ("kimi-k2.7-code", DEFAULT_MOONSHOT_MODEL),
+            ("kimi-code", DEFAULT_MOONSHOT_MODEL),
+            ("kimi-k2.6", MOONSHOT_KIMI_K2_6_MODEL),
+        ] {
+            assert_eq!(
+                normalize_model_name_for_provider(ApiProvider::Moonshot, alias).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_model_name_for_provider_maps_minimax_direct_aliases() {
+        for (alias, expected) in [
+            ("minimax", DEFAULT_MINIMAX_MODEL),
+            ("minimax-m3", DEFAULT_MINIMAX_MODEL),
+            ("minimax-m2.7", MINIMAX_M2_7_MODEL),
+            ("minimax-m2-7-highspeed", MINIMAX_M2_7_HIGHSPEED_MODEL),
+            ("minimax-m2.5", MINIMAX_M2_5_MODEL),
+            ("minimax-m2-5-highspeed", MINIMAX_M2_5_HIGHSPEED_MODEL),
+            ("minimax-m2.1", MINIMAX_M2_1_MODEL),
+            ("minimax-m2-1-highspeed", MINIMAX_M2_1_HIGHSPEED_MODEL),
+            ("minimax-m2", MINIMAX_M2_MODEL),
+        ] {
+            assert_eq!(
+                normalize_model_name_for_provider(ApiProvider::Minimax, alias).as_deref(),
                 Some(expected)
             );
         }
@@ -8080,11 +8627,14 @@ api_key = "old-openrouter-key"
             OPENROUTER_ARCEE_TRINITY_LARGE_THINKING_MODEL,
             OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL,
             OPENROUTER_MINIMAX_M3_MODEL,
+            OPENROUTER_MINIMAX_2_7_MODEL,
             OPENROUTER_QWEN_3_6_FLASH_MODEL,
             OPENROUTER_QWEN_3_6_35B_A3B_MODEL,
             OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL,
             OPENROUTER_QWEN_3_6_27B_MODEL,
             OPENROUTER_QWEN_3_6_PLUS_MODEL,
+            OPENROUTER_GLM_5_1_MODEL,
+            OPENROUTER_GLM_5_2_MODEL,
             OPENROUTER_GEMMA_4_31B_MODEL,
         ] {
             assert!(models.contains(&expected), "missing {expected}");
@@ -8092,10 +8642,59 @@ api_key = "old-openrouter-key"
     }
 
     #[test]
-    fn model_completion_names_for_moonshot_excludes_oauth_only_kimi_code_model() {
+    fn model_completion_names_for_moonshot_uses_latest_platform_model() {
         assert_eq!(
             model_completion_names_for_provider(ApiProvider::Moonshot),
             vec![DEFAULT_MOONSHOT_MODEL]
+        );
+    }
+
+    #[test]
+    fn model_completion_names_for_zai_keep_5_1_default_and_include_5_2() {
+        let models = model_completion_names_for_provider(ApiProvider::Zai);
+
+        assert_eq!(models.first().copied(), Some(DEFAULT_ZAI_MODEL));
+        assert!(models.contains(&ZAI_GLM_5_2_MODEL));
+    }
+
+    #[test]
+    fn normalize_model_name_for_zai_canonicalizes_current_glm_models() {
+        for (alias, expected) in [
+            ("glm-5.1", DEFAULT_ZAI_MODEL),
+            ("glm-5-1", DEFAULT_ZAI_MODEL),
+            ("glm-5.2", ZAI_GLM_5_2_MODEL),
+            ("zai-glm-5-2", ZAI_GLM_5_2_MODEL),
+        ] {
+            assert_eq!(
+                normalize_model_name_for_provider(ApiProvider::Zai, alias).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            normalize_model_name_for_provider(ApiProvider::Zai, "glm-next-preview").as_deref(),
+            Some("glm-next-preview")
+        );
+    }
+
+    #[test]
+    fn model_completion_names_for_minimax_include_direct_chat_models() {
+        let models = model_completion_names_for_provider(ApiProvider::Minimax);
+
+        for expected in [
+            DEFAULT_MINIMAX_MODEL,
+            MINIMAX_M2_7_MODEL,
+            MINIMAX_M2_7_HIGHSPEED_MODEL,
+            MINIMAX_M2_5_MODEL,
+            MINIMAX_M2_5_HIGHSPEED_MODEL,
+            MINIMAX_M2_1_MODEL,
+            MINIMAX_M2_1_HIGHSPEED_MODEL,
+            MINIMAX_M2_MODEL,
+        ] {
+            assert!(models.contains(&expected), "missing {expected}");
+        }
+        assert!(
+            !models.contains(&OPENROUTER_MINIMAX_M3_MODEL),
+            "direct MiniMax picker must not expose OpenRouter namespaced IDs"
         );
     }
 
@@ -8561,6 +9160,18 @@ http_headers = { "X-Model-Provider-Id" = "from-file" }
             ..Default::default()
         };
         assert_eq!(pinned.default_model(), "gpt-5.5-codex-preview");
+    }
+
+    #[test]
+    fn direct_provider_ignores_foreign_deepseek_root_default_model() {
+        let config = Config {
+            provider: Some("zai".to_string()),
+            default_text_model: Some(DEFAULT_TEXT_MODEL.to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(config.api_provider(), ApiProvider::Zai);
+        assert_eq!(config.default_model(), DEFAULT_ZAI_MODEL);
     }
 
     #[test]
@@ -9818,6 +10429,138 @@ model = "deepseek-v4-flash"
     }
 
     #[test]
+    fn siliconflow_cn_reads_hyphenated_provider_table_from_config_file() -> Result<()> {
+        let _lock = lock_test_env();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-siliconflow-cn-table-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&temp_root)?;
+        let _guard = EnvGuard::new(&temp_root);
+
+        let config_path = temp_root.join(".deepseek").join("config.toml");
+        ensure_parent_dir(&config_path)?;
+        fs::write(
+            &config_path,
+            r#"provider = "siliconflow-CN"
+
+[providers.siliconflow-CN]
+api_key = "sf-cn-table-key"
+base_url = "https://api.siliconflow.cn/v1"
+model = "deepseek-reasoner"
+"#,
+        )?;
+
+        let config = Config::load(None, None)?;
+        assert_eq!(config.api_provider(), ApiProvider::SiliconflowCn);
+        assert_eq!(config.deepseek_api_key()?, "sf-cn-table-key");
+        assert_eq!(config.deepseek_base_url(), DEFAULT_SILICONFLOW_CN_BASE_URL);
+        assert_eq!(config.default_model(), DEFAULT_SILICONFLOW_MODEL);
+        assert!(has_api_key_for(&config, ApiProvider::SiliconflowCn));
+        Ok(())
+    }
+
+    #[test]
+    fn siliconflow_cn_falls_back_to_shared_siliconflow_table_when_unset() -> Result<()> {
+        let _lock = lock_test_env();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-siliconflow-cn-fallback-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&temp_root)?;
+        let _guard = EnvGuard::new(&temp_root);
+
+        let config_path = temp_root.join(".deepseek").join("config.toml");
+        ensure_parent_dir(&config_path)?;
+        fs::write(
+            &config_path,
+            r#"provider = "siliconflow-CN"
+
+[providers.siliconflow]
+api_key = "sf-shared-key"
+base_url = "https://api.siliconflow.com/v1"
+model = "deepseek-chat"
+
+[providers.siliconflow_cn]
+base_url = "https://api.siliconflow.cn/v1"
+"#,
+        )?;
+
+        let config = Config::load(None, None)?;
+        assert_eq!(config.api_provider(), ApiProvider::SiliconflowCn);
+        assert_eq!(config.deepseek_api_key()?, "sf-shared-key");
+        assert_eq!(config.deepseek_base_url(), DEFAULT_SILICONFLOW_CN_BASE_URL);
+        assert_eq!(config.default_model(), DEFAULT_SILICONFLOW_FLASH_MODEL);
+        assert!(active_provider_has_config_api_key(&config));
+        Ok(())
+    }
+
+    #[test]
+    fn siliconflow_cn_env_overrides_write_cn_table_only() -> Result<()> {
+        let _lock = lock_test_env();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-siliconflow-cn-env-table-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&temp_root)?;
+        let _guard = EnvGuard::new(&temp_root);
+
+        let config_path = temp_root.join(".deepseek").join("config.toml");
+        ensure_parent_dir(&config_path)?;
+        fs::write(
+            &config_path,
+            r#"provider = "siliconflow-CN"
+
+[providers.siliconflow]
+api_key = "sf-shared-key"
+base_url = "https://api.siliconflow.com/v1"
+model = "deepseek-reasoner"
+"#,
+        )?;
+        unsafe {
+            env::set_var("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1");
+            env::set_var("SILICONFLOW_MODEL", "deepseek-chat");
+        }
+
+        let config = Config::load(None, None)?;
+        let providers = config.providers.as_ref().expect("providers");
+        assert_eq!(
+            providers.siliconflow.base_url.as_deref(),
+            Some(DEFAULT_SILICONFLOW_BASE_URL)
+        );
+        assert_eq!(
+            providers.siliconflow.model.as_deref(),
+            Some(DEFAULT_SILICONFLOW_MODEL)
+        );
+        assert_eq!(
+            providers.siliconflow_cn.base_url.as_deref(),
+            Some(DEFAULT_SILICONFLOW_CN_BASE_URL)
+        );
+        assert_eq!(
+            providers.siliconflow_cn.model.as_deref(),
+            Some(DEFAULT_SILICONFLOW_FLASH_MODEL)
+        );
+        assert_eq!(config.deepseek_api_key()?, "sf-shared-key");
+        assert_eq!(config.default_model(), DEFAULT_SILICONFLOW_FLASH_MODEL);
+        Ok(())
+    }
+
+    #[test]
     fn openrouter_custom_base_url_preserves_provider_model() -> Result<()> {
         let _lock = lock_test_env();
         let nanos = SystemTime::now()
@@ -9887,7 +10630,65 @@ api_key = "novita-table-key"
     }
 
     #[test]
-    fn moonshot_kimi_oauth_reads_fresh_cli_credential() -> Result<()> {
+    fn moonshot_kimi_oauth_reads_kimi_code_home_credential() -> Result<()> {
+        let _lock = lock_test_env();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-kimi-code-oauth-key-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&temp_root)?;
+        let _guard = EnvGuard::new(&temp_root);
+
+        let kimi_code_home = temp_root.join(".kimi-code");
+        let credential_dir = kimi_code_home.join("credentials");
+        fs::create_dir_all(&credential_dir)?;
+        unsafe { env::set_var("KIMI_CODE_HOME", &kimi_code_home) };
+
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+            + 3600.0;
+        let credential = json!({
+            "access_token": "fresh-kimi-code-oauth-token",
+            "refresh_token": "refresh-token",
+            "expires_at": expires_at,
+            "scope": "openid profile email",
+            "token_type": "Bearer",
+        });
+        fs::write(
+            credential_dir.join(KIMI_CODE_CREDENTIAL_FILE),
+            serde_json::to_string(&credential)?,
+        )?;
+
+        let config_path = temp_root.join(".deepseek").join("config.toml");
+        ensure_parent_dir(&config_path)?;
+        fs::write(
+            &config_path,
+            r#"provider = "moonshot"
+
+[providers.moonshot]
+auth_mode = "kimi_oauth"
+api_key = "stale-api-key"
+"#,
+        )?;
+
+        let config = Config::load(None, None)?;
+        assert_eq!(config.api_provider(), ApiProvider::Moonshot);
+        assert_eq!(config.deepseek_base_url(), DEFAULT_KIMI_CODE_BASE_URL);
+        assert_eq!(config.default_model(), DEFAULT_KIMI_CODE_MODEL);
+        assert_eq!(config.deepseek_api_key()?, "fresh-kimi-code-oauth-token");
+        assert!(has_api_key_for(&config, ApiProvider::Moonshot));
+        Ok(())
+    }
+
+    #[test]
+    fn moonshot_kimi_oauth_falls_back_to_legacy_share_dir_credential() -> Result<()> {
         let _lock = lock_test_env();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -10140,11 +10941,11 @@ base_url = "https://api.kimi.com/coding/v1"
 
     /// Moonshot Platform path: when [providers.moonshot] is empty (or
     /// missing) and no Kimi Code endpoint is configured, the resolver
-    /// defaults to the Moonshot Platform base URL and the `kimi-k2.6`
+    /// defaults to the Moonshot Platform base URL and the latest Kimi platform
     /// model. This is the "I have a Moonshot Platform API key, not a
     /// Kimi Code plan key" path.
     #[test]
-    fn moonshot_platform_defaults_to_kimi_k26() -> Result<()> {
+    fn moonshot_platform_defaults_to_kimi_k27_code() -> Result<()> {
         let _lock = lock_test_env();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -10396,16 +11197,18 @@ api_key = "moonshot-platform-key"
         assert_eq!(
             parsed
                 .get("providers")
-                .and_then(|p| p.get("siliconflow"))
+                .and_then(|p| p.get("siliconflow_cn"))
                 .and_then(|t| t.get("api_key"))
                 .and_then(toml::Value::as_str),
             Some("sf-cn-saved-key")
         );
-        assert!(
+        assert_eq!(
             parsed
                 .get("providers")
-                .and_then(|p| p.get("siliconflow-CN"))
-                .is_none()
+                .and_then(|p| p.get("siliconflow"))
+                .and_then(|t| t.get("api_key"))
+                .and_then(toml::Value::as_str),
+            Some("sf-saved-key")
         );
         Ok(())
     }
@@ -10635,6 +11438,21 @@ model = "deepseek-ai/deepseek-v4-pro"
     }
 
     #[test]
+    fn provider_capability_openai_codex_uses_responses_payload() {
+        let cap = provider_capability(ApiProvider::OpenaiCodex, DEFAULT_OPENAI_CODEX_MODEL);
+        assert_eq!(cap.provider, ApiProvider::OpenaiCodex);
+        assert_eq!(cap.resolved_model, DEFAULT_OPENAI_CODEX_MODEL);
+        assert_eq!(
+            cap.context_window,
+            OPENAI_CODEX_EFFECTIVE_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(cap.max_output, 128_000);
+        assert!(cap.thinking_supported);
+        assert!(!cap.cache_telemetry_supported);
+        assert_eq!(cap.request_payload_mode, RequestPayloadMode::Responses);
+    }
+
+    #[test]
     fn provider_capability_openrouter_recent_large_models_are_reasoning_aware() {
         for (model, expected_window, expected_output) in [
             (
@@ -10649,6 +11467,10 @@ model = "deepseek-ai/deepseek-v4-pro"
             (OPENROUTER_QWEN_3_6_PLUS_MODEL, 1_000_000, 65_536),
             (OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL, 1_000_000, 131_072),
             (OPENROUTER_MINIMAX_M3_MODEL, 1_000_000, 524_288),
+            (OPENROUTER_MINIMAX_2_7_MODEL, 204_800, 4096),
+            (OPENROUTER_GLM_5_1_MODEL, 202_752, 131_072),
+            (OPENROUTER_GLM_5_2_MODEL, 1_000_000, 131_072),
+            (OPENROUTER_NEMOTRON_3_ULTRA_MODEL, 1_000_000, 16_384),
         ] {
             let cap = provider_capability(ApiProvider::Openrouter, model);
 
@@ -10659,6 +11481,26 @@ model = "deepseek-ai/deepseek-v4-pro"
             assert_eq!(
                 cap.request_payload_mode,
                 RequestPayloadMode::ChatCompletions
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_nemotron_ultra_aliases_resolve_to_live_id() {
+        assert_eq!(
+            OPENROUTER_NEMOTRON_3_ULTRA_MODEL,
+            "nvidia/nemotron-3-ultra-550b-a55b"
+        );
+        assert_ne!(OPENROUTER_NEMOTRON_3_ULTRA_MODEL, "nvidia/nemotron-3-ultra");
+
+        for alias in [
+            "nemotron-3-ultra",
+            "nvidia/nemotron-3-ultra",
+            "nvidia-nemotron-3-ultra",
+        ] {
+            assert_eq!(
+                normalize_model_name_for_provider(ApiProvider::Openrouter, alias).as_deref(),
+                Some(OPENROUTER_NEMOTRON_3_ULTRA_MODEL)
             );
         }
     }
@@ -10776,19 +11618,81 @@ model = "deepseek-ai/deepseek-v4-pro"
     }
 
     #[test]
-    fn provider_capability_atlascloud_custom_model_is_chat_completions_without_thinking() {
+    fn provider_capability_atlascloud_v4_model_resolves_model_metadata() {
+        // #3023: Atlascloud uses the generic model-based path, so its default
+        // DeepSeek V4 model resolves the real V4 metadata instead of the old
+        // hardcoded legacy floor.
         let cap = provider_capability(ApiProvider::Atlascloud, "deepseek-ai/deepseek-v4-flash");
         assert_eq!(
             cap.context_window,
-            crate::models::LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS
+            crate::models::DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS
         );
-        assert_eq!(cap.max_output, 4096);
-        assert!(!cap.thinking_supported);
+        assert_eq!(cap.max_output, 384_000);
+        assert!(cap.thinking_supported);
         assert!(!cap.cache_telemetry_supported);
         assert_eq!(
             cap.request_payload_mode,
             RequestPayloadMode::ChatCompletions
         );
+    }
+
+    #[test]
+    fn provider_capability_moonshot_default_model_resolves_kimi_metadata() {
+        let cap = provider_capability(ApiProvider::Moonshot, DEFAULT_MOONSHOT_MODEL);
+        assert_eq!(cap.context_window, 262_144);
+        assert_eq!(cap.max_output, 262_144);
+        assert!(cap.thinking_supported);
+        assert!(!cap.cache_telemetry_supported);
+        assert_eq!(
+            cap.request_payload_mode,
+            RequestPayloadMode::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn provider_capability_zai_keeps_5_1_default_and_tracks_5_2_window() {
+        let default = provider_capability(ApiProvider::Zai, DEFAULT_ZAI_MODEL);
+        assert_eq!(default.resolved_model, DEFAULT_ZAI_MODEL);
+        assert_eq!(default.context_window, 202_752);
+        assert_eq!(default.max_output, 131_072);
+        assert!(default.thinking_supported);
+        assert!(!default.cache_telemetry_supported);
+
+        let preview = provider_capability(ApiProvider::Zai, ZAI_GLM_5_2_MODEL);
+        assert_eq!(preview.resolved_model, ZAI_GLM_5_2_MODEL);
+        assert_eq!(preview.context_window, 1_000_000);
+        assert_eq!(preview.max_output, 131_072);
+        assert!(preview.thinking_supported);
+        assert!(!preview.cache_telemetry_supported);
+    }
+
+    #[test]
+    fn provider_capability_minimax_direct_models_use_api_docs_shape() {
+        let m3 = provider_capability(ApiProvider::Minimax, DEFAULT_MINIMAX_MODEL);
+        assert_eq!(m3.context_window, 1_000_000);
+        assert_eq!(m3.max_output, 524_288);
+        assert!(m3.thinking_supported);
+        assert!(!m3.cache_telemetry_supported);
+        assert_eq!(m3.request_payload_mode, RequestPayloadMode::ChatCompletions);
+
+        for model in [
+            MINIMAX_M2_7_MODEL,
+            MINIMAX_M2_7_HIGHSPEED_MODEL,
+            MINIMAX_M2_5_MODEL,
+            MINIMAX_M2_5_HIGHSPEED_MODEL,
+            MINIMAX_M2_1_MODEL,
+            MINIMAX_M2_1_HIGHSPEED_MODEL,
+            MINIMAX_M2_MODEL,
+        ] {
+            let cap = provider_capability(ApiProvider::Minimax, model);
+            assert_eq!(cap.context_window, 204_800, "{model}");
+            assert!(cap.thinking_supported, "{model}");
+            assert!(!cap.cache_telemetry_supported, "{model}");
+            assert_eq!(
+                cap.request_payload_mode,
+                RequestPayloadMode::ChatCompletions
+            );
+        }
     }
 
     #[test]
@@ -10808,8 +11712,26 @@ model = "deepseek-ai/deepseek-v4-pro"
     }
 
     #[test]
-    fn provider_capability_ollama_is_openai_compatible_without_thinking() {
+    fn provider_capability_ollama_deepseek_tag_uses_deepseek_heuristic() {
+        // #3023: known model families resolve through models.rs lookups even
+        // on Ollama — a legacy DeepSeek tag gets the 128K heuristic window.
         let cap = provider_capability(ApiProvider::Ollama, "deepseek-v3.1:671b");
+        assert_eq!(
+            cap.context_window,
+            crate::models::LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(cap.max_output, 4096);
+        assert!(!cap.thinking_supported);
+        assert!(!cap.cache_telemetry_supported);
+        assert_eq!(
+            cap.request_payload_mode,
+            RequestPayloadMode::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn provider_capability_ollama_unknown_model_falls_back_to_8192() {
+        let cap = provider_capability(ApiProvider::Ollama, "llama3.2:3b");
         assert_eq!(cap.context_window, 8192);
         assert_eq!(cap.max_output, 4096);
         assert!(!cap.thinking_supported);
@@ -10887,6 +11809,25 @@ model = "deepseek-ai/deepseek-v4-pro"
     }
 
     #[test]
+    fn huggingface_provider_aliases_parse() {
+        for alias in ["huggingface", "hugging-face", "hugging_face", "hf"] {
+            assert_eq!(ApiProvider::parse(alias), Some(ApiProvider::Huggingface));
+        }
+    }
+
+    #[test]
+    fn invalid_provider_error_lists_huggingface() {
+        let config = Config {
+            provider: Some("not-a-provider".to_string()),
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("unknown provider should fail");
+        let message = err.to_string();
+        assert!(message.contains("Invalid provider 'not-a-provider'"));
+        assert!(message.contains("huggingface"));
+    }
+
+    #[test]
     fn huggingface_provider_uses_direct_defaults() -> Result<()> {
         let _lock = lock_test_env();
         let nanos = SystemTime::now()
@@ -10941,6 +11882,35 @@ model = "deepseek-ai/deepseek-v4-pro"
     }
 
     #[test]
+    fn huggingface_missing_key_error_mentions_env_fallbacks() -> Result<()> {
+        let _lock = lock_test_env();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-huggingface-missing-key-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&temp_root)?;
+        let _guard = EnvGuard::new(&temp_root);
+
+        let config = Config {
+            provider: Some("huggingface".to_string()),
+            ..Default::default()
+        };
+
+        config.validate()?;
+        let err = config.deepseek_api_key().expect_err("missing key");
+        let message = err.to_string();
+        assert!(message.contains("Hugging Face API key not found"));
+        assert!(message.contains("HUGGINGFACE_API_KEY"));
+        assert!(message.contains("HF_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
     fn huggingface_env_overrides_key_base_url_and_model() -> Result<()> {
         let _lock = lock_test_env();
         let nanos = SystemTime::now()
@@ -10961,8 +11931,11 @@ model = "deepseek-ai/deepseek-v4-pro"
             unsafe {
                 env::set_var("CODEWHALE_PROVIDER", "huggingface");
                 env::set_var("HUGGINGFACE_API_KEY", "hf-env-key");
+                env::set_var("HF_TOKEN", "hf-token-fallback");
                 env::set_var("HUGGINGFACE_BASE_URL", "https://custom-hf.example/v1");
+                env::set_var("HF_BASE_URL", "https://fallback-hf.example/v1");
                 env::set_var("HUGGINGFACE_MODEL", "meta-llama/Llama-3-70B");
+                env::set_var("HF_MODEL", "fallback/model");
             }
 
             let config = Config::load(None, None)?;
@@ -11010,5 +11983,35 @@ model = "deepseek-ai/deepseek-v4-pro"
             notifications.sound_file.as_deref(),
             Some(std::path::Path::new("E:\\google\\downloads\\xm4114.wav"))
         );
+    }
+
+    #[test]
+    fn huggingface_short_env_fallbacks_configure_route() -> Result<()> {
+        let _lock = lock_test_env();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-huggingface-short-env-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&temp_root)?;
+        let _guard = EnvGuard::new(&temp_root);
+
+        unsafe {
+            env::set_var("CODEWHALE_PROVIDER", "hf");
+            env::set_var("HF_TOKEN", "hf-token-value");
+            env::set_var("HF_BASE_URL", "https://short-hf.example/v1");
+            env::set_var("HF_MODEL", "org/short-model");
+        }
+
+        let config = Config::load(None, None)?;
+        assert_eq!(config.api_provider(), ApiProvider::Huggingface);
+        assert_eq!(config.deepseek_api_key()?, "hf-token-value");
+        assert_eq!(config.deepseek_base_url(), "https://short-hf.example/v1");
+        assert_eq!(config.default_model(), "org/short-model");
+        Ok(())
     }
 }

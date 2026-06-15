@@ -104,6 +104,7 @@ impl ProviderPickerView {
             ApiProvider::Deepseek | ApiProvider::DeepseekCN => "DEEPSEEK_API_KEY",
             ApiProvider::NvidiaNim => "NVIDIA_API_KEY",
             ApiProvider::Openai => "OPENAI_API_KEY",
+            ApiProvider::Anthropic => "ANTHROPIC_API_KEY",
             ApiProvider::Atlascloud => "ATLASCLOUD_API_KEY",
             ApiProvider::WanjieArk => "WANJIE_ARK_API_KEY",
             ApiProvider::Volcengine => "VOLCENGINE_API_KEY",
@@ -120,6 +121,9 @@ impl ProviderPickerView {
             ApiProvider::Huggingface => "HUGGINGFACE_API_KEY / HF_TOKEN",
             ApiProvider::Together => "TOGETHER_API_KEY",
             ApiProvider::OpenaiCodex => "OPENAI_CODEX_ACCESS_TOKEN / CODEX_ACCESS_TOKEN",
+            ApiProvider::Zai => "ZAI_API_KEY / Z_AI_API_KEY",
+            ApiProvider::Stepfun => "STEPFUN_API_KEY / STEP_API_KEY",
+            ApiProvider::Minimax => "MINIMAX_API_KEY",
         }
     }
 
@@ -504,15 +508,19 @@ mod tests {
                 "Novita AI",
                 "Fireworks AI",
                 "SiliconFlow",
-                "SiliconFlow (China)",
                 "Arcee AI",
+                "SiliconFlow (China)",
                 "Moonshot/Kimi",
                 "SGLang",
                 "vLLM",
                 "Ollama",
                 "Hugging Face",
                 "Together AI",
-                "OpenAI Codex (ChatGPT)"
+                "OpenAI Codex (ChatGPT)",
+                "Anthropic",
+                "Z.ai (GLM Coding)",
+                "StepFun / StepFlash",
+                "MiniMax"
             ]
         );
     }
@@ -547,7 +555,7 @@ mod tests {
         let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
 
         picker.handle_key(key(KeyCode::Up));
-        assert_eq!(picker.selected_provider(), ApiProvider::OpenaiCodex);
+        assert_eq!(picker.selected_provider(), ApiProvider::Minimax);
 
         picker.handle_key(key(KeyCode::Down));
         assert_eq!(picker.selected_provider(), ApiProvider::Deepseek);

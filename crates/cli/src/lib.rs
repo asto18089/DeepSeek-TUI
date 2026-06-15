@@ -14,14 +14,15 @@ use codewhale_app_server::{
     AppServerOptions, run as run_app_server, run_stdio as run_app_server_stdio,
 };
 use codewhale_config::{
-    CliRuntimeOverrides, ConfigStore, ProviderKind, ResolvedRuntimeOptions, RuntimeApiKeySource,
+    CliRuntimeOverrides, ConfigStore, ProviderKind, ProviderSource, ResolvedRuntimeOptions,
+    RuntimeApiKeySource,
 };
 use codewhale_execpolicy::{AskForApproval, ExecPolicyContext, ExecPolicyEngine};
 use codewhale_mcp::{McpServerDefinition, run_stdio_server};
 use codewhale_secrets::Secrets;
 use codewhale_state::{StateStore, ThreadListFilters};
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ProviderArg {
     Deepseek,
     NvidiaNim,
@@ -40,6 +41,12 @@ enum ProviderArg {
     Vllm,
     Ollama,
     Huggingface,
+    Together,
+    OpenaiCodex,
+    Anthropic,
+    Zai,
+    Stepfun,
+    Minimax,
 }
 
 impl From<ProviderArg> for ProviderKind {
@@ -62,6 +69,12 @@ impl From<ProviderArg> for ProviderKind {
             ProviderArg::Vllm => ProviderKind::Vllm,
             ProviderArg::Ollama => ProviderKind::Ollama,
             ProviderArg::Huggingface => ProviderKind::Huggingface,
+            ProviderArg::Together => ProviderKind::Together,
+            ProviderArg::OpenaiCodex => ProviderKind::OpenaiCodex,
+            ProviderArg::Anthropic => ProviderKind::Anthropic,
+            ProviderArg::Zai => ProviderKind::Zai,
+            ProviderArg::Stepfun => ProviderKind::Stepfun,
+            ProviderArg::Minimax => ProviderKind::Minimax,
         }
     }
 }
@@ -88,6 +101,12 @@ struct Cli {
     model: Option<String>,
     #[arg(long = "output-mode")]
     output_mode: Option<String>,
+    #[arg(
+        long = "verbosity",
+        value_name = "LEVEL",
+        help = "Controls transcript and output verbosity (normal, concise)"
+    )]
+    verbosity: Option<String>,
     #[arg(long = "log-level")]
     log_level: Option<String>,
     #[arg(long)]
@@ -181,6 +200,8 @@ and writes a SWE-bench-compatible JSONL prediction row from the resulting
 working-tree diff. `export` only writes the current diff.
 ")]
     Swebench(TuiPassthroughArgs),
+    /// Manage durable Agent Fleet runs via the TUI runtime.
+    Fleet(TuiPassthroughArgs),
     /// Run a CodeWhale-powered code review over a git diff.
     Review(TuiPassthroughArgs),
     /// Apply a patch file or stdin to the working tree.
@@ -513,6 +534,7 @@ fn run() -> Result<()> {
         approval_policy: cli.approval_policy.clone(),
         sandbox_mode: cli.sandbox_mode.clone(),
         yolo: Some(cli.yolo),
+        verbosity: cli.verbosity.clone(),
     };
     let command = cli.command.take();
 
@@ -561,6 +583,10 @@ fn run() -> Result<()> {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, tui_args("swebench", args))
         }
+        Some(Commands::Fleet(args)) => {
+            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            delegate_to_tui(&cli, &resolved_runtime, tui_args("fleet", args))
+        }
         Some(Commands::Review(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, tui_args("review", args))
@@ -594,7 +620,7 @@ fn run() -> Result<()> {
         Some(Commands::Auth(args)) => run_auth_command(&mut store, args.command),
         Some(Commands::McpServer) => run_mcp_server_command(&mut store),
         Some(Commands::Config(args)) => run_config_command(&mut store, args.command),
-        Some(Commands::Model(args)) => run_model_command(args.command),
+        Some(Commands::Model(args)) => run_model_command(args.command, runtime_overrides.provider),
         Some(Commands::Thread(args)) => run_thread_command(args.command),
         Some(Commands::Sandbox(args)) => run_sandbox_command(args.command),
         Some(Commands::AppServer(args)) => run_app_server_command(args),
@@ -767,11 +793,15 @@ fn provider_slot(provider: ProviderKind) -> &'static str {
         ProviderKind::Huggingface => "huggingface",
         ProviderKind::Together => "together",
         ProviderKind::OpenaiCodex => "openai-codex",
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Zai => "zai",
+        ProviderKind::Stepfun => "stepfun",
+        ProviderKind::Minimax => "minimax",
     }
 }
 
 /// Provider order used by the `auth list` and `auth status` outputs.
-const PROVIDER_LIST: [ProviderKind; 20] = [
+const PROVIDER_LIST: [ProviderKind; 24] = [
     ProviderKind::Deepseek,
     ProviderKind::NvidiaNim,
     ProviderKind::Openai,
@@ -792,7 +822,56 @@ const PROVIDER_LIST: [ProviderKind; 20] = [
     ProviderKind::Huggingface,
     ProviderKind::Together,
     ProviderKind::OpenaiCodex,
+    ProviderKind::Anthropic,
+    ProviderKind::Zai,
+    ProviderKind::Stepfun,
+    ProviderKind::Minimax,
 ];
+
+fn provider_is_supported_by_tui(provider: ProviderKind) -> bool {
+    matches!(
+        provider,
+        ProviderKind::Deepseek
+            | ProviderKind::NvidiaNim
+            | ProviderKind::Openai
+            | ProviderKind::Atlascloud
+            | ProviderKind::WanjieArk
+            | ProviderKind::Volcengine
+            | ProviderKind::Openrouter
+            | ProviderKind::XiaomiMimo
+            | ProviderKind::Novita
+            | ProviderKind::Fireworks
+            | ProviderKind::Siliconflow
+            | ProviderKind::SiliconflowCN
+            | ProviderKind::Arcee
+            | ProviderKind::Moonshot
+            | ProviderKind::Sglang
+            | ProviderKind::Vllm
+            | ProviderKind::Ollama
+            | ProviderKind::Huggingface
+            | ProviderKind::Together
+            | ProviderKind::OpenaiCodex
+            | ProviderKind::Zai
+            | ProviderKind::Stepfun
+            | ProviderKind::Minimax
+    )
+    // NOTE: Anthropic is intentionally exec-only in the interactive TUI: it
+    // speaks the native Messages API rather than the OpenAI-compatible shape the
+    // interactive loop expects, so `codewhale --provider anthropic` is rejected
+    // with a hint to use `codewhale exec --provider anthropic`. Zai (GLM/Z.AI),
+    // Stepfun, and Minimax are OpenAI-compatible and supported interactively.
+    // (Re-evaluate if/when the interactive loop gains a native Anthropic client.)
+}
+
+fn supported_tui_providers_csv() -> String {
+    ProviderKind::ALL
+        .iter()
+        .copied()
+        .filter(|provider| provider_is_supported_by_tui(*provider))
+        .map(ProviderKind::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 #[cfg(test)]
 fn no_keyring_secrets() -> Secrets {
@@ -865,6 +944,10 @@ fn provider_env_vars(provider: ProviderKind) -> &'static [&'static str] {
         ],
         ProviderKind::Together => &["TOGETHER_API_KEY"],
         ProviderKind::OpenaiCodex => &["OPENAI_CODEX_ACCESS_TOKEN", "CODEX_ACCESS_TOKEN"],
+        ProviderKind::Anthropic => &["ANTHROPIC_API_KEY"],
+        ProviderKind::Zai => &["ZAI_API_KEY", "Z_AI_API_KEY"],
+        ProviderKind::Stepfun => &["STEPFUN_API_KEY", "STEP_API_KEY"],
+        ProviderKind::Minimax => &["MINIMAX_API_KEY"],
     }
 }
 
@@ -875,6 +958,28 @@ fn provider_env_value(provider: ProviderKind) -> Option<(&'static str, String)> 
             .filter(|value| !value.trim().is_empty())
             .map(|value| (*var, value))
     })
+}
+
+fn openai_codex_auth_file_path() -> PathBuf {
+    if let Ok(path) = std::env::var("OPENAI_CODEX_AUTH_FILE") {
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+
+    let codex_home = std::env::var("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".codex")
+        });
+    codex_home.join("auth.json")
+}
+
+fn provider_oauth_file_path(provider: ProviderKind) -> Option<PathBuf> {
+    (provider == ProviderKind::OpenaiCodex).then(openai_codex_auth_file_path)
 }
 
 fn provider_config_api_key(store: &ConfigStore, provider: ProviderKind) -> Option<&str> {
@@ -936,17 +1041,31 @@ fn auth_status_all_providers(store: &ConfigStore, secrets: &Secrets) -> Vec<Stri
         let config_key = provider_config_api_key(store, provider);
         let keyring_key = provider_keyring_api_key(secrets, provider);
         let env_key = provider_env_value(provider);
+        let oauth_file_present = provider_oauth_file_path(provider).is_some_and(|p| p.exists());
 
         let config_status = config_key.map(|_| "set").unwrap_or("-");
         let keyring_status = keyring_key.as_ref().map(|_| "set").unwrap_or("-");
         let env_status = env_key.as_ref().map(|_| "set").unwrap_or("-");
 
-        let source = if config_key.is_some() {
+        let source = if provider == ProviderKind::OpenaiCodex {
+            // Keep the summary consistent with `auth status`: Codex auth is
+            // OAuth-file (or env token) based — config/keyring keys are not
+            // consulted for it.
+            if env_key.is_some() {
+                "env"
+            } else if oauth_file_present {
+                "oauth file"
+            } else {
+                "unset"
+            }
+        } else if config_key.is_some() {
             "config"
         } else if keyring_key.is_some() {
             "keyring"
         } else if env_key.is_some() {
             "env"
+        } else if oauth_file_present {
+            "oauth file"
         } else {
             "unset"
         };
@@ -982,8 +1101,18 @@ fn auth_status_lines_for_provider(
     let config_key = provider_config_api_key(store, provider);
     let keyring_key = provider_keyring_api_key(secrets, provider);
     let env_key = provider_env_value(provider);
+    let oauth_file = provider_oauth_file_path(provider);
+    let oauth_file_present = oauth_file.as_ref().is_some_and(|path| path.exists());
 
-    let active_source = if config_key.is_some() {
+    let active_source = if provider == ProviderKind::OpenaiCodex {
+        if env_key.is_some() {
+            "env"
+        } else if oauth_file_present {
+            "Codex OAuth file"
+        } else {
+            "missing"
+        }
+    } else if config_key.is_some() {
         "config"
     } else if keyring_key.is_some() {
         "secret store"
@@ -992,10 +1121,14 @@ fn auth_status_lines_for_provider(
     } else {
         "missing"
     };
-    let active_last4 = config_key
-        .map(last4_label)
-        .or_else(|| keyring_key.as_deref().map(last4_label))
-        .or_else(|| env_key.as_ref().map(|(_, value)| last4_label(value)));
+    let active_last4 = if provider == ProviderKind::OpenaiCodex {
+        env_key.as_ref().map(|(_, value)| last4_label(value))
+    } else {
+        config_key
+            .map(last4_label)
+            .or_else(|| keyring_key.as_deref().map(last4_label))
+            .or_else(|| env_key.as_ref().map(|(_, value)| last4_label(value)))
+    };
     let active_label = active_last4
         .map(|last4| format!("{active_source} (last4: {last4})"))
         .unwrap_or_else(|| active_source.to_string());
@@ -1016,16 +1149,24 @@ fn auth_status_lines_for_provider(
     let base_url = provider_cfg.base_url.as_deref().unwrap_or("(default)");
     let model = provider_cfg.model.as_deref().unwrap_or("(default)");
 
-    vec![
+    let lookup_order = if provider == ProviderKind::OpenaiCodex {
+        "lookup order: env -> Codex OAuth file".to_string()
+    } else {
+        "lookup order: config -> secret store -> env".to_string()
+    };
+    let auth_mode = if provider == ProviderKind::OpenaiCodex {
+        "codex_oauth"
+    } else {
+        store.config.auth_mode.as_deref().unwrap_or("api_key")
+    };
+
+    let mut lines = vec![
         format!("provider: {}{}", provider.as_str(), active_marker),
         format!("route: {}", base_url),
         format!("model: {}", model),
-        format!(
-            "auth mode: {}",
-            store.config.auth_mode.as_deref().unwrap_or("api_key")
-        ),
+        format!("auth mode: {auth_mode}"),
         format!("active source: {active_label}"),
-        "lookup order: config -> secret store -> env".to_string(),
+        lookup_order,
         format!(
             "config file: {} ({})",
             store.path().display(),
@@ -1037,7 +1178,12 @@ fn auth_status_lines_for_provider(
             source_status(keyring_key.as_deref(), "missing")
         ),
         format!("env var: {env_var_label} ({env_status})"),
-    ]
+    ];
+    if let Some(path) = oauth_file {
+        let status = if path.exists() { "present" } else { "missing" };
+        lines.push(format!("Codex OAuth file: {} ({status})", path.display()));
+    }
+    lines
 }
 
 fn source_status(value: Option<&str>, missing_label: &str) -> String {
@@ -1321,11 +1467,23 @@ fn run_config_command(store: &mut ConfigStore, command: ConfigCommand) -> Result
     }
 }
 
-fn run_model_command(command: ModelCommand) -> Result<()> {
+fn model_command_provider_hint(
+    command_provider: Option<ProviderArg>,
+    top_level_provider: Option<ProviderKind>,
+) -> Option<ProviderKind> {
+    command_provider
+        .map(ProviderKind::from)
+        .or(top_level_provider)
+}
+
+fn run_model_command(
+    command: ModelCommand,
+    top_level_provider: Option<ProviderKind>,
+) -> Result<()> {
     let registry = ModelRegistry::default();
     match command {
         ModelCommand::List { provider } => {
-            let filter = provider.map(ProviderKind::from);
+            let filter = model_command_provider_hint(provider, top_level_provider);
             for model in registry.list().into_iter().filter(|m| match filter {
                 Some(p) => m.provider == p,
                 None => true,
@@ -1335,7 +1493,8 @@ fn run_model_command(command: ModelCommand) -> Result<()> {
             Ok(())
         }
         ModelCommand::Resolve { model, provider } => {
-            let resolved = registry.resolve(model.as_deref(), provider.map(ProviderKind::from));
+            let provider = model_command_provider_hint(provider, top_level_provider);
+            let resolved = registry.resolve(model.as_deref(), provider);
             println!("requested: {}", resolved.requested.unwrap_or_default());
             println!("resolved: {}", resolved.resolved.id);
             println!("provider: {}", resolved.resolved.provider.as_str());
@@ -1579,6 +1738,14 @@ fn build_tui_command(
     passthrough: Vec<String>,
 ) -> Result<Command> {
     let tui = locate_sibling_tui_binary()?;
+    let mut verbosity = resolved_runtime.verbosity.clone();
+    if verbosity.is_none()
+        && passthrough
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "exec" | "swebench" | "eval"))
+    {
+        verbosity = Some("concise".to_string());
+    }
 
     let mut cmd = Command::new(&tui);
     if let Some(config) = cli.config.as_ref() {
@@ -1604,45 +1771,70 @@ fn build_tui_command(
     }
     cmd.args(passthrough);
 
-    if !matches!(
-        resolved_runtime.provider,
-        ProviderKind::Deepseek
-            | ProviderKind::NvidiaNim
-            | ProviderKind::Openai
-            | ProviderKind::Atlascloud
-            | ProviderKind::WanjieArk
-            | ProviderKind::Volcengine
-            | ProviderKind::Openrouter
-            | ProviderKind::XiaomiMimo
-            | ProviderKind::Novita
-            | ProviderKind::Fireworks
-            | ProviderKind::Siliconflow
-            | ProviderKind::Arcee
-            | ProviderKind::Moonshot
-            | ProviderKind::Sglang
-            | ProviderKind::Vllm
-            | ProviderKind::Ollama
-    ) {
-        bail!(
-            "The interactive TUI supports DeepSeek, NVIDIA NIM, OpenAI-compatible, AtlasCloud, Wanjie Ark, Volcengine Ark, OpenRouter, Xiaomi MiMo, Novita, Fireworks, SiliconFlow, Arcee AI, Moonshot/Kimi, SGLang, vLLM, and Ollama providers. Remove --provider {} or use `codewhale model ...` for provider registry inspection.",
-            resolved_runtime.provider.as_str()
-        );
+    let mut launch_provider_override = cli.provider.map(ProviderKind::from);
+    let mut keyring_bridge_provider = resolved_runtime.provider;
+    let mut keyring_bridge_api_key = resolved_runtime.api_key.as_ref();
+    let mut keyring_bridge_source = resolved_runtime.api_key_source;
+
+    if !provider_is_supported_by_tui(resolved_runtime.provider) {
+        let supported = supported_tui_providers_csv();
+        match resolved_runtime.provider_source {
+            ProviderSource::Cli => {
+                bail!(
+                    "The interactive TUI does not support provider '{}' from --provider.\n\
+                     \n\
+                     Supported TUI providers: {supported}.\n\
+                     \n\
+                     To fix: remove `--provider {}` or pass a supported provider. \
+                     For this provider, use `codewhale exec --provider {} \"your prompt\"`.",
+                    resolved_runtime.provider.as_str(),
+                    resolved_runtime.provider.as_str(),
+                    resolved_runtime.provider.as_str(),
+                );
+            }
+            ProviderSource::Env(var) => {
+                bail!(
+                    "The interactive TUI does not support provider '{}' from {var}.\n\
+                     \n\
+                     Supported TUI providers: {supported}.\n\
+                     \n\
+                     To fix: unset {var} or set it to a supported provider. \
+                     For this provider, use `codewhale exec --provider {} \"your prompt\"`.",
+                    resolved_runtime.provider.as_str(),
+                    resolved_runtime.provider.as_str(),
+                );
+            }
+            ProviderSource::Config => {
+                let config_hint = cli
+                    .config
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "~/.codewhale/config.toml".to_string());
+                eprintln!(
+                    "Warning: provider '{}' from config is not supported by the interactive TUI; \
+                     launching with deepseek instead. Edit {config_hint} and set \
+                     provider = \"deepseek\", or pass --provider <supported-id>.",
+                    resolved_runtime.provider.as_str(),
+                );
+                launch_provider_override = Some(ProviderKind::Deepseek);
+                keyring_bridge_provider = ProviderKind::Deepseek;
+                keyring_bridge_api_key = None;
+                keyring_bridge_source = None;
+            }
+        }
     }
 
-    if let Some(provider) = cli.provider {
-        let provider: ProviderKind = provider.into();
+    if let Some(provider) = launch_provider_override {
         cmd.env("DEEPSEEK_PROVIDER", provider.as_str());
     }
-    if matches!(
-        resolved_runtime.api_key_source,
-        Some(RuntimeApiKeySource::Keyring)
-    ) && let Some(api_key) = resolved_runtime.api_key.as_ref()
+    if matches!(keyring_bridge_source, Some(RuntimeApiKeySource::Keyring))
+        && let Some(api_key) = keyring_bridge_api_key
     {
         // TUI reloads auth_mode from config/profile, but it does not re-query the
         // platform keyring on normal startup. Bridge only the recovered secret;
         // replaying auth_mode here would turn it back into a profile override.
         cmd.env("DEEPSEEK_API_KEY", api_key);
-        for var in provider_env_vars(resolved_runtime.provider) {
+        for var in provider_env_vars(keyring_bridge_provider) {
             if *var != "DEEPSEEK_API_KEY" {
                 cmd.env(var, api_key);
             }
@@ -1658,6 +1850,10 @@ fn build_tui_command(
     }
     if let Some(output_mode) = cli.output_mode.as_ref() {
         cmd.env("DEEPSEEK_OUTPUT_MODE", output_mode);
+    }
+    if let Some(v) = verbosity.as_ref() {
+        cmd.env("CODEWHALE_VERBOSITY", v);
+        cmd.env("DEEPSEEK_VERBOSITY", v);
     }
     if let Some(log_level) = cli.log_level.as_ref() {
         cmd.env("DEEPSEEK_LOG_LEVEL", log_level);
@@ -1891,6 +2087,41 @@ mod tests {
         }
     }
 
+    fn install_fake_tui_binary() -> (tempfile::TempDir, ScopedEnvVar) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let custom = dir
+            .path()
+            .join(format!("custom-tui{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&custom, b"").unwrap();
+        let custom_str = custom.to_string_lossy().into_owned();
+        let bin = ScopedEnvVar::set("DEEPSEEK_TUI_BIN", &custom_str);
+        (dir, bin)
+    }
+
+    fn resolved_runtime_for_test(
+        provider: ProviderKind,
+        provider_source: ProviderSource,
+    ) -> ResolvedRuntimeOptions {
+        ResolvedRuntimeOptions {
+            provider,
+            provider_source,
+            model: "test-model".to_string(),
+            api_key: None,
+            api_key_source: None,
+            base_url: "http://localhost:8000/v1".to_string(),
+            auth_mode: None,
+            insecure_skip_tls_verify: false,
+            output_mode: None,
+            log_level: None,
+            telemetry: false,
+            approval_policy: None,
+            sandbox_mode: None,
+            yolo: None,
+            verbosity: None,
+            http_headers: std::collections::BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn clap_command_definition_is_consistent() {
         Cli::command().debug_assert();
@@ -2053,6 +2284,28 @@ mod tests {
     }
 
     #[test]
+    fn model_command_provider_hint_uses_subcommand_then_top_level_provider() {
+        assert_eq!(
+            model_command_provider_hint(None, Some(ProviderKind::Zai)),
+            Some(ProviderKind::Zai)
+        );
+        assert_eq!(
+            model_command_provider_hint(Some(ProviderArg::Minimax), Some(ProviderKind::Zai)),
+            Some(ProviderKind::Minimax)
+        );
+        assert_eq!(model_command_provider_hint(None, None), None);
+
+        let cli = parse_ok(&["codewhale", "--provider", "zai", "model", "list"]);
+        assert_eq!(cli.provider, Some(ProviderArg::Zai));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Model(ModelArgs {
+                command: ModelCommand::List { provider: None }
+            }))
+        ));
+    }
+
+    #[test]
     fn parses_thread_command_matrix() {
         let cli = parse_ok(&["deepseek", "thread", "list", "--all", "--limit", "50"]);
         assert!(matches!(
@@ -2201,6 +2454,28 @@ mod tests {
             cli.command,
             Some(Commands::Setup(TuiPassthroughArgs { ref args }))
                 if args == &["--skills", "--local"]
+        ));
+
+        let cli = parse_ok(&["codewhale", "fleet", "init"]);
+        assert!(cli.prompt.is_empty());
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Fleet(TuiPassthroughArgs { ref args })) if args == &["init"]
+        ));
+
+        let cli = parse_ok(&[
+            "codewhale",
+            "fleet",
+            "run",
+            "tasks.json",
+            "--max-workers",
+            "2",
+        ]);
+        assert!(cli.prompt.is_empty());
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Fleet(TuiPassthroughArgs { ref args }))
+                if args == &["run", "tasks.json", "--max-workers", "2"]
         ));
     }
 
@@ -2404,6 +2679,42 @@ mod tests {
                 }
             }))
         ));
+
+        let cli = parse_ok(&["deepseek", "auth", "status", "--provider", "openai-codex"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth(AuthArgs {
+                command: AuthCommand::Status {
+                    provider: Some(ProviderArg::OpenaiCodex)
+                }
+            }))
+        ));
+
+        for (provider, expected) in [
+            ("anthropic", ProviderArg::Anthropic),
+            ("zai", ProviderArg::Zai),
+            ("stepfun", ProviderArg::Stepfun),
+            ("minimax", ProviderArg::Minimax),
+        ] {
+            let cli = parse_ok(&[
+                "deepseek",
+                "auth",
+                "set",
+                "--provider",
+                provider,
+                "--api-key-stdin",
+            ]);
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Auth(AuthArgs {
+                    command: AuthCommand::Set {
+                        provider,
+                        api_key: None,
+                        api_key_stdin: true,
+                    }
+                })) if provider == expected
+            ));
+        }
 
         let cli = parse_ok(&["deepseek", "auth", "list"]);
         assert!(matches!(
@@ -2722,6 +3033,41 @@ mod tests {
     }
 
     #[test]
+    fn auth_status_openai_codex_reports_codex_oauth_file() {
+        use codewhale_secrets::InMemoryKeyringStore;
+        use std::sync::Arc;
+
+        let _lock = env_lock();
+        let _access_token = ScopedEnvVar::set("OPENAI_CODEX_ACCESS_TOKEN", "");
+        let _codex_token = ScopedEnvVar::set("CODEX_ACCESS_TOKEN", "");
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(&auth_path, r#"{"tokens":{"access_token":"secret-token"}}"#)
+            .expect("write auth file");
+        let auth_path_str = auth_path.to_string_lossy().into_owned();
+        let _auth_file = ScopedEnvVar::set("OPENAI_CODEX_AUTH_FILE", &auth_path_str);
+
+        let mut store = ConfigStore::load(Some(config_path)).expect("store should load");
+        store.config.provider = ProviderKind::OpenaiCodex;
+        let secrets = Secrets::new(Arc::new(InMemoryKeyringStore::new()));
+
+        let output =
+            auth_status_lines_for_provider(&store, &secrets, ProviderKind::OpenaiCodex).join("\n");
+
+        assert!(output.contains("provider: openai-codex"));
+        assert!(output.contains("auth mode: codex_oauth"));
+        assert!(output.contains("active source: Codex OAuth file"));
+        assert!(output.contains("lookup order: env -> Codex OAuth file"));
+        assert!(output.contains(&format!(
+            "Codex OAuth file: {} (present)",
+            auth_path.display()
+        )));
+        assert!(!output.contains("secret-token"));
+    }
+
+    #[test]
     fn auth_status_scoped_provider_shows_detailed_info() {
         use codewhale_secrets::InMemoryKeyringStore;
         use std::sync::Arc;
@@ -2910,6 +3256,8 @@ mod tests {
             "deepseek-v4-pro",
             "--output-mode",
             "json",
+            "--verbosity",
+            "concise",
             "--log-level",
             "debug",
             "--telemetry",
@@ -2937,6 +3285,7 @@ mod tests {
         assert_eq!(cli.profile.as_deref(), Some("work"));
         assert_eq!(cli.model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(cli.output_mode.as_deref(), Some("json"));
+        assert_eq!(cli.verbosity.as_deref(), Some("concise"));
         assert_eq!(cli.log_level.as_deref(), Some("debug"));
         assert_eq!(cli.telemetry, Some(true));
         assert_eq!(cli.approval_policy.as_deref(), Some("on-request"));
@@ -2973,6 +3322,7 @@ mod tests {
         ]);
         let resolved = ResolvedRuntimeOptions {
             provider: ProviderKind::Openai,
+            provider_source: ProviderSource::Cli,
             model: "glm-5".to_string(),
             api_key: Some("resolved-openai-key".to_string()),
             api_key_source: Some(RuntimeApiKeySource::Keyring),
@@ -2985,6 +3335,7 @@ mod tests {
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
         };
 
@@ -3018,6 +3369,146 @@ mod tests {
     }
 
     #[test]
+    fn build_tui_command_allows_openai_codex_from_resolved_runtime() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let custom = dir
+            .path()
+            .join(format!("custom-tui{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&custom, b"").unwrap();
+        let custom_str = custom.to_string_lossy().into_owned();
+        let _bin = ScopedEnvVar::set("DEEPSEEK_TUI_BIN", &custom_str);
+
+        let cli = parse_ok(&["codewhale", "doctor"]);
+        let resolved = ResolvedRuntimeOptions {
+            provider: ProviderKind::OpenaiCodex,
+            provider_source: ProviderSource::Config,
+            model: "gpt-5.5".to_string(),
+            api_key: None,
+            api_key_source: None,
+            base_url: "https://chatgpt.com/backend-api".to_string(),
+            auth_mode: Some("oauth".to_string()),
+            insecure_skip_tls_verify: false,
+            output_mode: None,
+            log_level: None,
+            telemetry: false,
+            approval_policy: None,
+            sandbox_mode: None,
+            yolo: None,
+            verbosity: None,
+            http_headers: std::collections::BTreeMap::new(),
+        };
+
+        let cmd = build_tui_command(&cli, &resolved, vec!["doctor".to_string()])
+            .expect("openai-codex should be accepted by the facade");
+        assert_eq!(command_env(&cmd, "DEEPSEEK_PROVIDER"), None);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["doctor"]);
+    }
+
+    #[test]
+    fn build_tui_command_forwards_explicit_openai_codex_provider() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let custom = dir
+            .path()
+            .join(format!("custom-tui{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&custom, b"").unwrap();
+        let custom_str = custom.to_string_lossy().into_owned();
+        let _bin = ScopedEnvVar::set("DEEPSEEK_TUI_BIN", &custom_str);
+
+        let cli = parse_ok(&["codewhale", "--provider", "openai-codex", "doctor"]);
+        let resolved = ResolvedRuntimeOptions {
+            provider: ProviderKind::OpenaiCodex,
+            provider_source: ProviderSource::Cli,
+            model: "gpt-5.5".to_string(),
+            api_key: None,
+            api_key_source: None,
+            base_url: "https://chatgpt.com/backend-api".to_string(),
+            auth_mode: Some("oauth".to_string()),
+            insecure_skip_tls_verify: false,
+            output_mode: None,
+            log_level: None,
+            telemetry: false,
+            approval_policy: None,
+            sandbox_mode: None,
+            yolo: None,
+            verbosity: None,
+            http_headers: std::collections::BTreeMap::new(),
+        };
+
+        let cmd = build_tui_command(&cli, &resolved, vec!["doctor".to_string()])
+            .expect("openai-codex should be accepted by the facade");
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_PROVIDER").as_deref(),
+            Some("openai-codex")
+        );
+    }
+
+    #[test]
+    fn build_tui_command_rejects_unsupported_cli_provider_with_flag_hint() {
+        let _lock = env_lock();
+        let (_dir, _bin) = install_fake_tui_binary();
+
+        let cli = parse_ok(&["codewhale", "doctor"]);
+        let resolved = resolved_runtime_for_test(ProviderKind::Anthropic, ProviderSource::Cli);
+
+        let err = build_tui_command(&cli, &resolved, vec!["doctor".to_string()])
+            .expect_err("unsupported provider should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("from --provider"), "{msg}");
+        assert!(msg.contains("remove `--provider anthropic`"), "{msg}");
+        assert!(msg.contains("Supported TUI providers:"), "{msg}");
+    }
+
+    #[test]
+    fn build_tui_command_rejects_unsupported_env_provider_with_env_hint() {
+        let _lock = env_lock();
+        let (_dir, _bin) = install_fake_tui_binary();
+
+        let cli = parse_ok(&["codewhale", "doctor"]);
+        let resolved = resolved_runtime_for_test(
+            ProviderKind::Anthropic,
+            ProviderSource::Env("DEEPSEEK_PROVIDER"),
+        );
+
+        let err = build_tui_command(&cli, &resolved, vec!["doctor".to_string()])
+            .expect_err("unsupported provider should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("from DEEPSEEK_PROVIDER"), "{msg}");
+        assert!(msg.contains("unset DEEPSEEK_PROVIDER"), "{msg}");
+        assert!(msg.contains("Supported TUI providers:"), "{msg}");
+    }
+
+    #[test]
+    fn build_tui_command_config_fallback_does_not_forward_stale_keyring_secret() {
+        let _lock = env_lock();
+        let (_dir, _bin) = install_fake_tui_binary();
+
+        let cli = parse_ok(&["codewhale", "doctor"]);
+        let mut resolved =
+            resolved_runtime_for_test(ProviderKind::Anthropic, ProviderSource::Config);
+        resolved.api_key = Some("anthropic-keyring-secret".to_string());
+        resolved.api_key_source = Some(RuntimeApiKeySource::Keyring);
+
+        let cmd = build_tui_command(&cli, &resolved, vec!["doctor".to_string()])
+            .expect("config-sourced unsupported provider should fall back");
+
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_PROVIDER").as_deref(),
+            Some("deepseek")
+        );
+        assert_eq!(command_env(&cmd, "DEEPSEEK_API_KEY"), None);
+        assert_eq!(command_env(&cmd, "ANTHROPIC_API_KEY"), None);
+        assert_eq!(command_env(&cmd, "DEEPSEEK_API_KEY_SOURCE"), None);
+    }
+
+    #[test]
     fn build_tui_command_does_not_export_default_runtime_overrides_for_profiles() {
         let _lock = env_lock();
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -3033,6 +3524,7 @@ mod tests {
         resolved_headers.insert("X-From-Base".to_string(), "base".to_string());
         let resolved = ResolvedRuntimeOptions {
             provider: ProviderKind::Deepseek,
+            provider_source: ProviderSource::Config,
             model: "deepseek-v4-pro".to_string(),
             api_key: Some("config-file-key".to_string()),
             api_key_source: Some(RuntimeApiKeySource::ConfigFile),
@@ -3045,6 +3537,7 @@ mod tests {
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: resolved_headers,
         };
 
@@ -3068,6 +3561,53 @@ mod tests {
     }
 
     #[test]
+    fn build_tui_command_defaults_noninteractive_to_concise_verbosity() {
+        let _lock = env_lock();
+        let (_dir, _bin) = install_fake_tui_binary();
+
+        let cli = parse_ok(&["codewhale"]);
+        let resolved = resolved_runtime_for_test(ProviderKind::Deepseek, ProviderSource::Config);
+
+        let cmd = build_tui_command(
+            &cli,
+            &resolved,
+            vec!["exec".to_string(), "summarize".to_string()],
+        )
+        .expect("command");
+
+        assert_eq!(
+            command_env(&cmd, "CODEWHALE_VERBOSITY").as_deref(),
+            Some("concise")
+        );
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_VERBOSITY").as_deref(),
+            Some("concise")
+        );
+    }
+
+    #[test]
+    fn build_tui_command_respects_resolved_verbosity_override() {
+        let _lock = env_lock();
+        let (_dir, _bin) = install_fake_tui_binary();
+
+        let cli = parse_ok(&["codewhale"]);
+        let mut resolved =
+            resolved_runtime_for_test(ProviderKind::Deepseek, ProviderSource::Config);
+        resolved.verbosity = Some("normal".to_string());
+
+        let cmd = build_tui_command(&cli, &resolved, vec!["exec".to_string()]).expect("command");
+
+        assert_eq!(
+            command_env(&cmd, "CODEWHALE_VERBOSITY").as_deref(),
+            Some("normal")
+        );
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_VERBOSITY").as_deref(),
+            Some("normal")
+        );
+    }
+
+    #[test]
     fn build_tui_command_allows_moonshot_and_forwards_kimi_key() {
         let _lock = env_lock();
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -3083,13 +3623,14 @@ mod tests {
             "--provider",
             "moonshot",
             "--model",
-            "kimi-k2.6",
+            "kimi-k2.7-code",
             "--workspace",
             "/tmp/codewhale-workspace",
         ]);
         let resolved = ResolvedRuntimeOptions {
             provider: ProviderKind::Moonshot,
-            model: "kimi-k2.6".to_string(),
+            provider_source: ProviderSource::Cli,
+            model: "kimi-k2.7-code".to_string(),
             api_key: Some("resolved-kimi-key".to_string()),
             api_key_source: Some(RuntimeApiKeySource::Keyring),
             base_url: "https://api.moonshot.ai/v1".to_string(),
@@ -3101,6 +3642,7 @@ mod tests {
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
         };
 
@@ -3111,7 +3653,7 @@ mod tests {
         );
         assert_eq!(
             command_env(&cmd, "DEEPSEEK_MODEL").as_deref(),
-            Some("kimi-k2.6")
+            Some("kimi-k2.7-code")
         );
         assert_eq!(
             command_env(&cmd, "DEEPSEEK_API_KEY").as_deref(),
@@ -3154,6 +3696,7 @@ mod tests {
         ]);
         let resolved = ResolvedRuntimeOptions {
             provider: ProviderKind::Volcengine,
+            provider_source: ProviderSource::Cli,
             model: "DeepSeek-V4-Pro".to_string(),
             api_key: Some("resolved-ark-key".to_string()),
             api_key_source: Some(RuntimeApiKeySource::Keyring),
@@ -3166,6 +3709,7 @@ mod tests {
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
         };
 
@@ -3220,6 +3764,7 @@ mod tests {
         ]);
         let resolved = ResolvedRuntimeOptions {
             provider: ProviderKind::Openai,
+            provider_source: ProviderSource::Cli,
             model: "glm-5".to_string(),
             api_key: None,
             api_key_source: None,
@@ -3232,6 +3777,7 @@ mod tests {
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
         };
 
@@ -3316,6 +3862,7 @@ mod tests {
             ]);
             let resolved = ResolvedRuntimeOptions {
                 provider,
+                provider_source: ProviderSource::Cli,
                 model: "test-model".to_string(),
                 api_key: Some("test-key".to_string()),
                 api_key_source: Some(RuntimeApiKeySource::Keyring),
@@ -3328,6 +3875,7 @@ mod tests {
                 approval_policy: None,
                 sandbox_mode: None,
                 yolo: None,
+                verbosity: None,
                 http_headers: std::collections::BTreeMap::new(),
             };
 

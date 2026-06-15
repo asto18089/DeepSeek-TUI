@@ -4,10 +4,17 @@ codewhale has two related concepts:
 
 - **TUI mode**: what kind of visible interaction you're in (Plan/Agent/YOLO).
 - **Approval mode**: how aggressively the UI asks before executing tools.
+- **WhaleFlow overlay**: optional long-running workflow orchestration that can
+  run on top of any TUI mode when a task needs many coordinated workers.
 
 Model selection is separate. `--model auto` and `/model auto` route each turn to
 a concrete model and thinking level; they are not TUI modes and are not part of
 the `Tab` cycle.
+
+WhaleFlow is also separate from the `Tab` mode cycle. It is the visible
+continuous-work layer for repeatable workflows, fleet workers, and swarm-style
+fanout. The active mode still controls permissions; WhaleFlow controls whether a
+large task is planned into a resumable workflow with its own progress view.
 
 Each user turn includes a small `<turn_meta>` block with the current local date
 and the concrete model sent to the provider. When `--model auto` is active, the
@@ -48,10 +55,24 @@ The fast `deepseek-v4-flash` / thinking-off path is called Fin in the product
 language. Fin is a seam for routing, summaries, cheap child calls, and
 coordination work; it does not change approval behavior.
 
-`/goal` sets a session objective with an optional token budget and keeps that
-objective visible as Work context. It does not change the active TUI mode,
+`/goal` sets a session objective with an optional token budget and keeps active
+objectives visible as Work context. `/goal pause` stops goal continuation without
+changing the objective, `/goal resume` resumes and sends the objective back into
+the turn, `/goal complete` marks it done, `/goal blocked` marks it blocked, and
+`/goal clear` removes it. Goal state does not change the active TUI mode,
 approval mode, or model route. This remains distinct from `--model auto`, which
 only controls model and thinking selection.
+
+WhaleFlow builds on the same separation: a goal can ask the agent to keep
+working, while WhaleFlow supplies the repeatable workflow/progress surface for
+large fanout. In the UI, a WhaleFlow run should be shown as an overlay on the
+main screen, not as a fourth mode next to Agent, Plan, and YOLO.
+
+App-server clients can persist a thread-scoped goal with `thread/goal/set`, read
+it with `thread/goal/get`, and clear it with `thread/goal/clear`. That persisted
+record carries `active`, `paused`, `blocked`, `usage_limited`, `budget_limited`,
+or `complete` status plus token/time accounting fields for clients that need
+thread resume semantics.
 
 ## Compatibility Notes
 

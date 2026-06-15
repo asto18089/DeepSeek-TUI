@@ -5,6 +5,7 @@
 
 use crate::compaction::CompactionConfig;
 use crate::models::{Message, SystemPrompt};
+use crate::tools::goal::GoalStatus;
 use crate::tui::app::AppMode;
 use crate::tui::approval::ApprovalMode;
 use std::path::PathBuf;
@@ -21,6 +22,8 @@ pub enum Op {
         mode: AppMode,
         model: String,
         goal_objective: Option<String>,
+        goal_token_budget: Option<u32>,
+        goal_status: GoalStatus,
         /// Reasoning-effort tier: `"off" | "low" | "medium" | "high" | "max"`.
         /// `None` lets the provider apply its default.
         reasoning_effort: Option<String>,
@@ -41,6 +44,7 @@ pub enum Op {
         /// Hook executor for control-plane hooks.
         /// `ToolCallBefore` hooks may deny a tool call with exit code 2.
         hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
+        verbosity: Option<String>,
     },
 
     /// Execute a user-submitted composer shell command (`! <command>`) without

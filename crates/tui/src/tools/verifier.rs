@@ -13,6 +13,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use shlex::try_join;
 
 use crate::dependencies::ExternalTool;
 
@@ -23,6 +24,7 @@ use super::spec::{
 const MAX_GATE_OUTPUT_CHARS: usize = 16_000;
 const DEFAULT_MAX_PYTHON_FILES: usize = 200;
 const MAX_CUSTOM_GATES: usize = 12;
+const BACKGROUND_GATE_TIMEOUT_MS: u64 = 600_000;
 
 /// Tool for running independent verifier gates concurrently.
 pub struct RunVerifiersTool;
@@ -95,6 +97,7 @@ struct RunVerifiersInput {
     level: String,
     max_python_files: usize,
     commands: Vec<CustomVerifierInput>,
+    background: bool,
 }
 
 impl Default for RunVerifiersInput {
@@ -104,6 +107,7 @@ impl Default for RunVerifiersInput {
             level: "quick".to_string(),
             max_python_files: DEFAULT_MAX_PYTHON_FILES,
             commands: Vec::new(),
+            background: false,
         }
     }
 }
@@ -164,6 +168,33 @@ struct RunVerifiersOutput {
     skipped: usize,
     summary: String,
     gates: Vec<GateResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BackgroundGateJob {
+    name: String,
+    ecosystem: String,
+    status: String,
+    command: String,
+    cwd: String,
+    task_id: Option<String>,
+    skipped_reason: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunVerifiersBackgroundOutput {
+    success: bool,
+    profile: String,
+    level: String,
+    workspace: String,
+    background: bool,
+    gate_count: usize,
+    started: usize,
+    skipped: usize,
+    failed_to_start: usize,
+    summary: String,
+    jobs: Vec<BackgroundGateJob>,
 }
 
 #[async_trait]
@@ -228,6 +259,11 @@ impl ToolSpec for RunVerifiersTool {
                         "additionalProperties": false
                     },
                     "default": []
+                },
+                "background": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Start verifier gates as background shell jobs and return task_ids immediately. Use for long build/test/lint gates, then poll with exec_shell_wait or task_shell_wait while continuing independent inspection."
                 }
             },
             "additionalProperties": false
@@ -240,6 +276,10 @@ impl ToolSpec for RunVerifiersTool {
 
     fn approval_requirement(&self) -> ApprovalRequirement {
         ApprovalRequirement::Required
+    }
+
+    fn starts_detached_for(&self, input: &Value) -> bool {
+        input.get("background").and_then(Value::as_bool) == Some(true)
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
@@ -280,6 +320,10 @@ impl ToolSpec for RunVerifiersTool {
             };
             return ToolResult::json(&output)
                 .map_err(|err| ToolError::execution_failed(err.to_string()));
+        }
+
+        if input.background {
+            return start_background_gates(context, profile, level, gates);
         }
 
         let mut handles = Vec::with_capacity(gates.len());
@@ -343,6 +387,129 @@ impl ToolSpec for RunVerifiersTool {
 
         ToolResult::json(&output).map_err(|err| ToolError::execution_failed(err.to_string()))
     }
+}
+
+fn start_background_gates(
+    context: &ToolContext,
+    profile: VerifierProfile,
+    level: VerifierLevel,
+    gates: Vec<VerifierGate>,
+) -> Result<ToolResult, ToolError> {
+    let mut jobs = Vec::with_capacity(gates.len());
+    let mut started = 0usize;
+    let mut skipped = 0usize;
+    let mut failed_to_start = 0usize;
+
+    for gate in gates {
+        let cwd = gate.cwd.display().to_string();
+        let Some(program) = gate.program.as_deref() else {
+            skipped += 1;
+            jobs.push(BackgroundGateJob {
+                name: gate.name,
+                ecosystem: gate.ecosystem,
+                status: "skipped".to_string(),
+                command: String::new(),
+                cwd,
+                task_id: None,
+                skipped_reason: gate.skipped_reason,
+                error: None,
+            });
+            continue;
+        };
+
+        let command = render_gate_command(program, &gate.args)?;
+        let env: HashMap<String, String> = gate.env.into_iter().collect();
+        let spawn_result = {
+            let mut manager = context
+                .shell_manager
+                .lock()
+                .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
+            manager.execute_with_options_env(
+                &command,
+                Some(&cwd),
+                BACKGROUND_GATE_TIMEOUT_MS,
+                true,
+                None,
+                false,
+                context.elevated_sandbox_policy.clone(),
+                env,
+            )
+        };
+
+        match spawn_result {
+            Ok(result) => {
+                started += 1;
+                jobs.push(BackgroundGateJob {
+                    name: gate.name,
+                    ecosystem: gate.ecosystem,
+                    status: "running".to_string(),
+                    command,
+                    cwd,
+                    task_id: result.task_id,
+                    skipped_reason: None,
+                    error: None,
+                });
+            }
+            Err(err) => {
+                failed_to_start += 1;
+                jobs.push(BackgroundGateJob {
+                    name: gate.name,
+                    ecosystem: gate.ecosystem,
+                    status: "failed_to_start".to_string(),
+                    command,
+                    cwd,
+                    task_id: None,
+                    skipped_reason: None,
+                    error: Some(err.to_string()),
+                });
+            }
+        }
+    }
+
+    jobs.sort_by(|a, b| a.name.cmp(&b.name));
+    let success = failed_to_start == 0 && started > 0;
+    let summary = if failed_to_start == 0 {
+        format!(
+            "Started {started} verifier gate(s) in the background; {skipped} skipped. Poll task_ids with exec_shell_wait or task_shell_wait."
+        )
+    } else {
+        format!(
+            "Started {started} verifier gate(s), failed to start {failed_to_start}, and skipped {skipped}. Poll task_ids with exec_shell_wait or task_shell_wait."
+        )
+    };
+    let task_ids = jobs
+        .iter()
+        .filter_map(|job| job.task_id.clone())
+        .collect::<Vec<_>>();
+    let output = RunVerifiersBackgroundOutput {
+        success,
+        profile: profile.as_str().to_string(),
+        level: level.as_str().to_string(),
+        workspace: context.workspace.display().to_string(),
+        background: true,
+        gate_count: jobs.len(),
+        started,
+        skipped,
+        failed_to_start,
+        summary,
+        jobs,
+    };
+
+    let mut result =
+        ToolResult::json(&output).map_err(|err| ToolError::execution_failed(err.to_string()))?;
+    result.success = success;
+    Ok(result.with_metadata(json!({
+        "backgrounded": true,
+        "detached_start": true,
+        "verifier_background": true,
+        "task_ids": task_ids,
+        "poll_with": ["exec_shell_wait", "task_shell_wait"]
+    })))
+}
+
+fn render_gate_command(program: &str, args: &[String]) -> Result<String, ToolError> {
+    try_join(std::iter::once(program).chain(args.iter().map(String::as_str)))
+        .map_err(|err| ToolError::execution_failed(format!("failed to render gate command: {err}")))
 }
 
 fn build_gate_plan(
@@ -951,6 +1118,7 @@ fn char_boundary_index(text: &str, max_chars: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::shell::ShellStatus;
     use tempfile::tempdir;
 
     #[test]
@@ -961,6 +1129,20 @@ mod tests {
             ApprovalRequirement::Required,
             "run_verifiers executes project code and must require approval"
         );
+    }
+
+    #[test]
+    fn run_verifiers_background_advertises_detached_start() {
+        let tool = RunVerifiersTool;
+        let schema = tool.input_schema();
+        let background_description = schema["properties"]["background"]["description"]
+            .as_str()
+            .expect("background description");
+
+        assert!(background_description.contains("exec_shell_wait"));
+        assert!(background_description.contains("task_shell_wait"));
+        assert!(tool.starts_detached_for(&json!({"background": true})));
+        assert!(!tool.starts_detached_for(&json!({"profile": "auto"})));
     }
 
     #[test]
@@ -1062,6 +1244,66 @@ mod tests {
             parsed.gates[0].stdout.contains("rustc"),
             "stdout should include rustc version: {:?}",
             parsed.gates[0].stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn run_verifiers_background_starts_shell_jobs_and_returns_task_ids() {
+        if !crate::dependencies::RustC::available() {
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path());
+        let tool = RunVerifiersTool;
+        let result = tool
+            .execute(
+                json!({
+                    "profile": "auto",
+                    "background": true,
+                    "commands": [
+                        {
+                            "name": "rustc-version",
+                            "program": crate::dependencies::RustC::resolve().expect("rustc"),
+                            "args": ["--version"]
+                        }
+                    ]
+                }),
+                &ctx,
+            )
+            .await
+            .expect("execute");
+
+        let parsed: RunVerifiersBackgroundOutput =
+            serde_json::from_str(&result.content).expect("background verifier output json");
+        assert!(parsed.success, "result: {}", result.content);
+        assert!(parsed.background);
+        assert_eq!(parsed.started, 1);
+        assert_eq!(parsed.failed_to_start, 0);
+        let task_id = parsed.jobs[0]
+            .task_id
+            .as_deref()
+            .expect("background task id");
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("verifier_background"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            "metadata should mark verifier background start"
+        );
+
+        let output = ctx
+            .shell_manager
+            .lock()
+            .expect("shell manager")
+            .get_output(task_id, true, 10_000)
+            .expect("background output");
+        assert_eq!(output.status, ShellStatus::Completed);
+        assert!(
+            output.stdout.contains("rustc"),
+            "stdout should include rustc version: {:?}",
+            output.stdout
         );
     }
 }

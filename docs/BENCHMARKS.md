@@ -103,6 +103,23 @@ harbor run \
   --model deepseek/deepseek-chat
 ```
 
+### Compare CodeWhale and Codex
+
+Use the paired comparison harness when you need one normalized row per CLI for
+the same task, model, timeout, and environment:
+
+```bash
+python scripts/benchmarks/cli-compare.py \
+  --task prove-plus-comm \
+  --model deepseek/deepseek-chat \
+  --runs 3
+```
+
+The harness writes raw Harbor logs plus `summary.json`, `summary.md`, and
+`metadata.json` under `benchmark_results/cli-compare-*`. Missing metrics are
+reported as JSON `null`, and generated run directories are intentionally ignored
+by git; keep only curated summaries in docs or release notes.
+
 ## PinchBench
 
 PinchBench measures agent performance on real-world tasks — scheduling, email

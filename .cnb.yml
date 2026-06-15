@@ -113,20 +113,24 @@ $:
     - docker:
         image: rust:1.88-bookworm
       stages:
-        - name: build linux x64 release assets
+        - name: build linux x64 release assets (static)
           script: |
             set -eu
 
             apt-get update
-            apt-get install -y git libdbus-1-dev nodejs pkg-config
+            apt-get install -y git musl-tools nodejs pkg-config
+            rustup target add x86_64-unknown-linux-musl
 
             ./scripts/release/check-versions.sh
             ./scripts/release/check-ohos-deps.sh
-            cargo build --release --locked -p codewhale-cli -p codewhale-tui
+            cargo build --release --locked \
+              --target x86_64-unknown-linux-musl \
+              -p codewhale-cli -p codewhale-tui
 
             mkdir -p target/cnb-release
-            cp target/release/codewhale target/cnb-release/codewhale-linux-x64
-            cp target/release/codewhale-tui target/cnb-release/codewhale-tui-linux-x64
+            BIN_DIR="target/x86_64-unknown-linux-musl/release"
+            cp "$BIN_DIR/codewhale" target/cnb-release/codewhale-linux-x64
+            cp "$BIN_DIR/codewhale-tui" target/cnb-release/codewhale-tui-linux-x64
             strip \
               target/cnb-release/codewhale-linux-x64 \
               target/cnb-release/codewhale-tui-linux-x64 \

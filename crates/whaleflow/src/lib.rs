@@ -4,6 +4,7 @@
 //! exposure, worktree application, replay, and model execution are layered on
 //! top only after their cancellation and evidence semantics are proven.
 
+mod js_authoring;
 mod model_policy;
 mod replay;
 #[cfg(not(target_env = "ohos"))]
@@ -15,6 +16,10 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use js_authoring::{
+    JavascriptWorkflowError, JavascriptWorkflowResult, compile_javascript_workflow,
+    compile_typescript_workflow,
+};
 pub use model_policy::*;
 pub use replay::*;
 #[cfg(not(target_env = "ohos"))]

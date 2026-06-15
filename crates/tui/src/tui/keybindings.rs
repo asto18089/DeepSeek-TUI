@@ -18,7 +18,7 @@
 //! Entries are grouped by `KeybindingSection`. The `chord` field is a
 //! human-readable string formatted exactly the way it should appear in help —
 //! we avoid storing `KeyBinding` values directly because many shortcuts are
-//! pairs (`↑/↓`) or families (`Alt+1/2/3`) that don't map cleanly to a single
+//! pairs (`↑/↓`) or families (`1-8`) that don't map cleanly to a single
 //! chord.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,7 +237,7 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Modes,
     },
     KeybindingEntry {
-        chord: "Alt+1 / Alt+2 / Alt+3",
+        chord: "1-8 / Alt+1-8",
         description_id: crate::localization::MessageId::KbJumpPlanAgentYolo,
         section: KeybindingSection::Modes,
     },

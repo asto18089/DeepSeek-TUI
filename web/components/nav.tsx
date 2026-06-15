@@ -33,14 +33,14 @@ export function Nav({ locale = "en" }: { locale?: Locale }) {
       <div className="hairline-b">
         <div className="mx-auto max-w-[1400px] px-6 py-1.5 flex items-center justify-between text-[0.66rem] font-mono uppercase tracking-[0.18em] text-ink-mute">
           <div className="flex items-center gap-4">
-            <span>{isZh ? `第 ${new Date().toISOString().slice(0, 10)} 期` : `第 ${new Date().toISOString().slice(0, 10)} 期`}</span>
+            <span>{isZh ? `第 ${new Date().toISOString().slice(0, 10)} 期` : `Edition ${new Date().toISOString().slice(0, 10)}`}</span>
             <span className="hidden sm:inline">· {isZh ? new Date().toLocaleDateString("zh-CN", { weekday: "long", month: "long", day: "numeric" }) : new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}</span>
           </div>
           <div className="flex items-center gap-4">
             <span className="hidden md:inline">codewhale.net</span>
             <span className="inline-flex items-center gap-1.5">
               <span className="w-1.5 h-1.5 bg-jade rounded-full inline-block animate-pulse" />
-              <span>{isZh ? "API · 在线" : "API · 在线"}</span>
+              <span>{isZh ? "API · 在线" : "API · Online"}</span>
             </span>
           </div>
         </div>

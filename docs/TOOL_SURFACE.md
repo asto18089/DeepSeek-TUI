@@ -128,6 +128,12 @@ confirmation prompt, `/relay`, and fork-state handoff all render the same
 artifact so a plan can be reviewed, accepted, revised, replayed, or delegated
 without losing its source context.
 
+Strategy metadata and checklist work are one Work surface. Treat
+`update_plan` as phase context and sequencing intent, while `checklist_*`
+remains the counted task ledger. When both exist, UI projections should group
+strategy around the checklist instead of showing two peer checklist/progress
+systems for the same run.
+
 ### Verification gates and artifacts
 
 | Tool | Niche |
@@ -135,6 +141,13 @@ without losing its source context.
 | `task_gate_run` | Run an approved verification command and attach structured evidence to the active durable task: command, cwd, exit code, duration, classification, summary, and log artifact. |
 
 Large logs and command outputs should be artifacts with compact summaries in the transcript. `task_gate_run` handles this automatically for active durable tasks.
+
+Sub-agent runs also expose a compact run receipt through `agent_eval`: `run_id`,
+`follow_up`, `takeover`, `artifacts`, `usage`, `verification`, and
+`worker_record`. Follow-up delivery receipts record whether an `agent_eval`
+message actually reached the child or why it did not. Usage is marked
+`unknown` until worker-level token accounting is available, and verification is
+`self_report_only` unless a separate gate or artifact proves the claim.
 
 ### GitHub context and guarded writes
 
@@ -177,7 +190,7 @@ The active model-facing sub-agent surface is persistent and intentionally small:
 | Tool | Niche |
 |---|---|
 | `agent_open` | Open a named sub-agent session for independent work. Returns a session projection immediately so the parent can keep coordinating. |
-| `agent_eval` | Send follow-up input, block for completion, or fetch the current projection/transcript handle for an existing session. |
+| `agent_eval` | Send follow-up input or fetch the current projection/transcript handle for an existing session. Nonblocking by default; pass `block:true` only for a deliberate wait. |
 | `agent_close` | Cancel or release a sub-agent session by name or id. |
 
 See `agent.txt` for the delegation protocol and

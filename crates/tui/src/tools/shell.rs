@@ -1768,7 +1768,9 @@ pub fn new_shared_shell_manager(workspace: PathBuf) -> SharedShellManager {
 
 // === ToolSpec Implementations ===
 
-use crate::command_safety::{SafetyLevel, analyze_command, extract_primary_command};
+use crate::command_safety::{
+    SafetyLevel, analyze_command, extract_primary_command, is_parallel_readonly_command,
+};
 use crate::execpolicy::{ExecPolicyDecision, load_default_policy};
 use crate::features::Feature;
 use crate::tools::cargo_failure_summary::summarize_cargo_failure;
@@ -1911,6 +1913,39 @@ fn shell_network_restricted_hint<'a>(
     } else {
         None
     }
+}
+
+fn exec_shell_input_is_parallel_readonly(input: &serde_json::Value) -> bool {
+    let Some(command) = input.get("command").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    if ["background", "interactive", "tty", "combined_output"]
+        .iter()
+        .any(|key| input.get(*key).and_then(serde_json::Value::as_bool) == Some(true))
+    {
+        return false;
+    }
+    if ["stdin", "input", "data"]
+        .iter()
+        .any(|key| input.get(*key).is_some())
+    {
+        return false;
+    }
+
+    is_parallel_readonly_command(command)
+}
+
+fn exec_shell_input_starts_detached(input: &serde_json::Value) -> bool {
+    input
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+        && input
+            .get("interactive")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        && (input.get("background").and_then(serde_json::Value::as_bool) == Some(true)
+            || input.get("tty").and_then(serde_json::Value::as_bool) == Some(true))
 }
 
 async fn execute_foreground_via_background(
@@ -2059,6 +2094,26 @@ impl ToolSpec for ExecShellTool {
 
     fn approval_requirement(&self) -> ApprovalRequirement {
         ApprovalRequirement::Required
+    }
+
+    fn approval_requirement_for(&self, input: &serde_json::Value) -> ApprovalRequirement {
+        if exec_shell_input_is_parallel_readonly(input) {
+            ApprovalRequirement::Auto
+        } else {
+            self.approval_requirement()
+        }
+    }
+
+    fn is_read_only_for(&self, input: &serde_json::Value) -> bool {
+        exec_shell_input_is_parallel_readonly(input)
+    }
+
+    fn supports_parallel_for(&self, input: &serde_json::Value) -> bool {
+        exec_shell_input_is_parallel_readonly(input)
+    }
+
+    fn starts_detached_for(&self, input: &serde_json::Value) -> bool {
+        exec_shell_input_starts_detached(input)
     }
 
     async fn execute(

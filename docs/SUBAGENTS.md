@@ -1,14 +1,30 @@
 # Sub-Agents
 
-Sub-agents are persistent background instances of the agent loop. The parent
-opens one with a focused task, gets back an `agent_id` and session name
-immediately, and continues working while the sub-agent runs to completion.
-Sub-agents inherit the parent's tool registry by default. `agent_open`
-launches them as detached background work: cancelling the parent turn stops the
-parent wait/eval path, but it does not kill already-opened child sessions. Use
+Sub-agents are the user-facing vocabulary for nested worker assignments: a
+parent opens a focused role (`explore`, `review`, `implementer`, `verifier`,
+...) and gets back an `agent_id` plus session name while the worker runs.
+
+Architecturally, sub-agents should not be a second execution substrate. The
+durable primitive is the fleet-backed worker run described in
+[`AGENT_RUNTIME.md`](AGENT_RUNTIME.md): retries, terminal status, receipts,
+artifact refs, inspection, and restart behavior belong there. `agent_open`
+stays as the familiar nested-agent launcher, but detached work should converge
+on the same lifecycle as Agent Fleet.
+
+The current `agent_open` implementation is a compatibility path while that
+cutover completes. It can still be useful for short in-session delegation, but
+if a child fails once on a transient provider timeout while an equivalent fleet
+worker would retry from the ledger, that is a runtime unification gap. For work
+that must survive provider hiccups, process restarts, sleep, or remote
+execution, prefer Fleet or a WhaleFlow-backed fleet run.
+
+Sub-agents inherit the parent's tool registry by default. `agent_open` launches
+them as detached background work: cancelling the parent turn stops the parent
+wait/eval path, but it does not kill already-opened child sessions. Use
 `agent_close` to cancel a running child explicitly.
 
-This doc covers the role taxonomy. The active orchestration surface is
+This doc covers the role taxonomy and current compatibility controls. The active
+orchestration surface is
 `agent_open`, `agent_eval`, and `agent_close`; see `prompts/base.md`
 "Sub-Agent Strategy" and the in-line tool descriptions.
 
@@ -112,7 +128,7 @@ the next turn.
 
 ## Concurrency cap
 
-The dispatcher caps concurrent sub-agents at 10 by default
+The current compatibility dispatcher caps concurrent sub-agents at 10 by default
 (configurable via `[subagents].max_concurrent` in `~/.codewhale/config.toml`,
 hard ceiling 20). When the parent hits the cap, `agent_open` returns
 an error with the cap value; the parent should use `agent_eval` to wait for a
@@ -123,6 +139,50 @@ The cap counts only **running** agents — completed / failed /
 cancelled records persist for inspection but don't occupy a slot.
 Agents that lost their `task_handle` (e.g. across a process
 restart) also don't count against the cap.
+
+## Per-role models (#3018)
+
+Children can run on a different model than the parent. Two config surfaces
+feed the same override map (`[subagents.models]` keys win on conflict, keys
+are case-insensitive):
+
+```toml
+[subagents]
+default_model  = "deepseek-v4-flash"   # fallback for every role
+worker_model   = "deepseek-v4-pro"     # worker / general
+explorer_model = "deepseek-v4-flash"   # explorer / explore
+awaiter_model  = "deepseek-v4-flash"   # awaiter / plan
+review_model   = "deepseek-v4-pro"     # review
+custom_model   = "deepseek-v4-pro"     # custom
+
+[subagents.models]
+# Free-form role → model map; any role alias accepted by agent_open works.
+implementation = "deepseek-v4-pro"
+```
+
+Model ids may be **any model the active provider accepts** — validation is
+provider-aware and happens at spawn time, not load time. On the official
+DeepSeek API only DeepSeek ids are accepted; every other provider passes the
+id through to the provider API, which is the authority. A non-DeepSeek
+example:
+
+```toml
+provider = "moonshot"
+model = "kimi-k2.7-code"
+
+[subagents]
+worker_model = "kimi-k2.6"
+```
+
+Spawn-time `model` arguments on `agent_open` are validated the same way; an
+invalid id on the official DeepSeek API fails the spawn with the accepted-id
+list instead of an opaque provider 400.
+
+With `/model auto`, sub-agent routing is provider-aware too: providers with a
+known big/cheap pair (DeepSeek, and the hosted DeepSeek routes on NVIDIA NIM,
+OpenRouter, Novita, SiliconFlow, SGLang, vLLM) route between that pair;
+providers without a known cheap tier (e.g. Ollama, Moonshot) skip the
+network router and keep children on the session model.
 
 ## Per-step API timeout (#1806, #1808)
 
@@ -183,6 +243,36 @@ as archived records so the model does not mistake stale work for live work.
 Records that loaded from a pre-#405 persisted state file (no
 `session_boot_id` field) classify as prior-session because the
 manager can't match them to the current boot.
+
+## Run receipts, follow-up, and takeover
+
+Each compatibility sub-agent has a persisted worker record in
+`.codewhale/state/subagents.v1.json`. The record is the current run-ledger
+slice for sub-agent lanes until those lanes are backed directly by the fleet
+ledger: it stores `run_id`, objective, role/model,
+workspace/branch, lifecycle events, artifact refs, follow-up target, takeover
+target, usage provenance, and verification provenance.
+
+`agent_eval` returns these fields at the top level of the session projection and
+inside `worker_record`. It is nonblocking by default: use it to poll status or
+deliver follow-up input while the parent keeps coordinating. Pass `block:true`
+only when deliberately waiting for a terminal child result. A running or
+continuable interrupted child should be continued through the returned
+`follow_up` target (`agent_eval` with the same agent id or session name). A
+local takeover should use the returned `takeover` instructions; unsupported
+future cases must say why instead of leaving the operator to guess.
+
+Follow-up delivery is explicit. If a message was delivered, the worker record
+stores a bounded preview and timestamp. If the child had already terminated,
+`agent_eval` still returns the projection and transcript handle, but records the
+undelivered follow-up reason so queued instructions do not disappear into UI
+state.
+
+Artifacts are symbolic refs. Use `handle_read` on the returned
+`transcript_handle` for transcript details, and treat `result_summary` as a
+child self-report unless `verification.status` points to a separate gate or
+receipt. `usage.status` is `unknown` until sub-agent token accounting is wired
+into the worker ledger.
 
 ## Output contract
 

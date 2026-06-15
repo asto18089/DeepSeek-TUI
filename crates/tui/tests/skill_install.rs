@@ -364,6 +364,48 @@ async fn install_accepts_nested_workflow_pack_skill_directory() {
 }
 
 #[tokio::test]
+async fn install_rejects_multi_skill_claude_plugin_archive() {
+    let tarball = make_tarball(&[
+        (
+            "repo-main/.claude-plugin/plugin.json",
+            br#"{"name":"workflow-pack","version":"1.0.0"}"#,
+        ),
+        (
+            "repo-main/skills/plan/SKILL.md",
+            &skill_md("plan", "Planning skill"),
+        ),
+        (
+            "repo-main/skills/review/SKILL.md",
+            &skill_md("review", "Review skill"),
+        ),
+    ]);
+    let (url, tx, handle) = spawn_tarball_server(tarball);
+
+    let tmp = TempDir::new().unwrap();
+    let policy = allow_all_policy();
+    let err = install::install(
+        InstallSource::DirectUrl(url),
+        tmp.path(),
+        install::DEFAULT_MAX_SIZE_BYTES,
+        &policy,
+        false,
+    )
+    .await
+    .expect_err("multi-skill Claude plugin archive should not be flattened");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("Claude Code plugin archive contains multiple SKILL.md entries"),
+        "expected Claude plugin compatibility error, got: {msg}"
+    );
+    assert!(
+        std::fs::read_dir(tmp.path()).unwrap().next().is_none(),
+        "rejected plugin archive must not write an installed skill"
+    );
+
+    shutdown(tx, handle);
+}
+
+#[tokio::test]
 async fn install_accepts_single_skill_subdirectory_archive() {
     let tarball = make_tarball(&[
         (

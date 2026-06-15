@@ -99,7 +99,7 @@ export function Footer({ locale = "en" }: { locale?: Locale }) {
             <div className="pt-2 border-t border-paper-line/20">
               <div className="eyebrow mb-2 text-ink-mute">镜像源 / Mirror</div>
               <div className="flex flex-wrap gap-3 text-xs">
-                {GITEE_ENABLED && <a href="https://gitee.com/Hmbown/deepseek-tui" className="text-indigo hover:underline" target="_blank" rel="noopener">Gitee 镜像</a>}
+                {GITEE_ENABLED && <a href="https://gitee.com/Hmbown/CodeWhale" className="text-indigo hover:underline" target="_blank" rel="noopener">Gitee 镜像</a>}
                 <a href="https://cnb.cool/codewhale.net/codewhale" className="text-indigo hover:underline" target="_blank" rel="noopener">CNB 镜像</a>
                 <a href="https://npmmirror.com/package/codewhale" className="text-indigo hover:underline" target="_blank" rel="noopener">npmmirror</a>
                 <a href="https://mirrors.tuna.tsinghua.edu.cn/help/crates.io-index.html" className="text-indigo hover:underline" target="_blank" rel="noopener">Tuna crates.io</a>

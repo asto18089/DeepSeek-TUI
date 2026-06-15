@@ -116,6 +116,7 @@ Supported keys in the project overlay (top-level fields only):
 | `api_key` | use a per-repo key (typically read from `.env`, **not committed**) |
 | `base_url` | point at a self-hosted endpoint |
 | `reasoning_effort` | force `"high"` / `"max"` for a complex repo |
+| `verbosity` | use `"normal"` or `"concise"` prompt/output discipline |
 | `approval_policy` | `"never"` / `"on-request"` / `"untrusted"` for opinionated repos |
 | `sandbox_mode` | `"read-only"` / `"workspace-write"` / `"danger-full-access"` |
 | `mcp_config_path` | per-repo MCP server set |
@@ -462,6 +463,9 @@ Remaining variables:
 - `ARCEE_API_KEY`
 - `ARCEE_BASE_URL`
 - `ARCEE_MODEL`
+- `ANTHROPIC_API_KEY`
+- `ANTHROPIC_BASE_URL`
+- `ANTHROPIC_MODEL`
 - `MOONSHOT_API_KEY` or `KIMI_API_KEY`
 - `MOONSHOT_BASE_URL` or `KIMI_BASE_URL`
 - `MOONSHOT_MODEL`, `KIMI_MODEL_NAME`, or `KIMI_MODEL`
@@ -612,7 +616,100 @@ receives the text produced by the previous hook. Hooks marked
 `background = true` are observer-only and cannot transform or block
 the message. Existing environment variables remain available.
 `shell_env` hooks keep their existing `KEY=VALUE` stdout contract;
-the JSON stdout contract applies only to `message_submit`.
+JSON stdout contracts exist for `message_submit` (above) and
+`tool_call_before` (below).
+
+### `tool_call_before` decision hooks
+
+`tool_call_before` hooks run before each tool call executes. In
+addition to the legacy hard deny (exit code `2`, which always wins
+regardless of stdout), a foreground hook may print a JSON decision on
+stdout with exit code `0`:
+
+```json
+{
+  "decision": "allow" | "deny" | "ask",
+  "reason": "human-readable explanation (used for deny)",
+  "updatedInput": { "command": "ls -la" },
+  "additionalContext": "text appended to the tool result for the model"
+}
+```
+
+All fields are optional. Empty stdout, non-JSON stdout, and JSON
+without a `decision` field behave exactly as before (allow). An
+unrecognized `decision` string logs a warning and is treated as allow.
+
+- `deny` blocks the tool; the model receives a permission-denied tool
+  result containing `reason`.
+- `ask` forces the interactive approval prompt even for tools that
+  would otherwise auto-run.
+- `updatedInput` must be a JSON object; it replaces the tool input
+  before execution. When several hooks supply it, the last hook wins.
+- `additionalContext` is appended to the tool result sent back to the
+  model as `[hook context] ...`. Multiple hooks' contexts are
+  concatenated.
+
+When multiple hooks match, precedence is deny > ask > allow. Hooks
+marked `background = true` cannot steer tool calls — they exit
+immediately without a captured result.
+
+Example deny hook:
+
+```toml
+[[hooks.hooks]]
+event = "tool_call_before"
+command = '''echo '{"decision":"deny","reason":"blocked by project policy"}' '''
+condition = { type = "tool_name", name = "exec_shell" }
+```
+
+Example ask hook (force approval for every MCP tool):
+
+```toml
+[[hooks.hooks]]
+event = "tool_call_before"
+command = '''echo '{"decision":"ask"}' '''
+condition = { type = "tool_name", name = "mcp__*" }
+```
+
+Example input rewrite:
+
+```toml
+[[hooks.hooks]]
+event = "tool_call_before"
+command = "~/.codewhale/hooks/clamp-shell-timeout.sh"
+condition = { type = "tool_name", name = "exec_shell" }
+```
+
+where the script reads the hook context, then prints
+`{"updatedInput": {...}}` with the adjusted arguments.
+
+`tool_name` conditions support `*` globs: `mcp__*` matches every MCP
+tool (e.g. `mcp__github__create_issue`) but not built-ins like
+`read_file`; exact names keep matching exactly. Other regex
+metacharacters in the pattern are matched literally.
+
+### Project-local hooks
+
+Repositories can ship policy in `<workspace>/.codewhale/hooks.toml`,
+using the same shape as the `[hooks]` table (top-level fields plus
+`[[hooks]]` entries). Project hooks are executable shell
+configuration, so CodeWhale only loads them after the workspace has
+been trusted in user-owned config through the trust prompt or a
+`[projects."<workspace>"] trust_level = "trusted"` entry. Session
+`/trust on` mode does not enable repo-supplied hooks by itself, and
+repo-local legacy markers such as `.deepseek/trusted` do not enable
+project hooks. Once trusted, project hooks are appended after global
+hooks from `config.toml`, so they run last and, for `updatedInput`,
+win ties. A malformed trusted project file logs a warning and startup
+falls back to global hooks only.
+
+```toml
+# .codewhale/hooks.toml
+[[hooks]]
+event = "tool_call_before"
+command = '''echo '{"decision":"deny","reason":"no shell in this repo"}' '''
+condition = { type = "tool_name", name = "exec_shell" }
+```
 
 ### Turn-end observer hooks
 
@@ -855,13 +952,19 @@ If you are upgrading from older releases:
 
 ### Core keys (used by the TUI/engine)
 
-- `provider` (string, optional): `deepseek` (default), `nvidia-nim`, `openai`, `atlascloud`, `wanjie-ark`, `volcengine`, `openrouter`, `xiaomi-mimo`, `novita`, `fireworks`, `siliconflow`, `siliconflow-CN`, `arcee`, `moonshot`, `sglang`, `vllm`, or `ollama`. Legacy `deepseek-cn` configs are still accepted as an alias for `deepseek`; DeepSeek uses the same official host [`https://api.deepseek.com`](https://api-docs.deepseek.com/) worldwide. `nvidia-nim` targets NVIDIA's NIM-hosted DeepSeek endpoints through `https://integrate.api.nvidia.com/v1`; `openai` targets a generic OpenAI-compatible endpoint, defaulting to `https://api.openai.com/v1`; `atlascloud` targets AtlasCloud's OpenAI-compatible endpoint at `https://api.atlascloud.ai/v1`; `wanjie-ark` targets Wanjie Ark's OpenAI-compatible endpoint at `https://maas-openapi.wanjiedata.com/api/v1`; `volcengine` targets Volcengine Ark's OpenAI-compatible coding endpoint at `https://ark.cn-beijing.volces.com/api/coding/v3`; `openrouter` targets `https://openrouter.ai/api/v1`; `xiaomi-mimo` targets Xiaomi MiMo's OpenAI-compatible endpoint, using `https://token-plan-sgp.xiaomimimo.com/v1` by default for Token Plan keys (`tp-...`) and `https://api.xiaomimimo.com/v1` for pay-as-you-go keys; set `base_url` explicitly if your Token Plan account uses the China region; `novita` targets `https://api.novita.ai/v1`; `fireworks` targets `https://api.fireworks.ai/inference/v1`; `siliconflow` targets SiliconFlow, defaulting to `https://api.siliconflow.com/v1`; `siliconflow-CN` targets the SiliconFlow China regional endpoint while sharing `[providers.siliconflow]`; `arcee` targets Arcee AI's OpenAI-compatible endpoint at `https://api.arcee.ai/api/v1`; `moonshot` targets Moonshot/Kimi, defaulting to `https://api.moonshot.ai/v1`; `sglang` targets a self-hosted OpenAI-compatible endpoint, defaulting to `http://localhost:30000/v1`; `vllm` targets a self-hosted vLLM OpenAI-compatible endpoint, defaulting to `http://localhost:8000/v1`; `ollama` targets Ollama's OpenAI-compatible endpoint, defaulting to `http://localhost:11434/v1`.
+- `provider` (string, optional): `deepseek` (default), `nvidia-nim`, `openai`, `atlascloud`, `wanjie-ark`, `volcengine`, `openrouter`, `xiaomi-mimo`, `novita`, `fireworks`, `siliconflow`, `siliconflow-CN`, `arcee`, `moonshot`, `minimax`, `zai`, `stepfun`, `sglang`, `vllm`, or `ollama`. Legacy `deepseek-cn` configs are still accepted as an alias for `deepseek`; DeepSeek uses the same official host [`https://api.deepseek.com`](https://api-docs.deepseek.com/) worldwide. `nvidia-nim` targets NVIDIA's NIM-hosted DeepSeek endpoints through `https://integrate.api.nvidia.com/v1`; `openai` targets a generic OpenAI-compatible endpoint, defaulting to `https://api.openai.com/v1`; `atlascloud` targets AtlasCloud's OpenAI-compatible endpoint at `https://api.atlascloud.ai/v1`; `wanjie-ark` targets Wanjie Ark's OpenAI-compatible endpoint at `https://maas-openapi.wanjiedata.com/api/v1`; `volcengine` targets Volcengine Ark's OpenAI-compatible coding endpoint at `https://ark.cn-beijing.volces.com/api/coding/v3`; `openrouter` targets `https://openrouter.ai/api/v1`; `xiaomi-mimo` targets Xiaomi MiMo's OpenAI-compatible endpoint, using `https://token-plan-sgp.xiaomimimo.com/v1` by default for Token Plan keys (`tp-...`) and `https://api.xiaomimimo.com/v1` for pay-as-you-go keys; set `base_url` explicitly if your Token Plan account uses the China region; `novita` targets `https://api.novita.ai/v1`; `fireworks` targets `https://api.fireworks.ai/inference/v1`; `siliconflow` targets SiliconFlow, defaulting to `https://api.siliconflow.com/v1`; `siliconflow-CN` targets the SiliconFlow China regional endpoint while sharing `[providers.siliconflow]`; `arcee` targets Arcee AI's OpenAI-compatible endpoint at `https://api.arcee.ai/api/v1`; `moonshot` targets Moonshot/Kimi, defaulting to `https://api.moonshot.ai/v1`; `minimax` targets MiniMax at `https://api.minimax.io/v1`; `zai` targets Z.ai at `https://api.z.ai/api/coding/paas/v4`; `stepfun` targets StepFun at `https://api.stepfun.ai/v1`; `sglang` targets a self-hosted OpenAI-compatible endpoint, defaulting to `http://localhost:30000/v1`; `vllm` targets a self-hosted vLLM OpenAI-compatible endpoint, defaulting to `http://localhost:8000/v1`; `ollama` targets Ollama's OpenAI-compatible endpoint, defaulting to `http://localhost:11434/v1`.
 - `api_key` (string, required for hosted providers): must be non-empty for DeepSeek/hosted providers (or set the provider API key env var). Self-hosted SGLang, vLLM, and Ollama can omit it.
-- `base_url` (string, optional): defaults to `https://api.deepseek.com/beta` for DeepSeek's OpenAI-compatible Chat Completions API, including legacy `provider = "deepseek-cn"` configs. Other defaults are `https://integrate.api.nvidia.com/v1` for `nvidia-nim`, `https://api.openai.com/v1` for `openai`, `https://api.atlascloud.ai/v1` for `atlascloud`, `https://maas-openapi.wanjiedata.com/api/v1` for `wanjie-ark`, `https://ark.cn-beijing.volces.com/api/coding/v3` for `volcengine`, `https://openrouter.ai/api/v1` for `openrouter`, `https://token-plan-sgp.xiaomimimo.com/v1` for `xiaomi-mimo` when the API key starts with `tp-...` and `https://api.xiaomimimo.com/v1` otherwise, `https://api.novita.ai/v1` for `novita`, `https://api.fireworks.ai/inference/v1` for `fireworks`, `https://api.siliconflow.com/v1` for `siliconflow`, `https://api.siliconflow.cn/v1` for `siliconflow-CN`, `https://api.arcee.ai/api/v1` for `arcee`, `https://api.moonshot.ai/v1` for `moonshot`, `http://localhost:30000/v1` for `sglang`, `http://localhost:8000/v1` for `vllm`, and `http://localhost:11434/v1` for `ollama`. Set `base_url = "https://token-plan-cn.xiaomimimo.com/v1"` explicitly if your Xiaomi MiMo Token Plan account is provisioned in the China region. Set `https://api.deepseek.com` or `https://api.deepseek.com/v1` explicitly to opt out of DeepSeek beta features.
+- `base_url` (string, optional): defaults to `https://api.deepseek.com/beta` for DeepSeek's OpenAI-compatible Chat Completions API, including legacy `provider = "deepseek-cn"` configs. Other defaults are `https://integrate.api.nvidia.com/v1` for `nvidia-nim`, `https://api.openai.com/v1` for `openai`, `https://api.atlascloud.ai/v1` for `atlascloud`, `https://maas-openapi.wanjiedata.com/api/v1` for `wanjie-ark`, `https://ark.cn-beijing.volces.com/api/coding/v3` for `volcengine`, `https://openrouter.ai/api/v1` for `openrouter`, `https://token-plan-sgp.xiaomimimo.com/v1` for `xiaomi-mimo` when the API key starts with `tp-...` and `https://api.xiaomimimo.com/v1` otherwise, `https://api.novita.ai/v1` for `novita`, `https://api.fireworks.ai/inference/v1` for `fireworks`, `https://api.siliconflow.com/v1` for `siliconflow`, `https://api.siliconflow.cn/v1` for `siliconflow-CN`, `https://api.arcee.ai/api/v1` for `arcee`, `https://api.moonshot.ai/v1` for `moonshot`, `https://api.minimax.io/v1` for `minimax`, `https://api.z.ai/api/coding/paas/v4` for `zai`, `https://api.stepfun.ai/v1` for `stepfun`, `http://localhost:30000/v1` for `sglang`, `http://localhost:8000/v1` for `vllm`, and `http://localhost:11434/v1` for `ollama`. Set `base_url = "https://token-plan-cn.xiaomimimo.com/v1"` explicitly if your Xiaomi MiMo Token Plan account is provisioned in the China region. Set `https://api.deepseek.com` or `https://api.deepseek.com/v1` explicitly to opt out of DeepSeek beta features.
 - `path_suffix` (string, optional provider-table key): override the chat-completions path for OpenAI-compatible gateways that do not serve `/v1/chat/completions`. For example, `[providers.openai] path_suffix = "/chat/completions"` sends chat requests to the unversioned base URL plus `/chat/completions`; `models` and `beta/*` requests keep their normal routing.
 - `insecure_skip_tls_verify` (bool, optional provider-table key): disabled by default. When true on the active provider table, only the LLM provider HTTP client skips TLS certificate verification. Prefer `SSL_CERT_FILE` for corporate or private CA bundles; `codewhale doctor` reports this setting when enabled.
-- `default_text_model` (string, optional): defaults to `deepseek-v4-pro` for DeepSeek and generic OpenAI-compatible endpoints, `deepseek-ai/deepseek-v4-pro` for NVIDIA NIM, `deepseek-ai/deepseek-v4-flash` for AtlasCloud, `deepseek-reasoner` for Wanjie Ark, `DeepSeek-V4-Pro` for Volcengine Ark, `deepseek/deepseek-v4-pro` for OpenRouter and Novita, `mimo-v2.5-pro` for Xiaomi MiMo, `accounts/fireworks/models/deepseek-v4-pro` for Fireworks, `deepseek-ai/DeepSeek-V4-Pro` for SiliconFlow, `trinity-large-thinking` for Arcee AI, `kimi-k2.6` for Moonshot, `deepseek-ai/DeepSeek-V4-Pro` for SGLang/vLLM, and `deepseek-coder:1.3b` for Ollama. Hugging Face and Together AI both default to `deepseek-ai/DeepSeek-V4-Pro`. Current public DeepSeek IDs are `deepseek-v4-pro` and `deepseek-v4-flash`, both with 1M context windows, 384K max output, and thinking mode enabled by default. Legacy `deepseek-chat` and `deepseek-reasoner` remain compatibility aliases for `deepseek-v4-flash` until July 24, 2026, except SiliconFlow maps `deepseek-reasoner` and `deepseek-r1` to its Pro model while `deepseek-chat` and `deepseek-v3` map to Flash. Provider-specific mappings translate `deepseek-v4-pro` / `deepseek-v4-flash` to each provider's model ID where supported. OpenRouter also recognizes recent large IDs such as `arcee-ai/trinity-large-thinking`, `minimax/minimax-m3`, `minimax/minimax-2.7`, `xiaomi/mimo-v2.5-pro`, `qwen/qwen3.6-flash`, `qwen/qwen3.6-35b-a3b`, `qwen/qwen3.6-max-preview`, `qwen/qwen3.6-27b`, `qwen/qwen3.6-plus`, `qwen/qwen3.7-max`, `google/gemma-4-31b-it`, `moonshotai/kimi-k2.6`, `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`, and `nvidia/nemotron-3-ultra`; direct Arcee uses bare IDs such as `trinity-large-thinking` and `trinity-large-preview`; direct Xiaomi MiMo recognizes chat IDs `mimo-v2.5-pro` and `mimo-v2.5`, while TTS IDs are selected through `codewhale speech` / `tts`. Generic `openai`, `atlascloud`, `wanjie-ark`, `xiaomi-mimo`, `arcee`, and Ollama model IDs are passed through unchanged after known aliases are normalized. OpenRouter and SiliconFlow provider configs with a custom `base_url` also preserve explicit model values, which lets OpenAI-compatible gateways accept bare model IDs. Use `/models` or `codewhale models` to discover live IDs from your configured endpoint. `CODEWHALE_MODEL` overrides this for a single process; `DEEPSEEK_MODEL` is the legacy alias.
-- `reasoning_effort` (string, optional): `off`, `low`, `medium`, `high`, or `max`; defaults to the configured UI tier. DeepSeek Platform receives top-level `thinking` / `reasoning_effort` fields. NVIDIA NIM receives equivalent settings through `chat_template_kwargs`.
+- `default_text_model` (string, optional): defaults to `deepseek-v4-pro` for DeepSeek and generic OpenAI-compatible endpoints, `deepseek-ai/deepseek-v4-pro` for NVIDIA NIM, `deepseek-ai/deepseek-v4-flash` for AtlasCloud, `deepseek-reasoner` for Wanjie Ark, `DeepSeek-V4-Pro` for Volcengine Ark, `deepseek/deepseek-v4-pro` for OpenRouter and Novita, `mimo-v2.5-pro` for Xiaomi MiMo, `accounts/fireworks/models/deepseek-v4-pro` for Fireworks, `deepseek-ai/DeepSeek-V4-Pro` for SiliconFlow, `trinity-large-thinking` for Arcee AI, `kimi-k2.7-code` for Moonshot, `MiniMax-M3` for MiniMax, `GLM-5.1` for Z.ai, `step-3.7-flash` for StepFun, `deepseek-ai/DeepSeek-V4-Pro` for SGLang/vLLM, and `deepseek-coder:1.3b` for Ollama. Hugging Face and Together AI both default to `deepseek-ai/DeepSeek-V4-Pro`. Current public DeepSeek IDs are `deepseek-v4-pro` and `deepseek-v4-flash`, both with 1M context windows, 384K max output, and thinking mode enabled by default. Legacy `deepseek-chat` and `deepseek-reasoner` remain compatibility aliases for `deepseek-v4-flash` until July 24, 2026, except SiliconFlow maps `deepseek-reasoner` and `deepseek-r1` to its Pro model while `deepseek-chat` and `deepseek-v3` map to Flash. Provider-specific mappings translate `deepseek-v4-pro` / `deepseek-v4-flash` to each provider's model ID where supported. OpenRouter also recognizes recent large IDs such as `arcee-ai/trinity-large-thinking`, `minimax/minimax-m3`, `minimax/minimax-2.7`, `xiaomi/mimo-v2.5-pro`, `qwen/qwen3.6-flash`, `qwen/qwen3.6-35b-a3b`, `qwen/qwen3.6-max-preview`, `qwen/qwen3.6-27b`, `qwen/qwen3.6-plus`, `qwen/qwen3.7-max`, `google/gemma-4-31b-it`, `moonshotai/kimi-k2.7-code`, `moonshotai/kimi-k2.6`, `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`, and `nvidia/nemotron-3-ultra-550b-a55b`; direct Arcee uses bare IDs such as `trinity-large-thinking` and `trinity-large-preview`; direct Moonshot recognizes `kimi-k2.7-code`, `kimi-k2.6`, and Kimi Code's stable `kimi-for-coding`; direct MiniMax recognizes `MiniMax-M3` and the documented M2.x chat model IDs; direct Xiaomi MiMo recognizes chat IDs `mimo-v2.5-pro` and `mimo-v2.5`, while TTS IDs are selected through `codewhale speech` / `tts`. Generic `openai`, `atlascloud`, `wanjie-ark`, `xiaomi-mimo`, `arcee`, `moonshot`, `minimax`, `zai`, `stepfun`, and Ollama model IDs are passed through unchanged after known aliases are normalized. OpenRouter and SiliconFlow provider configs with a custom `base_url` also preserve explicit model values, which lets OpenAI-compatible gateways accept bare model IDs. Use `/models` or `codewhale models` to discover live IDs from your configured endpoint. `CODEWHALE_MODEL` overrides this for a single process; `DEEPSEEK_MODEL` is the legacy alias.
+- `reasoning_effort` (string, optional): `off`, `low`, `medium`, `high`, `max`, `xhigh`, or `ultracode`; defaults to the configured UI tier. DeepSeek Platform receives top-level `thinking` / `reasoning_effort` fields. OpenAI Codex normalizes stale `off` to `low` and sends `max` / `ultracode` as Responses `xhigh`. Z.ai receives documented `thinking` controls and treats enabled thinking as the GLM coding high/max lane. NVIDIA NIM receives equivalent settings through `chat_template_kwargs`.
+- `verbosity` (string, optional): `normal` or `concise`. `normal` keeps the
+  default conversational prompt. `concise` appends a prompt discipline block
+  for direct, low-chatter output; CLI noninteractive commands (`exec`, `eval`,
+  and `swebench`) default to `concise` unless config/env/CLI overrides it.
+  Override per process with `CODEWHALE_VERBOSITY` or the legacy
+  `DEEPSEEK_VERBOSITY` alias.
 - `allow_shell` (bool, optional): defaults to `false`; shell tools must be explicitly enabled.
 - `approval_policy` (string, optional): `on-request`, `untrusted`, or `never`. Runtime `approval_mode` editing in `/config` also accepts `on-request` and `untrusted` aliases.
 - `sandbox_mode` (string, optional): `read-only`, `workspace-write`, `danger-full-access`, `external-sandbox`.
@@ -903,7 +1006,9 @@ If you are upgrading from older releases:
   agentskills.io-compatible `~/.agents/skills` and the broader Claude-ecosystem
   `~/.claude/skills`. First launch installs versioned bundled skills for common
   workflows including skill creation, delegation, MCP/plugin scaffolding,
-  documents, presentations, spreadsheets, PDFs, and Feishu/Lark.
+  documents, presentations, spreadsheets, PDFs, and Feishu/Lark. See
+  [CLAUDE_PLUGIN_COMPAT.md](CLAUDE_PLUGIN_COMPAT.md) for the supported boundary
+  between portable `SKILL.md` bundles and Claude Code plugin runtimes.
 - `mcp_config_path` (string, optional): defaults to `~/.codewhale/mcp.json`, with
   legacy `~/.deepseek/mcp.json` fallback when the CodeWhale path is absent.
   It is visible in `/config` and can be changed from the TUI. The new path is
@@ -1100,6 +1205,13 @@ You can also override features for a single run:
 - `codewhale-tui --disable subagents`
 
 Use `codewhale-tui features list` to inspect known flags and their effective state.
+The native `/config` view also includes a read-only **Experimental** section
+for experimental feature flags. It shows each flag's effective enabled/disabled
+state and whether that state comes from the default or a configured override.
+Change feature flags in `[features]` or with `--enable` / `--disable`; the
+`/config` section is an audit surface, not a stability promise. Goal and
+WhaleFlow preview rows may appear there as placeholders until those workflows
+graduate behind real gated flags.
 
 ## Web Search Provider
 

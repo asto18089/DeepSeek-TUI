@@ -34,11 +34,17 @@ pub enum AgentLifecycle {
     Completed,
     Failed,
     Cancelled,
+    /// Interrupted with a continuable checkpoint (e.g. API timeout); not
+    /// running, but recoverable via `agent_eval` continuation.
+    Interrupted,
 }
 
 impl AgentLifecycle {
     fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Interrupted
+        )
     }
 
     fn label(self) -> &'static str {
@@ -48,6 +54,7 @@ impl AgentLifecycle {
             Self::Completed => "done",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
         }
     }
 
@@ -58,6 +65,7 @@ impl AgentLifecycle {
             Self::Completed => palette::STATUS_SUCCESS,
             Self::Failed => palette::STATUS_ERROR,
             Self::Cancelled => palette::TEXT_MUTED,
+            Self::Interrupted => palette::STATUS_WARNING,
         }
     }
 }
@@ -265,7 +273,9 @@ impl FanoutCard {
             match slot.status {
                 AgentLifecycle::Completed => done += 1,
                 AgentLifecycle::Running => running += 1,
-                AgentLifecycle::Failed | AgentLifecycle::Cancelled => failed += 1,
+                AgentLifecycle::Failed
+                | AgentLifecycle::Cancelled
+                | AgentLifecycle::Interrupted => failed += 1,
                 AgentLifecycle::Pending => pending += 1,
             }
         }
@@ -277,11 +287,12 @@ impl FanoutCard {
         let mut s = String::with_capacity(self.workers.len());
         for slot in &self.workers {
             let glyph = match slot.status {
-                AgentLifecycle::Completed => '\u{25CF}', // ●
-                AgentLifecycle::Running => '\u{25D0}',   // ◐
-                AgentLifecycle::Failed => '\u{00D7}',    // ×
-                AgentLifecycle::Cancelled => '\u{2298}', // ⊘
-                AgentLifecycle::Pending => '\u{25CB}',   // ○
+                AgentLifecycle::Completed => '\u{25CF}',   // ●
+                AgentLifecycle::Running => '\u{25D0}',     // ◐
+                AgentLifecycle::Failed => '\u{00D7}',      // ×
+                AgentLifecycle::Cancelled => '\u{2298}',   // ⊘
+                AgentLifecycle::Pending => '\u{25CB}',     // ○
+                AgentLifecycle::Interrupted => '\u{25CC}', // ◌
             };
             s.push(glyph);
         }
@@ -327,6 +338,12 @@ impl FanoutCard {
         let (done, running, failed, pending) = self.counts();
         if running > 0 || pending > 0 {
             AgentLifecycle::Running
+        } else if self
+            .workers
+            .iter()
+            .any(|slot| matches!(slot.status, AgentLifecycle::Interrupted))
+        {
+            AgentLifecycle::Interrupted
         } else if failed > 0 && done == 0 {
             AgentLifecycle::Failed
         } else if done > 0 {
@@ -434,6 +451,10 @@ pub fn apply_to_delegate(card: &mut DelegateCard, msg: &MailboxMessage) -> bool 
             card.status = AgentLifecycle::Failed;
             card.summary = Some(error.clone());
         }
+        MailboxMessage::Interrupted { reason, .. } => {
+            card.status = AgentLifecycle::Interrupted;
+            card.summary = Some(reason.clone());
+        }
         MailboxMessage::Cancelled { .. } => {
             card.status = AgentLifecycle::Cancelled;
         }
@@ -479,6 +500,10 @@ pub fn apply_to_fanout(card: &mut FanoutCard, msg: &MailboxMessage) -> bool {
         }
         MailboxMessage::Failed { .. } => {
             card.upsert_worker(id, AgentLifecycle::Failed);
+            true
+        }
+        MailboxMessage::Interrupted { .. } => {
+            card.upsert_worker(id, AgentLifecycle::Interrupted);
             true
         }
         MailboxMessage::Cancelled { .. } => {
@@ -745,6 +770,72 @@ mod tests {
                 "fanout dot-grid for total={total} done={done}",
             );
         }
+    }
+
+    #[test]
+    fn delegate_interrupted_leaves_running_and_renders_reason() {
+        let mut card = DelegateCard::new("agent_int", "general");
+        apply_to_delegate(
+            &mut card,
+            &MailboxMessage::started("agent_int", crate::tools::subagent::SubAgentType::General),
+        );
+        assert_eq!(card.status, AgentLifecycle::Running);
+
+        let msg = MailboxMessage::Interrupted {
+            agent_id: "agent_int".into(),
+            reason: "API call timed out after 120000ms; checkpoint preserved for continuation"
+                .into(),
+        };
+        assert!(apply_to_delegate(&mut card, &msg));
+        assert_eq!(card.status, AgentLifecycle::Interrupted);
+
+        let rendered = render_to_strings(&card.render_lines(80)).join("\n");
+        assert!(rendered.contains("[interrupted]"), "{rendered}");
+        assert!(rendered.contains("API call timed out"), "{rendered}");
+    }
+
+    #[test]
+    fn fanout_interrupted_worker_leaves_running_counts() {
+        let mut card = FanoutCard::new("fanout", Locale::En).with_workers(["w_1", "w_2"]);
+        apply_to_fanout(
+            &mut card,
+            &MailboxMessage::started("w_1", crate::tools::subagent::SubAgentType::General),
+        );
+        apply_to_fanout(
+            &mut card,
+            &MailboxMessage::started("w_2", crate::tools::subagent::SubAgentType::General),
+        );
+
+        let msg = MailboxMessage::Interrupted {
+            agent_id: "w_1".into(),
+            reason: "API call timed out".into(),
+        };
+        assert!(apply_to_fanout(&mut card, &msg));
+        assert_eq!(card.workers[0].status, AgentLifecycle::Interrupted);
+        assert_eq!(card.workers[1].status, AgentLifecycle::Running);
+
+        let rendered = render_to_strings(&card.render_lines(80));
+        let stats = rendered
+            .iter()
+            .find(|line| line.contains("running") && line.contains("pending"))
+            .expect("counts line present");
+        assert!(stats.contains("1 running"), "{stats}");
+        assert!(
+            stats.contains("1 failed"),
+            "interrupted folds into the non-running attention bucket: {stats}"
+        );
+
+        let msg = MailboxMessage::Interrupted {
+            agent_id: "w_2".into(),
+            reason: "API call timed out".into(),
+        };
+        assert!(apply_to_fanout(&mut card, &msg));
+        let rendered = render_to_strings(&card.render_lines(80)).join("\n");
+        assert!(
+            rendered.contains("[interrupted]"),
+            "aggregate header should surface interrupted once nothing runs: {rendered}"
+        );
+        assert!(rendered.contains("0 running"), "{rendered}");
     }
 
     #[test]

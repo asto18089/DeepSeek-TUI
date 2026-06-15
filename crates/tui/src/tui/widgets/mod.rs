@@ -131,7 +131,11 @@ impl ChatWidget {
 
         let history_len = app.history.len();
         let tool_runs = if app.tool_collapse_active() {
-            crate::tui::history::detect_tool_runs(&app.history, app.tool_collapse_threshold)
+            crate::tui::history::detect_tool_runs_from_slices(
+                &app.history,
+                active_entries,
+                app.tool_collapse_threshold,
+            )
         } else {
             Vec::new()
         };
@@ -201,7 +205,12 @@ impl ChatWidget {
                     .find(|run| run.start == idx && collapsed_run_starts.contains(&idx))
                 {
                     filtered_cells.push(tool_run_summary_cell(run));
-                    filtered_revs.push(tool_run_summary_revision(run, &app.history_revisions));
+                    filtered_revs.push(tool_run_summary_revision(
+                        run,
+                        &app.history_revisions,
+                        history_len,
+                        app.active_cell_revision,
+                    ));
                     filtered_to_original.push(idx);
                     continue;
                 }
@@ -217,13 +226,25 @@ impl ChatWidget {
                     if app.collapsed_cells.contains(&original_idx) {
                         continue;
                     }
+                    if collapsed_tool_indices.contains(&original_idx) {
+                        continue;
+                    }
+                    if let Some(run) = tool_runs.iter().find(|run| {
+                        run.start == original_idx && collapsed_run_starts.contains(&original_idx)
+                    }) {
+                        filtered_cells.push(tool_run_summary_cell(run));
+                        filtered_revs.push(tool_run_summary_revision(
+                            run,
+                            &app.history_revisions,
+                            history_len,
+                            active_rev,
+                        ));
+                        filtered_to_original.push(original_idx);
+                        continue;
+                    }
                     filtered_cells.push(cell.clone());
                     let salt = (i as u64).wrapping_add(1);
-                    filtered_revs.push(
-                        active_rev
-                            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                            .wrapping_add(salt),
-                    );
+                    filtered_revs.push(active_entry_revision(active_rev, salt));
                     filtered_to_original.push(original_idx);
                 }
             }
@@ -379,12 +400,27 @@ fn tool_run_summary_cell(run: &ToolRun) -> HistoryCell {
     }))
 }
 
-fn tool_run_summary_revision(run: &ToolRun, revisions: &[u64]) -> u64 {
+fn tool_run_summary_revision(
+    run: &ToolRun,
+    revisions: &[u64],
+    history_len: usize,
+    active_rev: u64,
+) -> u64 {
     let mut revision = 0xA11C_EA5E_D00D_2692u64 ^ ((run.start as u64) << 32) ^ (run.count as u64);
     for idx in run.start..run.start.saturating_add(run.count) {
-        revision = revision.rotate_left(7) ^ revisions.get(idx).copied().unwrap_or(u64::MAX);
+        let cell_revision = revisions.get(idx).copied().unwrap_or_else(|| {
+            let active_idx = idx.saturating_sub(history_len);
+            active_entry_revision(active_rev, (active_idx as u64).wrapping_add(1))
+        });
+        revision = revision.rotate_left(7) ^ cell_revision;
     }
     revision
+}
+
+fn active_entry_revision(active_rev: u64, salt: u64) -> u64 {
+    active_rev
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(salt)
 }
 
 impl Renderable for ChatWidget {
@@ -1454,7 +1490,7 @@ fn approval_palette(risk: RiskLevel) -> ApprovalColors {
 fn approval_selected_style() -> Style {
     Style::default()
         .fg(palette::SELECTION_TEXT)
-        .bg(palette::DEEPSEEK_BLUE)
+        .bg(palette::SELECTION_BG)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -1615,16 +1651,24 @@ fn option_abort(locale: Locale) -> &'static str {
 pub struct ElevationWidget<'a> {
     request: &'a ElevationRequest,
     selected: usize,
+    locale: Locale,
 }
 
 impl<'a> ElevationWidget<'a> {
-    pub fn new(request: &'a ElevationRequest, selected: usize) -> Self {
-        Self { request, selected }
+    pub fn new(request: &'a ElevationRequest, selected: usize, locale: Locale) -> Self {
+        Self {
+            request,
+            selected,
+            locale,
+        }
     }
 }
 
 impl Renderable for ElevationWidget<'_> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        use crate::localization::MessageId;
+        use crate::localization::tr;
+
         let popup_width = 70.min(area.width.saturating_sub(4));
         let popup_height = 22.min(area.height.saturating_sub(4));
         let popup_area = Rect {
@@ -1639,14 +1683,14 @@ impl Renderable for ElevationWidget<'_> {
         let mut lines = vec![
             Line::from(""),
             Line::from(vec![Span::styled(
-                "  ⚠ Sandbox Denied ",
+                tr(self.locale, MessageId::ElevationTitleSandboxDenied),
                 Style::default()
                     .fg(palette::STATUS_ERROR)
                     .add_modifier(Modifier::BOLD),
             )]),
             Line::from(""),
             Line::from(vec![
-                Span::raw("  Tool: "),
+                Span::raw(tr(self.locale, MessageId::ElevationFieldTool)),
                 Span::styled(
                     &self.request.tool_name,
                     Style::default()
@@ -1656,18 +1700,17 @@ impl Renderable for ElevationWidget<'_> {
             ]),
         ];
 
-        // Show command if it's a shell command
         if let Some(ref command) = self.request.command {
             let cmd_display = crate::utils::truncate_with_ellipsis(command, 45, "...");
             lines.push(Line::from(vec![
-                Span::raw("  Cmd:  "),
+                Span::raw(tr(self.locale, MessageId::ElevationFieldCmd)),
                 Span::styled(cmd_display, Style::default().fg(palette::TEXT_MUTED)),
             ]));
         }
 
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::raw("  Reason: "),
+            Span::raw(tr(self.locale, MessageId::ElevationFieldReason)),
             Span::styled(
                 &self.request.denial_reason,
                 Style::default().fg(palette::STATUS_WARNING),
@@ -1676,7 +1719,7 @@ impl Renderable for ElevationWidget<'_> {
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  Impact if approved:",
+            tr(self.locale, MessageId::ElevationImpactHeader),
             Style::default().fg(palette::TEXT_MUTED),
         )));
         if self
@@ -1686,7 +1729,7 @@ impl Renderable for ElevationWidget<'_> {
             .any(|option| matches!(option, ElevationOption::WithNetwork))
         {
             lines.push(Line::from(Span::styled(
-                "    - network retry enables outbound downloads and HTTP requests",
+                tr(self.locale, MessageId::ElevationImpactNetwork),
                 Style::default().fg(palette::TEXT_PRIMARY),
             )));
         }
@@ -1697,22 +1740,21 @@ impl Renderable for ElevationWidget<'_> {
             .any(|option| matches!(option, ElevationOption::WithWriteAccess(_)))
         {
             lines.push(Line::from(Span::styled(
-                "    - write retry expands writable filesystem scope for this tool call",
+                tr(self.locale, MessageId::ElevationImpactWrite),
                 Style::default().fg(palette::TEXT_PRIMARY),
             )));
         }
         lines.push(Line::from(Span::styled(
-            "    - full access removes sandbox restrictions entirely for this retry",
+            tr(self.locale, MessageId::ElevationImpactFullAccess),
             Style::default().fg(palette::TEXT_PRIMARY),
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  Choose how to proceed:",
+            tr(self.locale, MessageId::ElevationPromptProceed),
             Style::default().fg(palette::TEXT_MUTED),
         )));
         lines.push(Line::from(""));
 
-        // Render options
         for (i, option) in self.request.options.iter().enumerate() {
             let is_selected = i == self.selected;
             let style = if is_selected {
@@ -1723,11 +1765,27 @@ impl Renderable for ElevationWidget<'_> {
                 Style::default()
             };
 
-            let key = match option {
-                ElevationOption::WithNetwork => "n",
-                ElevationOption::WithWriteAccess(_) => "w",
-                ElevationOption::FullAccess => "f",
-                ElevationOption::Abort => "a",
+            let (key, label_id, desc_id) = match option {
+                ElevationOption::WithNetwork => (
+                    "n",
+                    MessageId::ElevationOptionNetwork,
+                    MessageId::ElevationOptionNetworkDesc,
+                ),
+                ElevationOption::WithWriteAccess(_) => (
+                    "w",
+                    MessageId::ElevationOptionWrite,
+                    MessageId::ElevationOptionWriteDesc,
+                ),
+                ElevationOption::FullAccess => (
+                    "f",
+                    MessageId::ElevationOptionFullAccess,
+                    MessageId::ElevationOptionFullAccessDesc,
+                ),
+                ElevationOption::Abort => (
+                    "a",
+                    MessageId::ElevationOptionAbort,
+                    MessageId::ElevationOptionAbortDesc,
+                ),
             };
 
             let label_color = match option {
@@ -1742,18 +1800,18 @@ impl Renderable for ElevationWidget<'_> {
                     format!("[{key}] "),
                     Style::default().fg(palette::STATUS_SUCCESS),
                 ),
-                Span::styled(option.label(), style.fg(label_color)),
+                Span::styled(tr(self.locale, label_id), style.fg(label_color)),
             ]));
             lines.push(Line::from(vec![
                 Span::raw("      "),
                 Span::styled(
-                    option.description(),
+                    tr(self.locale, desc_id),
                     Style::default().fg(palette::TEXT_MUTED),
                 ),
             ]));
         }
 
-        let title = " Sandbox Elevation Required ";
+        let title = tr(self.locale, MessageId::ElevationTitleRequired);
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
@@ -2061,7 +2119,15 @@ fn composer_top_right_chrome(app: &App, area_width: u16) -> Option<Line<'static>
 }
 
 fn should_render_empty_state(app: &App) -> bool {
-    app.history.is_empty() && !app.is_loading && !app.is_compacting && !app.is_purging
+    let active_is_empty = app
+        .active_cell
+        .as_ref()
+        .is_none_or(crate::tui::active_cell::ActiveCell::is_empty);
+    app.history.is_empty()
+        && active_is_empty
+        && !app.is_loading
+        && !app.is_compacting
+        && !app.is_purging
 }
 
 fn build_empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
@@ -2247,7 +2313,7 @@ pub(crate) fn slash_completion_hints(
     // ── Phase 2: contains (substring) matches ─────────────────────────
     // Medium priority — broader catching.
     if completing_skill_arg.is_none() {
-        for cmd in commands::COMMANDS {
+        for cmd in commands::command_infos() {
             let name = format!("/{}", cmd.name);
             if seen.contains(&name) {
                 continue;
@@ -2274,7 +2340,7 @@ pub(crate) fn slash_completion_hints(
     // ── Phase 3: fuzzy subsequence matches ────────────────────────────
     // Lowest priority — characters in order, not necessarily consecutive.
     if completing_skill_arg.is_none() {
-        for cmd in commands::COMMANDS {
+        for cmd in commands::command_infos() {
             let name = format!("/{}", cmd.name);
             if seen.contains(&name) {
                 continue;
@@ -2391,7 +2457,7 @@ fn all_command_names_matching_loaded(
     user_commands: &[(String, String)],
 ) -> Vec<String> {
     let prefix = prefix.strip_prefix('/').unwrap_or(prefix).to_lowercase();
-    let mut result: Vec<String> = commands::COMMANDS
+    let mut result: Vec<String> = commands::command_infos()
         .iter()
         .filter(|cmd| {
             cmd.name.starts_with(&prefix) || cmd.aliases.iter().any(|a| a.starts_with(&prefix))
@@ -2718,6 +2784,7 @@ mod tests {
     use crate::config::{ApiProvider, Config};
     use crate::localization::Locale;
     use crate::palette;
+    use crate::tui::active_cell::ActiveCell;
     use crate::tui::app::{App, ComposerDensity, ToolCollapseMode, TuiOptions};
     use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
     use crate::tui::scrolling::{TranscriptLineMeta, TranscriptScroll};
@@ -2843,7 +2910,45 @@ mod tests {
         let rendered = buffer_text(&buf, area);
 
         assert_eq!(app.collapsed_cell_map, vec![0]);
-        assert!(rendered.contains("3 tools"), "{rendered}");
+        assert!(
+            rendered.contains("Explored 2 files, 1 search"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("activity_group"), "{rendered}");
+        assert!(
+            !rendered.contains("full output from list_dir"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn chat_widget_collapses_dense_active_tool_runs_by_default() {
+        let mut app = create_test_app();
+        app.tool_collapse_mode = ToolCollapseMode::Compact;
+        app.tool_collapse_threshold = 3;
+        let active = app.active_cell.get_or_insert_with(ActiveCell::new);
+        active.push_untracked(success_tool_cell("read_file"));
+        active.push_untracked(success_tool_cell("list_dir"));
+        active.push_untracked(success_tool_cell("web_search"));
+        app.bump_active_cell_revision();
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 8,
+        };
+        let mut buf = Buffer::empty(area);
+        let widget = ChatWidget::new(&mut app, area);
+        widget.render(area, &mut buf);
+        let rendered = buffer_text(&buf, area);
+
+        assert_eq!(app.collapsed_cell_map, vec![0]);
+        assert!(
+            rendered.contains("Explored 2 files, 1 search"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("activity_group"), "{rendered}");
         assert!(
             !rendered.contains("full output from list_dir"),
             "{rendered}"
@@ -4046,21 +4151,21 @@ mod tests {
         let selected_row = (area.y..area.y.saturating_add(area.height))
             .find(|&y| {
                 (area.x..area.x.saturating_add(area.width))
-                    .any(|x| buf[(x, y)].bg == palette::DEEPSEEK_BLUE)
+                    .any(|x| buf[(x, y)].bg == palette::SELECTION_BG)
             })
-            .expect("selected approval row should use blue background");
+            .expect("selected approval row should use selection background");
         let highlighted_cells = (area.x..area.x.saturating_add(area.width))
             .filter(|&x| {
                 let cell = &buf[(x, selected_row)];
                 !cell.symbol().trim().is_empty()
-                    && cell.bg == palette::DEEPSEEK_BLUE
+                    && cell.bg == palette::SELECTION_BG
                     && cell.fg == palette::SELECTION_TEXT
             })
             .count();
 
         assert!(
             highlighted_cells >= 4,
-            "selected destructive option should render visible blue/white text"
+            "selected destructive option should render visible selection text"
         );
     }
 

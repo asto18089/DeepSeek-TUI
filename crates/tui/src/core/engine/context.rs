@@ -5,6 +5,7 @@
 //! engine module from accumulating unrelated context-policy details.
 
 use crate::compaction::estimate_tokens;
+use crate::config::{ApiProvider, provider_capability};
 use crate::error_taxonomy::ErrorCategory;
 use crate::models::{Message, SystemPrompt, context_window_for_model};
 use crate::tools::spec::ToolResult;
@@ -562,9 +563,12 @@ pub(super) fn estimate_input_tokens_conservative(
 /// window does not underflow to a negative budget.
 const INTERNAL_BUDGET_LARGE_WINDOW_THRESHOLD: u32 = 500_000;
 
-/// Internal input-side token budget for a model: `window - reserved_output -
-/// headroom`. Used by the preflight check, emergency recovery, and capacity
-/// trimming to decide when to compact.
+/// Internal input-side token budget for a provider/model route:
+/// `window - reserved_output - headroom`. Used by the preflight check,
+/// emergency recovery, and capacity trimming to decide when to compact.
+/// Unknown model ids fall back to the provider's conservative default instead
+/// of disabling preflight; custom long-context deployments can still advertise
+/// their window with a `-256k`/`-1024k` model suffix.
 ///
 /// The reserved-output term is window-dependent:
 ///   * `window >= 500K` (V4-class large-context) -> [`TURN_MAX_OUTPUT_TOKENS`]
@@ -575,8 +579,15 @@ const INTERNAL_BUDGET_LARGE_WINDOW_THRESHOLD: u32 = 500_000;
 ///     `256K - 262K - 1K`, which underflows `checked_sub` to `None` and
 ///     *silently disables every preflight and emergency recovery path* — the
 ///     session then runs until the provider hard-rejects on context length.
-pub(super) fn context_input_budget(model: &str) -> Option<usize> {
-    let window_tokens = context_window_for_model(model)?;
+pub(super) fn context_input_budget_for_provider(
+    provider: ApiProvider,
+    model: &str,
+) -> Option<usize> {
+    let capability = provider_capability(provider, model);
+    context_input_budget_for_window(model, capability.context_window)
+}
+
+fn context_input_budget_for_window(model: &str, window_tokens: u32) -> Option<usize> {
     let window = usize::try_from(window_tokens).ok()?;
     let reserved_output = if window_tokens >= INTERNAL_BUDGET_LARGE_WINDOW_THRESHOLD {
         TURN_MAX_OUTPUT_TOKENS

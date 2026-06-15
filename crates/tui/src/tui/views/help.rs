@@ -2,7 +2,7 @@
 //!
 //! Renders two stacked sections — *Slash commands* and *Keybindings* — with
 //! a live substring filter applied as the user types in the search box. The
-//! command list is sourced from [`crate::commands::COMMANDS`] and the
+//! command list is sourced from [`crate::commands::command_infos()`] and the
 //! keybinding list from [`crate::tui::keybindings::KEYBINDINGS`] so neither
 //! can drift from the wired-up handlers.
 //!
@@ -202,7 +202,7 @@ impl HelpView {
 fn build_entries(locale: Locale) -> Vec<HelpEntry> {
     let mut entries = Vec::new();
 
-    for command in commands::COMMANDS {
+    for command in commands::command_infos() {
         let label = format!("/{}", command.name);
         let localized = command.description_for(locale);
         let description = if command.aliases.is_empty() {
@@ -451,7 +451,7 @@ impl ModalView for HelpView {
                         let style = if is_selected {
                             Style::default()
                                 .fg(palette::SELECTION_TEXT)
-                                .bg(palette::DEEPSEEK_BLUE)
+                                .bg(palette::SELECTION_BG)
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(palette::TEXT_PRIMARY)
@@ -515,7 +515,7 @@ mod tests {
     fn empty_filter_lists_all_entries() {
         let view = HelpView::new();
         // Total = registered slash commands + catalogued keybindings.
-        let expected = commands::COMMANDS.len() + KEYBINDINGS.len();
+        let expected = commands::command_infos().len() + KEYBINDINGS.len();
         assert_eq!(view.filtered.len(), expected);
         assert_eq!(view.entries.len(), expected);
     }
@@ -699,7 +699,7 @@ mod tests {
                 let cell = &buf[(x, y)];
                 row.push_str(cell.symbol());
                 row_has_highlight |=
-                    cell.bg == palette::DEEPSEEK_BLUE && cell.fg == palette::SELECTION_TEXT;
+                    cell.bg == palette::SELECTION_BG && cell.fg == palette::SELECTION_TEXT;
             }
             if row_has_highlight && row.contains(&selected_label) {
                 highlighted_label = true;
@@ -714,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_help_row_uses_stronger_highlight() {
+    fn selected_help_row_uses_selection_highlight() {
         let view = HelpView::new();
         let area = Rect::new(0, 0, 96, 32);
         let mut buf = Buffer::empty(area);
@@ -724,7 +724,7 @@ mod tests {
         for y in area.top()..area.bottom() {
             for x in area.left()..area.right() {
                 let cell = &buf[(x, y)];
-                if cell.bg == palette::DEEPSEEK_BLUE && cell.fg == palette::SELECTION_TEXT {
+                if cell.bg == palette::SELECTION_BG && cell.fg == palette::SELECTION_TEXT {
                     found_highlight = true;
                     break;
                 }
@@ -733,7 +733,7 @@ mod tests {
 
         assert!(
             found_highlight,
-            "selected row should use a strong blue highlight"
+            "selected row should use the semantic selection highlight"
         );
     }
 

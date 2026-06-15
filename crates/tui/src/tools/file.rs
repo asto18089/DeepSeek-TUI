@@ -10,6 +10,7 @@ use super::spec::{
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use std::fmt::Display;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -356,7 +357,8 @@ fn read_pdf(path: &Path, pages: Option<&str>) -> Result<ToolResult, ToolError> {
     // path). Users with column-heavy / complex-table PDFs (academic
     // papers, financial filings) can opt into the historical
     // `pdftotext -layout` route by setting
-    // `prefer_external_pdftotext = true` in `~/.config/deepseek/settings.toml`.
+    // `prefer_external_pdftotext = true` in `~/.codewhale/settings.toml`
+    // (legacy: `~/.config/deepseek/settings.toml`).
     let prefer_external = crate::settings::Settings::load()
         .map(|s| s.prefer_external_pdftotext)
         .unwrap_or(false);
@@ -378,19 +380,7 @@ fn read_pdf_via_pdf_extract(
         // pdf-extract returns pages in document order; `start`/`end` are
         // 1-indexed inclusive (validated above), so we convert to a
         // 0-indexed half-open slice with bounds clamping.
-        // [pinvou3-fork] catch_unwind prevents pdf-extract font/CMap panics
-        // from crashing a whole sub-agent task; the model receives a normal
-        // tool error and can continue or ask for a converted PDF.
-        let pages = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pdf_extract::extract_text_by_pages(path)
-        }))
-        .map_err(|_| {
-            ToolError::execution_failed(format!(
-                "pdf-extract panicked on {} (PDF 字体编码不支持，如 Identity-H；请提供文本版或转换后重试)",
-                path.display()
-            ))
-        })?
-        .map_err(|e| {
+        let pages = guard_pdf_extract(|| pdf_extract::extract_text_by_pages(path)).map_err(|e| {
             ToolError::execution_failed(format!(
                 "pdf-extract failed on {}: {e} (set `prefer_external_pdftotext = true` in settings.toml to retry via pdftotext)",
                 path.display()
@@ -413,16 +403,7 @@ fn read_pdf_via_pdf_extract(
         // extract_text uses an internal codepath that can hang on certain PDF
         // cross-reference tables or font encodings (#2641). The per-page path
         // avoids that hang and produces identical output when joined.
-        // [pinvou3-fork] Same panic guard for whole-document extraction.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pdf_extract::extract_text_by_pages(path)
-        }))
-        .map_err(|_| {
-            ToolError::execution_failed(format!(
-                "pdf-extract panicked on {} (PDF 字体编码不支持，如 Identity-H；请提供文本版或转换后重试)",
-                path.display()
-            ))
-        })?
+        guard_pdf_extract(|| pdf_extract::extract_text_by_pages(path))
             .map(|pages| pages.join("\n"))
             .map_err(|e| {
                 ToolError::execution_failed(format!(
@@ -432,6 +413,31 @@ fn read_pdf_via_pdf_extract(
             })?
     };
     Ok(ToolResult::success(clean_pdf_text(&text)))
+}
+
+fn guard_pdf_extract<T, E, F>(extract: F) -> Result<T, String>
+where
+    E: Display,
+    F: FnOnce() -> Result<T, E>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(extract)) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(payload) => Err(format!(
+            "extractor panicked: {}",
+            panic_payload_message(payload.as_ref())
+        )),
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 fn read_pdf_via_pdftotext(
@@ -1577,6 +1583,17 @@ mod tests {
         );
         // Title text lives on page 1 — must survive the window crop.
         assert!(single.content.contains("Recursive Language Models"));
+    }
+
+    #[test]
+    fn pdf_extract_panic_is_returned_as_tool_error_text() {
+        let err = guard_pdf_extract(|| -> Result<String, &'static str> {
+            panic!("assertion failed: name == \"Identity-H\"");
+        })
+        .expect_err("panic should become an error");
+
+        assert!(err.contains("extractor panicked"));
+        assert!(err.contains("Identity-H"));
     }
 
     #[tokio::test]

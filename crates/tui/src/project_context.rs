@@ -756,22 +756,14 @@ fn load_project_context_with_parents_and_home(
         }
     }
 
-    // Auto-generate .codewhale/instructions.md when no context file exists anywhere.
-    // This avoids the per-turn filesystem scan fallback in prompts.rs that
-    // breaks KV prefix cache stability.
+    // Generate a bounded in-memory fallback when no context file exists
+    // anywhere. This keeps prompt shape stable without creating project-local
+    // `.codewhale/` files merely because CodeWhale was opened in a directory.
     if !ctx.has_instructions()
-        && let Some(generated) = auto_generate_context(workspace)
+        && let Some(generated) = generate_ephemeral_context(workspace)
     {
-        let mut warnings = std::mem::take(&mut ctx.warnings);
-        ctx = load_project_context(workspace);
-        warnings.extend(ctx.warnings.iter().cloned());
-        ctx.warnings = warnings;
-        if !ctx.has_instructions() {
-            // Loaded from the file we just wrote — use the generated content
-            // directly as a last resort (shouldn't normally happen).
-            ctx.instructions = Some(generated);
-            ctx.source_path = None;
-        }
+        ctx.instructions = Some(generated);
+        ctx.source_path = None;
     }
 
     // Load the CodeWhale-specific repo authority policy
@@ -940,14 +932,15 @@ fn load_global_agents_context(workspace: &Path, home_dir: Option<&Path>) -> Opti
     None
 }
 
-/// Generate a context file from project tree + summary and write it to
-/// `.codewhale/instructions.md` (or `.deepseek/instructions.md` as legacy
-/// fallback). Returns the generated content on success.
-fn auto_generate_context(_workspace: &Path) -> Option<String> {
-    // [pinvou3-fork] PROJECT_CONTEXT_FILES 砍空后 workspace 上下文走 INSTRUCTIONS_MD §0
-    // 内嵌(InstructionSource::Inline),不再有任何 disk 文件,也不需要 auto-gen 任何
-    // disk 内容(且 §5 禁写 ~/.codewhale)。函数保留 shell 防上游 sync 时直接回退;
-    // 永不触发(load_project_context 先扫砍空的 PROJECT_CONTEXT_FILES → 无入口调到这里)。
+/// Generate ephemeral context from the project tree. Returns the generated
+/// content on success without writing workspace files.
+///
+/// [pinvou3-fork C5] 砍空返 None。pinvou3 GUI 助手 workspace=$HOME,
+/// PROJECT_CONTEXT_FILES 砍空后此 fallback 会被触发(!ctx.has_instructions()),
+/// 上游原实现把 $HOME 目录树扫成 ephemeral overview 注入 prompt——既撑爆又破坏 prompt
+/// 字节稳定。workspace 上下文走 INSTRUCTIONS_MD §0 内嵌(InstructionSource::Inline)。
+/// 保留上游函数名/签名供调用点(line ~763)编译,仅短路 body 返 None。
+fn generate_ephemeral_context(_workspace: &Path) -> Option<String> {
     None
 }
 
@@ -1490,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pinvou3 fork(C5): auto_generate_context 砍空(workspace context 走 Inline 注入,不落 disk)"]
+    #[ignore = "pinvou3 fork(C5): generate_ephemeral_context 砍空(workspace context 走 Inline 注入,不落 disk)"]
     fn auto_generated_context_is_bounded_for_many_file_workspace() {
         let workspace = tempdir().expect("workspace tempdir");
         let home = tempdir().expect("home tempdir");
@@ -1516,9 +1509,17 @@ mod tests {
         assert!(ctx.has_instructions());
 
         let generated_path = workspace.path().join(".codewhale").join("instructions.md");
-        assert_eq!(ctx.source_path.as_deref(), Some(generated_path.as_path()));
-        let generated = fs::read_to_string(&generated_path).expect("read generated");
-        assert!(generated.contains("Project Context (Auto-generated)"));
+        assert_eq!(ctx.source_path, None);
+        assert!(
+            !generated_path.exists(),
+            "generated project context should stay ephemeral"
+        );
+        assert!(
+            !workspace.path().join(".codewhale").exists(),
+            "loading context should not create a .codewhale directory"
+        );
+        let generated = ctx.instructions.as_ref().expect("generated instructions");
+        assert!(generated.contains("Project Context (Auto-generated, ephemeral)"));
         assert!(generated.contains("Bounded Project Overview"));
         assert!(!generated.contains("<project_context_pack>"));
         assert!(
@@ -1618,7 +1619,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pinvou3 fork(C5): auto_generate_context 砍空,无 disk instructions 再生路径"]
+    #[ignore = "pinvou3 fork(C5): generate_ephemeral_context 砍空,无 disk instructions 再生路径"]
     fn cached_context_regenerates_after_auto_generated_context_is_deleted() {
         crate::project_context_cache::clear();
         let workspace = tempdir().expect("workspace tempdir");
@@ -1628,17 +1629,17 @@ mod tests {
             load_project_context_with_parents_cached_and_home(workspace.path(), Some(home.path()));
         assert!(first.has_instructions());
         let generated_path = workspace.path().join(".codewhale").join("instructions.md");
-        assert!(generated_path.is_file(), "expected generated instructions");
-
-        fs::remove_file(&generated_path).expect("remove generated instructions");
-        assert!(!generated_path.exists());
+        assert!(
+            !generated_path.exists(),
+            "first load should not write generated instructions"
+        );
 
         let second =
             load_project_context_with_parents_cached_and_home(workspace.path(), Some(home.path()));
         assert!(second.has_instructions());
         assert!(
-            generated_path.is_file(),
-            "cache hit under the missing-file signature would skip regeneration"
+            !generated_path.exists(),
+            "cached generated context should remain in memory-only state"
         );
     }
 
@@ -1952,7 +1953,7 @@ mod tests {
             ctx.instructions
                 .as_ref()
                 .unwrap()
-                .contains("Project Context (Auto-generated)")
+                .contains("Project Context (Auto-generated, ephemeral)")
         );
     }
 }

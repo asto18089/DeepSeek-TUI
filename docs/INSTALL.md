@@ -92,11 +92,6 @@ npm install -g codewhale
 codewhale
 ```
 
-```bash
-npm install -g codewhale
-codewhale
-```
-
 `postinstall` downloads the right pair of binaries from the matching GitHub
 release, verifies a SHA-256 manifest, and exposes both `codewhale` and
 `codewhale-tui` on your `PATH`.
@@ -105,14 +100,15 @@ Useful environment variables:
 
 | Variable                            | Purpose                                                                                |
 | ----------------------------------- | -------------------------------------------------------------------------------------- |
-| `DEEPSEEK_TUI_VERSION`              | Pin which release the wrapper downloads (defaults to `deepseekBinaryVersion`)          |
+| `CODEWHALE_VERSION`                 | Pin which release the wrapper downloads (canonical)                                    |
+| `DEEPSEEK_TUI_VERSION`              | Legacy alias for `CODEWHALE_VERSION` (defaults to `codewhaleBinaryVersion`)            |
 | `DEEPSEEK_TUI_GITHUB_REPO`          | Point the downloader at a fork (`owner/repo`)                                          |
 | `DEEPSEEK_TUI_RELEASE_BASE_URL`     | Override the download root (e.g. an internal mirror or release-asset proxy)            |
 | `DEEPSEEK_TUI_FORCE_DOWNLOAD=1`     | Re-download even if a cached binary marker matches                                     |
 | `DEEPSEEK_TUI_DISABLE_INSTALL=1`    | Skip the `postinstall` download entirely (CI smoke, vendored binaries)                 |
 | `DEEPSEEK_TUI_OPTIONAL_INSTALL=1`   | Don't fail `npm install` on download/extract errors — useful in CI matrices            |
 
-> **Slow npm download from mainland China?** Once npm publication resumes, if `npm install` itself is slow
+> **Slow npm download from mainland China?** If `npm install` itself is slow
 > (not just the postinstall binary download), use an npm registry mirror:
 > ```bash
 > npm config set registry https://registry.npmmirror.com
@@ -579,7 +575,7 @@ If you operate a binary asset mirror, `codewhale update` can use it directly:
 
 ```bash
 DEEPSEEK_TUI_VERSION=X.Y.Z \
-DEEPSEEK_TUI_RELEASE_BASE_URL=https://your-mirror.example.com/DeepSeek-TUI/vX.Y.Z/ \
+DEEPSEEK_TUI_RELEASE_BASE_URL=https://your-mirror.example.com/CodeWhale/vX.Y.Z/ \
 codewhale update
 ```
 
@@ -706,7 +702,7 @@ Use one of these paths:
 2. Mirror the release assets internally and set `DEEPSEEK_TUI_RELEASE_BASE_URL`:
 
    ```bash
-   export DEEPSEEK_TUI_RELEASE_BASE_URL=https://your-mirror.example.com/DeepSeek-TUI/
+   export DEEPSEEK_TUI_RELEASE_BASE_URL=https://your-mirror.example.com/CodeWhale/
    codewhale
    ```
 

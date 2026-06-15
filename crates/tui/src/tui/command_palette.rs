@@ -55,7 +55,7 @@ pub fn build_entries(
 ) -> Vec<CommandPaletteEntry> {
     let mut entries = Vec::new();
 
-    for command in commands::COMMANDS {
+    for command in commands::command_infos() {
         let mut description = command.palette_description_for(locale);
         if command.requires_argument() {
             description.push_str("  ");
@@ -1142,7 +1142,7 @@ mod tests {
 
         assert!(command_labels.contains(&"/config"));
         assert!(command_labels.contains(&"/links"));
-        assert!(!command_labels.contains(&"/voice"));
+        assert!(command_labels.contains(&"/voice"));
         assert!(!command_labels.contains(&"/set"));
         assert!(!command_labels.contains(&"/deepseek"));
     }
@@ -1164,9 +1164,9 @@ mod tests {
             .iter()
             .filter(|entry| entry.section == PaletteSection::Command)
             .collect::<Vec<_>>();
-        assert_eq!(command_entries.len(), commands::COMMANDS.len());
+        assert_eq!(command_entries.len(), commands::command_infos().len());
 
-        for command in commands::COMMANDS {
+        for command in commands::command_infos() {
             let label = format!("/{}", command.name);
             let matching = command_entries
                 .iter()

@@ -668,7 +668,7 @@ fn build_list_lines(
         let style = if idx == selected {
             Style::default()
                 .fg(palette::SELECTION_TEXT)
-                .bg(palette::DEEPSEEK_BLUE)
+                .bg(palette::SELECTION_BG)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(palette::TEXT_PRIMARY)
@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn build_list_lines_selected_row_uses_strong_highlight() {
+    fn build_list_lines_selected_row_uses_muted_selection_highlight() {
         let sessions = vec![
             test_session(1, "first session"),
             test_session(2, "second session"),
@@ -1109,7 +1109,8 @@ mod tests {
             .expect("selected row should have a span");
 
         assert_eq!(span.style.fg, Some(palette::SELECTION_TEXT));
-        assert_eq!(span.style.bg, Some(palette::DEEPSEEK_BLUE));
+        assert_eq!(span.style.bg, Some(palette::SELECTION_BG));
+        assert_ne!(span.style.bg, Some(palette::DEEPSEEK_BLUE));
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
     }
 

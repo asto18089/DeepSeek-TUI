@@ -1,4 +1,4 @@
-//! Runtime HTTP/SSE API for local DeepSeek automation.
+//! Runtime HTTP/SSE API for local CodeWhale automation.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -19,7 +19,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
-use codewhale_protocol::runtime::{RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION, RuntimeEventEnvelope};
+use codewhale_protocol::runtime::{
+    RUNTIME_API_VERSION, RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION, RuntimeCapabilities,
+    RuntimeEventEnvelope, RuntimeExperimentalCapabilities,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -34,6 +37,8 @@ use crate::automation_manager::{
     CreateAutomationRequest, SharedAutomationManager, UpdateAutomationRequest, spawn_scheduler,
 };
 use crate::config::{Config, DEFAULT_TEXT_MODEL};
+use crate::fleet::ledger::{FleetLedgerState, FleetTaskLedgerStatus};
+use crate::fleet::manager::{FleetManager, FleetStatusSnapshot, FleetWorkerInspection};
 use crate::mcp::McpPool;
 use crate::models::{ContentBlock, Message};
 use crate::runtime_threads::{
@@ -49,6 +54,10 @@ use crate::session_manager::{
 use crate::skill_state::SkillStateStore;
 use crate::task_manager::{
     NewTaskRequest, SharedTaskManager, TaskManager, TaskManagerConfig, TaskRecord, TaskSummary,
+};
+use crate::tools::subagent::{AgentWorkerRecord, load_persisted_agent_worker_records};
+use codewhale_protocol::fleet::{
+    FleetArtifactKind, FleetRun, FleetRunId, FleetWorkerEventPayload, FleetWorkerStatus,
 };
 
 #[derive(Clone)]
@@ -77,11 +86,13 @@ pub struct RuntimeApiOptions {
     /// Additional CORS origins to allow on top of the built-in defaults
     /// (`http://localhost:{3000,1420}`, `http://127.0.0.1:{3000,1420}`,
     /// `tauri://localhost`). Populated by `--cors-origin` (repeatable),
-    /// `DEEPSEEK_CORS_ORIGINS` (comma-separated), and `[runtime_api]
-    /// cors_origins` in `config.toml`. Whalescale#255 / #561.
+    /// `CODEWHALE_CORS_ORIGINS` (comma-separated, `DEEPSEEK_CORS_ORIGINS`
+    /// as alias), and `[runtime_api] cors_origins` in `config.toml`.
+    /// Whalescale#255 / #561.
     pub cors_origins: Vec<String>,
     /// Optional bearer token required for `/v1/*` routes. If omitted here,
-    /// `run_http_server` also checks `DEEPSEEK_RUNTIME_TOKEN`.
+    /// `run_http_server` checks `CODEWHALE_RUNTIME_TOKEN`, then
+    /// `DEEPSEEK_RUNTIME_TOKEN` as an alias.
     pub auth_token: Option<String>,
     /// Allow `/v1/*` routes without auth when no token is configured.
     pub insecure_no_auth: bool,
@@ -144,7 +155,7 @@ fn first_nonblank_token(token: Option<String>) -> Option<String> {
 
 fn generate_runtime_token() -> String {
     format!(
-        "dst_{}{}",
+        "cwrt_{}{}",
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     )
@@ -312,6 +323,11 @@ struct SkillsResponse {
     skills: Vec<SkillEntry>,
 }
 
+#[derive(Debug, Serialize)]
+struct AgentRunsResponse {
+    runs: Vec<AgentWorkerRecord>,
+}
+
 #[derive(Debug, Deserialize)]
 struct SetSkillEnabledRequest {
     enabled: bool,
@@ -359,10 +375,30 @@ struct SubmitUserInputResponse {
 
 #[derive(Debug, Serialize)]
 struct RuntimeInfoResponse {
+    service: &'static str,
+    runtime_api_version: &'static str,
+    codewhale_version: &'static str,
     bind_host: String,
     port: u16,
     auth_required: bool,
+    transports: Vec<&'static str>,
+    capabilities: RuntimeCapabilities,
+    experimental: RuntimeExperimentalCapabilities,
+    // Backward-compatible alias kept for existing clients.
     version: &'static str,
+}
+
+fn default_runtime_capabilities() -> RuntimeCapabilities {
+    RuntimeCapabilities {
+        threads: true,
+        turns: true,
+        turn_steer: true,
+        turn_interrupt: true,
+        event_replay: true,
+        external_tools: false,
+        environments: false,
+        worker_runtime: false,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -456,9 +492,12 @@ pub async fn run_http_server(
             .map(|h| h.join(".deepseek").join("sessions"))
             .unwrap_or_else(|| PathBuf::from(".deepseek").join("sessions"))
     });
+    let runtime_token_env = std::env::var("CODEWHALE_RUNTIME_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("DEEPSEEK_RUNTIME_TOKEN").ok());
     let resolved_auth = resolve_runtime_auth(
         options.auth_token.clone(),
-        std::env::var("DEEPSEEK_RUNTIME_TOKEN").ok(),
+        runtime_token_env,
         options.insecure_no_auth,
     );
     let runtime_token = resolved_auth.token.clone();
@@ -500,7 +539,9 @@ pub async fn run_http_server(
         if let Some(token) = runtime_token.as_deref() {
             println!("Runtime API auth: generated bearer token for this process.");
             println!("  Authorization: Bearer {token}");
-            println!("  Set DEEPSEEK_RUNTIME_TOKEN or pass --auth-token for a stable token.");
+            println!(
+                "  Set CODEWHALE_RUNTIME_TOKEN (or DEEPSEEK_RUNTIME_TOKEN as an alias) or pass --auth-token for a stable token."
+            );
         }
     } else if auth_enabled {
         println!("Runtime API auth: bearer token required for /v1/* routes.");
@@ -555,12 +596,33 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             post(resume_session_thread),
         )
         .route("/v1/workspace/status", get(workspace_status))
+        .route("/v1/agent-runs", get(list_agent_runs))
+        .route("/v1/agent-runs/{run_id}", get(get_agent_run))
+        .route("/v1/fleet/runs", get(list_fleet_runs))
+        .route("/v1/fleet/runs/{run_id}", get(get_fleet_run))
+        .route(
+            "/v1/fleet/runs/{run_id}/workers",
+            get(list_fleet_run_workers),
+        )
+        .route("/v1/fleet/runs/{run_id}/stop", post(stop_fleet_run))
+        .route("/v1/fleet/workers/{worker_id}", get(get_fleet_worker))
+        .route(
+            "/v1/fleet/workers/{worker_id}/interrupt",
+            post(interrupt_fleet_worker),
+        )
+        .route(
+            "/v1/fleet/workers/{worker_id}/restart",
+            post(restart_fleet_worker),
+        )
         .route("/v1/stream", post(stream_turn))
         .route("/v1/threads", get(list_threads).post(create_thread))
         .route("/v1/threads/summary", get(list_threads_summary))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
         .route("/v1/threads/{id}/resume", post(resume_thread))
         .route("/v1/threads/{id}/fork", post(fork_thread))
+        .route("/v1/threads/{id}/undo", post(undo_thread_turn))
+        .route("/v1/threads/{id}/patch-undo", post(patch_undo_thread_turn))
+        .route("/v1/threads/{id}/retry", post(retry_thread_turn))
         .route("/v1/threads/{id}/turns", post(start_thread_turn))
         .route(
             "/v1/threads/{id}/turns/{turn_id}/steer",
@@ -600,6 +662,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/automations/{id}/runs", get(list_automation_runs))
         .route("/v1/usage", get(get_usage))
         .route("/v1/snapshots", get(list_snapshots))
+        .route("/v1/snapshots/{id}/restore", post(restore_snapshot))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_runtime_token,
@@ -638,6 +701,11 @@ fn request_has_runtime_token(req: &Request, expected: &str) -> bool {
         .and_then(|value| value.to_str().ok())
         .and_then(|raw| raw.strip_prefix("Bearer "))
         .is_some_and(|token| token == expected)
+        || req
+            .headers()
+            .get("x-codewhale-runtime-token")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|token| token == expected)
         || req
             .headers()
             .get("x-deepseek-runtime-token")
@@ -784,7 +852,7 @@ fn detect_lan_ip() -> Option<String> {
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
-        service: "deepseek-runtime-api",
+        service: "codewhale-runtime-api",
         mode: "local",
     })
 }
@@ -853,6 +921,7 @@ async fn resume_session_thread(
             archived: false,
             system_prompt: session.system_prompt.clone(),
             task_id: None,
+            ..Default::default()
         })
         .await
         .map_err(|e| ApiError::internal(format!("Failed to create thread: {e}")))?;
@@ -1283,6 +1352,372 @@ async fn workspace_status(
     Ok(Json(collect_workspace_status(&state.workspace)))
 }
 
+async fn list_agent_runs(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<AgentRunsResponse>, ApiError> {
+    let runs = load_persisted_agent_worker_records(&state.workspace).map_err(|err| {
+        ApiError::internal(format!("Failed to load persisted agent run records: {err}"))
+    })?;
+    Ok(Json(AgentRunsResponse { runs }))
+}
+
+async fn get_agent_run(
+    State(state): State<RuntimeApiState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<AgentWorkerRecord>, ApiError> {
+    let runs = load_persisted_agent_worker_records(&state.workspace).map_err(|err| {
+        ApiError::internal(format!("Failed to load persisted agent run records: {err}"))
+    })?;
+    let run = runs
+        .into_iter()
+        .find(|record| {
+            let effective_run_id = if record.spec.run_id.is_empty() {
+                record.spec.worker_id.as_str()
+            } else {
+                record.spec.run_id.as_str()
+            };
+            effective_run_id == run_id || record.spec.worker_id == run_id
+        })
+        .ok_or_else(|| ApiError::not_found(format!("agent run '{run_id}' not found")))?;
+    Ok(Json(run))
+}
+
+async fn list_fleet_runs(State(state): State<RuntimeApiState>) -> Result<Json<Value>, ApiError> {
+    let manager = open_fleet_manager(&state)?;
+    let ledger_state = manager
+        .rebuild_state()
+        .map_err(|err| ApiError::internal(format!("Failed to rebuild fleet state: {err}")))?;
+    let runs: Vec<_> = ledger_state
+        .runs
+        .values()
+        .map(|run| fleet_run_summary_json(&manager, run, &ledger_state))
+        .collect::<Result<Vec<_>, _>>()?;
+    let status = manager
+        .status()
+        .map_err(|err| ApiError::internal(format!("Failed to read fleet status: {err}")))?;
+    Ok(Json(json!({
+        "status": fleet_status_json(&status),
+        "runs": runs,
+    })))
+}
+
+async fn get_fleet_run(
+    State(state): State<RuntimeApiState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let manager = open_fleet_manager(&state)?;
+    let ledger_state = manager
+        .rebuild_state()
+        .map_err(|err| ApiError::internal(format!("Failed to rebuild fleet state: {err}")))?;
+    let run = ledger_state
+        .runs
+        .get(&run_id)
+        .ok_or_else(|| ApiError::not_found(format!("fleet run '{run_id}' not found")))?;
+    Ok(Json(fleet_run_detail_json(&manager, run, &ledger_state)?))
+}
+
+async fn list_fleet_run_workers(
+    State(state): State<RuntimeApiState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let manager = open_fleet_manager(&state)?;
+    let ledger_state = manager
+        .rebuild_state()
+        .map_err(|err| ApiError::internal(format!("Failed to rebuild fleet state: {err}")))?;
+    let run = ledger_state
+        .runs
+        .get(&run_id)
+        .ok_or_else(|| ApiError::not_found(format!("fleet run '{run_id}' not found")))?;
+    let workers = run
+        .worker_specs
+        .iter()
+        .map(|worker| {
+            manager
+                .inspect_worker(&worker.id)
+                .map(|inspection| fleet_worker_json(&inspection))
+                .map_err(|err| {
+                    ApiError::internal(format!(
+                        "Failed to inspect fleet worker {}: {err}",
+                        worker.id
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(json!({
+        "run_id": run_id,
+        "workers": workers,
+    })))
+}
+
+async fn get_fleet_worker(
+    State(state): State<RuntimeApiState>,
+    Path(worker_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let manager = open_fleet_manager(&state)?;
+    let inspection = manager.inspect_worker(&worker_id).map_err(|err| {
+        ApiError::not_found(format!("fleet worker '{worker_id}' not found: {err}"))
+    })?;
+    Ok(Json(fleet_worker_json(&inspection)))
+}
+
+async fn interrupt_fleet_worker(
+    State(state): State<RuntimeApiState>,
+    Path(worker_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let manager = open_fleet_manager(&state)?;
+    let inspection = manager.interrupt_worker(&worker_id).map_err(|err| {
+        ApiError::bad_request(format!(
+            "Failed to interrupt fleet worker '{worker_id}': {err}"
+        ))
+    })?;
+    Ok(Json(json!({
+        "action": "interrupt",
+        "worker": fleet_worker_json(&inspection),
+    })))
+}
+
+async fn restart_fleet_worker(
+    State(state): State<RuntimeApiState>,
+    Path(worker_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let manager = open_fleet_manager(&state)?;
+    let inspection = manager.restart_worker(&worker_id).map_err(|err| {
+        ApiError::bad_request(format!(
+            "Failed to restart fleet worker '{worker_id}': {err}"
+        ))
+    })?;
+    Ok(Json(json!({
+        "action": "restart",
+        "worker": fleet_worker_json(&inspection),
+    })))
+}
+
+async fn stop_fleet_run(
+    State(state): State<RuntimeApiState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let manager = open_fleet_manager(&state)?;
+    let run_id = FleetRunId::from(run_id);
+    let stopped = manager.stop_run(&run_id).map_err(|err| {
+        ApiError::bad_request(format!("Failed to stop fleet run '{}': {err}", run_id.0))
+    })?;
+    let status = manager
+        .run_status(&run_id)
+        .map_err(|err| ApiError::internal(format!("Failed to read fleet run status: {err}")))?;
+    Ok(Json(json!({
+        "action": "stop",
+        "run_id": run_id.0,
+        "stopped": stopped,
+        "status": fleet_status_json(&status),
+    })))
+}
+
+fn open_fleet_manager(state: &RuntimeApiState) -> Result<FleetManager, ApiError> {
+    FleetManager::open(&state.workspace)
+        .map_err(|err| ApiError::internal(format!("Failed to open fleet manager: {err}")))
+}
+
+fn fleet_run_summary_json(
+    manager: &FleetManager,
+    run: &FleetRun,
+    ledger_state: &FleetLedgerState,
+) -> Result<Value, ApiError> {
+    let status = manager
+        .run_status(&run.id)
+        .map_err(|err| ApiError::internal(format!("Failed to read fleet run status: {err}")))?;
+    let task_statuses = ledger_state
+        .tasks
+        .values()
+        .filter(|task| task.entry.run_id == run.id)
+        .map(|task| {
+            json!({
+                "task_id": task.entry.task_id.clone(),
+                "status": fleet_task_status_label(task.status),
+                "leased_to": task.leased_to.clone(),
+                "attempts": task.entry.attempts,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "id": run.id.0.clone(),
+        "name": run.name.clone(),
+        "status": fleet_status_json(&status),
+        "task_count": run.task_specs.len(),
+        "worker_count": run.worker_specs.len(),
+        "tasks": task_statuses,
+        "labels": run.labels.clone(),
+        "created_at": run.created_at.clone(),
+        "updated_at": run.updated_at.clone(),
+        "completed_at": run.completed_at.clone(),
+    }))
+}
+
+fn fleet_run_detail_json(
+    manager: &FleetManager,
+    run: &FleetRun,
+    ledger_state: &FleetLedgerState,
+) -> Result<Value, ApiError> {
+    let mut value = fleet_run_summary_json(manager, run, ledger_state)?;
+    if let Some(map) = value.as_object_mut() {
+        map.insert("task_specs".to_string(), json!(run.task_specs.clone()));
+        map.insert("worker_specs".to_string(), json!(run.worker_specs.clone()));
+    }
+    Ok(value)
+}
+
+fn fleet_status_json(status: &FleetStatusSnapshot) -> Value {
+    json!({
+        "runs": status.runs,
+        "queued": status.queued,
+        "running": status.running,
+        "completed": status.completed,
+        "partial": status.partial,
+        "failed": status.failed,
+        "restarted": status.restarted,
+        "escalated": status.escalated,
+        "transport_failed": status.transport_failed,
+        "task_failed": status.task_failed,
+        "verifier_failed": status.verifier_failed,
+        "cancelled": status.cancelled,
+        "stale": status.stale,
+        "workers": status
+            .workers
+            .iter()
+            .map(|(worker_id, status)| {
+                (
+                    worker_id.clone(),
+                    Value::String(worker_status_label(status).to_string()),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>(),
+    })
+}
+
+fn fleet_worker_json(inspection: &FleetWorkerInspection) -> Value {
+    json!({
+        "worker_id": inspection.worker_id.clone(),
+        "status": worker_status_label(&inspection.status),
+        "run_id": inspection.current_run_id.as_ref().map(|run_id| run_id.0.clone()),
+        "task_id": inspection.current_task_id.clone(),
+        "objective": inspection.objective.clone(),
+        "role": inspection.role.clone(),
+        "host": inspection.host.clone(),
+        "latest_heartbeat_at": inspection.latest_heartbeat_at.clone(),
+        "latest_event": inspection.latest_event.as_ref().map(fleet_event_json),
+        "artifacts": inspection.artifacts.iter().map(fleet_artifact_json).collect::<Vec<_>>(),
+        "last_error": inspection.last_error.clone(),
+        "alert_state": inspection.alert_state.clone(),
+    })
+}
+
+fn fleet_artifact_json(artifact: &codewhale_protocol::fleet::FleetArtifactRef) -> Value {
+    json!({
+        "kind": artifact_kind_label(&artifact.kind),
+        "path": artifact.path.clone(),
+        "checksum": artifact.checksum.clone(),
+        "mime_type": artifact.mime_type.clone(),
+        "size_bytes": artifact.size_bytes,
+    })
+}
+
+fn fleet_event_json(event: &codewhale_protocol::fleet::FleetWorkerEvent) -> Value {
+    json!({
+        "seq": event.seq,
+        "run_id": event.run_id.0.clone(),
+        "worker_id": event.worker_id.clone(),
+        "task_id": event.task_id.clone(),
+        "timestamp": event.timestamp.clone(),
+        "label": fleet_event_label(&event.payload),
+        "payload": event.payload.clone(),
+    })
+}
+
+fn worker_status_label(status: &FleetWorkerStatus) -> &'static str {
+    match status {
+        FleetWorkerStatus::Unknown => "unknown",
+        FleetWorkerStatus::Online => "online",
+        FleetWorkerStatus::Busy => "busy",
+        FleetWorkerStatus::Offline => "offline",
+        FleetWorkerStatus::Unhealthy => "unhealthy",
+        FleetWorkerStatus::Draining => "draining",
+        FleetWorkerStatus::Retired => "retired",
+    }
+}
+
+fn fleet_task_status_label(status: FleetTaskLedgerStatus) -> &'static str {
+    match status {
+        FleetTaskLedgerStatus::Enqueued => "enqueued",
+        FleetTaskLedgerStatus::Leased => "leased",
+        FleetTaskLedgerStatus::Completed => "completed",
+        FleetTaskLedgerStatus::Failed => "failed",
+        FleetTaskLedgerStatus::Cancelled => "cancelled",
+    }
+}
+
+fn artifact_kind_label(kind: &FleetArtifactKind) -> String {
+    match kind {
+        FleetArtifactKind::Log => "log".to_string(),
+        FleetArtifactKind::Patch => "patch".to_string(),
+        FleetArtifactKind::TestResult => "test_result".to_string(),
+        FleetArtifactKind::Report => "report".to_string(),
+        FleetArtifactKind::Checkpoint => "checkpoint".to_string(),
+        FleetArtifactKind::Receipt => "receipt".to_string(),
+        FleetArtifactKind::Other(value) => value.clone(),
+    }
+}
+
+fn fleet_event_label(payload: &FleetWorkerEventPayload) -> String {
+    match payload {
+        FleetWorkerEventPayload::Queued => "queued".to_string(),
+        FleetWorkerEventPayload::Leased { .. } => "leased".to_string(),
+        FleetWorkerEventPayload::Starting => "starting".to_string(),
+        FleetWorkerEventPayload::Running => "running".to_string(),
+        FleetWorkerEventPayload::ModelWait { model } => model
+            .as_ref()
+            .map(|model| format!("model_wait model={model}"))
+            .unwrap_or_else(|| "model_wait".to_string()),
+        FleetWorkerEventPayload::RunningTool { tool, call_id } => call_id
+            .as_ref()
+            .map(|call_id| format!("running_tool tool={tool} call_id={call_id}"))
+            .unwrap_or_else(|| format!("running_tool tool={tool}")),
+        FleetWorkerEventPayload::Heartbeat { .. } => "heartbeat".to_string(),
+        FleetWorkerEventPayload::Artifact(artifact) => {
+            format!("artifact kind={}", artifact_kind_label(&artifact.kind))
+        }
+        FleetWorkerEventPayload::Completed { exit_code, summary } => match (exit_code, summary) {
+            (Some(code), Some(summary)) => format!("completed exit_code={code} {summary}"),
+            (Some(code), None) => format!("completed exit_code={code}"),
+            (None, Some(summary)) => format!("completed {summary}"),
+            (None, None) => "completed".to_string(),
+        },
+        FleetWorkerEventPayload::Failed {
+            reason,
+            recoverable,
+        } => {
+            format!("failed recoverable={recoverable} reason={reason}")
+        }
+        FleetWorkerEventPayload::Cancelled { cancelled_by } => cancelled_by
+            .as_ref()
+            .map(|by| format!("cancelled by={by}"))
+            .unwrap_or_else(|| "cancelled".to_string()),
+        FleetWorkerEventPayload::Interrupted { signal } => signal
+            .as_ref()
+            .map(|signal| format!("interrupted signal={signal}"))
+            .unwrap_or_else(|| "interrupted".to_string()),
+        FleetWorkerEventPayload::Stale { last_heartbeat_at } => last_heartbeat_at
+            .as_ref()
+            .map(|ts| format!("stale last_heartbeat_at={ts}"))
+            .unwrap_or_else(|| "stale".to_string()),
+        FleetWorkerEventPayload::Restarted { restart_count } => {
+            format!("restarted count={restart_count}")
+        }
+        FleetWorkerEventPayload::Escalated { channel, alert_id } => alert_id
+            .as_ref()
+            .map(|alert_id| format!("escalated channel={channel} alert_id={alert_id}"))
+            .unwrap_or_else(|| format!("escalated channel={channel}")),
+    }
+}
+
 async fn list_skills(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<SkillsResponse>, ApiError> {
@@ -1396,11 +1831,18 @@ async fn submit_user_input(
 }
 
 async fn runtime_info(State(state): State<RuntimeApiState>) -> Json<RuntimeInfoResponse> {
+    let version = env!("CARGO_PKG_VERSION");
     Json(RuntimeInfoResponse {
+        service: "codewhale-runtime-api",
+        runtime_api_version: RUNTIME_API_VERSION,
+        codewhale_version: version,
         bind_host: state.bind_host.clone(),
         port: state.bind_port,
         auth_required: state.auth_required,
-        version: env!("CARGO_PKG_VERSION"),
+        transports: vec!["http", "sse"],
+        capabilities: default_runtime_capabilities(),
+        experimental: RuntimeExperimentalCapabilities::default(),
+        version,
     })
 }
 
@@ -1612,6 +2054,238 @@ async fn fork_thread(
     Ok((StatusCode::CREATED, Json(thread)))
 }
 
+#[derive(Debug, Deserialize)]
+struct UndoTurnRequest {
+    /// How many turns back to undo (default 0 = last turn only).
+    #[serde(default)]
+    depth: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct UndoTurnResponse {
+    /// The new forked thread (with the last N turns removed).
+    thread: ThreadRecord,
+    /// The original user message text from the first dropped turn,
+    /// so the GUI can pre-populate the input box.
+    original_user_text: Option<String>,
+}
+
+async fn undo_thread_turn(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<UndoTurnRequest>,
+) -> Result<(StatusCode, Json<UndoTurnResponse>), ApiError> {
+    let depth = req.depth.unwrap_or(0);
+    let (forked_thread, original_user_text) = state
+        .runtime_threads
+        .fork_at_user_message(&id, depth)
+        .await
+        .map_err(map_thread_err)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(UndoTurnResponse {
+            thread: forked_thread,
+            original_user_text,
+        }),
+    ))
+}
+
+/// Result of the snapshot-based file rollback step of patch-undo, reported
+/// alongside the new forked thread.
+#[derive(Debug, Serialize)]
+struct PatchUndoResult {
+    /// Whether files were restored from a snapshot.
+    files_restored: bool,
+    /// Human-readable summary of what was restored (diff stat).
+    summary: Option<String>,
+    /// The label of the restored snapshot (e.g. "tool:apply_patch" or "pre-turn:3").
+    snapshot_label: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PatchUndoResponse {
+    /// Result of the snapshot-based file rollback step.
+    patch_result: PatchUndoResult,
+    /// The new forked thread (with the last turn removed).
+    thread: ThreadRecord,
+    /// The original user text from the removed turn (for re-editing).
+    original_user_text: Option<String>,
+}
+
+async fn patch_undo_thread_turn(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<UndoTurnRequest>,
+) -> Result<(StatusCode, Json<PatchUndoResponse>), ApiError> {
+    let depth = req.depth.unwrap_or(0);
+
+    // Step 1: Try snapshot-based file rollback (patch_undo).
+    let thread = state
+        .runtime_threads
+        .get_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    let patch_result = patch_undo_workspace_files(&thread.workspace);
+
+    // Step 2: Remove the last conversation turn (undo_conversation).
+    let (forked_thread, original_user_text) = state
+        .runtime_threads
+        .fork_at_user_message(&id, depth)
+        .await
+        .map_err(map_thread_err)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(PatchUndoResponse {
+            patch_result,
+            thread: forked_thread,
+            original_user_text,
+        }),
+    ))
+}
+
+/// Restore the newest `tool:` or `pre-turn:` snapshot that differs from the
+/// current workspace — same target selection as the TUI's `patch_undo`.
+fn patch_undo_workspace_files(workspace: &FsPath) -> PatchUndoResult {
+    let repo = match crate::snapshot::SnapshotRepo::open_or_init(workspace) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return PatchUndoResult {
+                files_restored: false,
+                summary: Some(format!("Snapshot repo unavailable: {e}")),
+                snapshot_label: None,
+            };
+        }
+    };
+    let snapshots = match repo.list(20) {
+        Ok(snapshots) => snapshots,
+        Err(e) => {
+            return PatchUndoResult {
+                files_restored: false,
+                summary: Some(format!("Failed to list snapshots: {e}")),
+                snapshot_label: None,
+            };
+        }
+    };
+    let target = snapshots
+        .iter()
+        .filter(|s| s.label.starts_with("tool:") || s.label.starts_with("pre-turn:"))
+        .find(|s| matches!(repo.work_tree_matches_snapshot(&s.id), Ok(false) | Err(_)));
+    let Some(target) = target else {
+        return PatchUndoResult {
+            files_restored: false,
+            summary: Some(
+                "No older tool or pre-turn snapshots differ from the current workspace."
+                    .to_string(),
+            ),
+            snapshot_label: None,
+        };
+    };
+    if let Err(e) = repo.restore(&target.id) {
+        return PatchUndoResult {
+            files_restored: false,
+            summary: Some(format!("Restore failed: {e}")),
+            snapshot_label: None,
+        };
+    }
+
+    // Compute a diff stat for the summary.
+    use crate::dependencies::{ExternalTool as _, Git};
+    let diff_stat = Git::command().and_then(|mut git| {
+        git.args(["diff", "--stat"])
+            .current_dir(workspace)
+            .output()
+            .ok()
+            .and_then(|o| {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            })
+    });
+
+    let short = &target.id.as_str()[..target.id.as_str().len().min(8)];
+    let summary = match diff_stat {
+        Some(ref stat) => format!(
+            "Restored snapshot '{}' ({}). Files affected:\n{stat}",
+            target.label, short
+        ),
+        None => format!(
+            "Restored snapshot '{}' ({}). No diff changes detected.",
+            target.label, short
+        ),
+    };
+    PatchUndoResult {
+        files_restored: true,
+        summary: Some(summary),
+        snapshot_label: Some(target.label.clone()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RetryTurnRequest {
+    /// How many turns back to retry (default 0 = last turn only).
+    #[serde(default)]
+    depth: Option<usize>,
+    /// Override the user message text. If omitted, the original text
+    /// from the dropped turn is re-used.
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RetryTurnResponse {
+    /// The new forked thread (with the last N turns removed).
+    thread: ThreadRecord,
+    /// The turn created by the retry.
+    turn: TurnRecord,
+}
+
+async fn retry_thread_turn(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<RetryTurnRequest>,
+) -> Result<(StatusCode, Json<RetryTurnResponse>), ApiError> {
+    let depth = req.depth.unwrap_or(0);
+    let (forked_thread, original_user_text) = state
+        .runtime_threads
+        .fork_at_user_message(&id, depth)
+        .await
+        .map_err(map_thread_err)?;
+
+    let retry_prompt = req.prompt.or(original_user_text).unwrap_or_default();
+    if retry_prompt.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "No user message to retry — the dropped turn had no user text",
+        ));
+    }
+
+    let turn = state
+        .runtime_threads
+        .start_turn(
+            &forked_thread.id,
+            StartTurnRequest {
+                prompt: retry_prompt,
+                input_summary: None,
+                model: None,
+                mode: None,
+                allow_shell: None,
+                trust_mode: None,
+                auto_approve: None,
+                dynamic_tools: Vec::new(),
+                environment_id: None,
+            },
+        )
+        .await
+        .map_err(map_thread_err)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RetryTurnResponse {
+            thread: forked_thread,
+            turn,
+        }),
+    ))
+}
+
 async fn start_thread_turn(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
@@ -1800,6 +2474,7 @@ async fn stream_turn(
             archived: true,
             system_prompt: None,
             task_id: None,
+            ..Default::default()
         })
         .await
         .map_err(|e| ApiError::internal(format!("Failed to create stream thread: {e}")))?;
@@ -1816,6 +2491,7 @@ async fn stream_turn(
                 allow_shell: Some(allow_shell),
                 trust_mode: Some(trust_mode),
                 auto_approve: Some(auto_approve),
+                ..Default::default()
             },
         )
         .await
@@ -2263,6 +2939,24 @@ async fn list_snapshots(
     )?))
 }
 
+async fn restore_snapshot(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    restore_snapshot_for_workspace(&state.workspace, &id)?;
+    Ok(Json(json!({
+        "restored": id,
+    })))
+}
+
+fn restore_snapshot_for_workspace(workspace: &FsPath, id: &str) -> Result<(), ApiError> {
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace)
+        .map_err(|e| ApiError::internal(format!("Snapshot repo init failed: {e}")))?;
+    let snapshot_id = crate::snapshot::SnapshotId(id.to_string());
+    repo.restore(&snapshot_id)
+        .map_err(|e| ApiError::internal(format!("Snapshot restore failed: {e}")))
+}
+
 fn snapshot_entries_for_workspace(
     workspace: &FsPath,
     query: SnapshotsQuery,
@@ -2587,7 +3281,7 @@ mod tests {
         let auth = resolve_runtime_auth(None, None, false);
         assert!(auth.generated);
         let token = auth.token.expect("generated token");
-        assert!(token.starts_with("dst_"));
+        assert!(token.starts_with("cwrt_"));
         assert!(token.len() > 32);
     }
 
@@ -2682,13 +3376,37 @@ mod tests {
             tokio::task::JoinHandle<()>,
         )>,
     > {
+        spawn_test_server_with_root_token_mobile_workspace(
+            root,
+            sessions_dir,
+            runtime_token,
+            mobile_enabled,
+            PathBuf::from("."),
+        )
+        .await
+    }
+
+    async fn spawn_test_server_with_root_token_mobile_workspace(
+        root: PathBuf,
+        sessions_dir: PathBuf,
+        runtime_token: Option<String>,
+        mobile_enabled: bool,
+        workspace: PathBuf,
+    ) -> Result<
+        Option<(
+            SocketAddr,
+            SharedRuntimeThreadManager,
+            tokio::task::JoinHandle<()>,
+        )>,
+    > {
         let _ = rustls::crypto::ring::default_provider().install_default();
         fs::create_dir_all(&sessions_dir)?;
+        fs::create_dir_all(&workspace)?;
         let manager = TaskManager::start_with_executor(
             TaskManagerConfig {
                 data_dir: root.join("tasks"),
                 worker_count: 1,
-                default_workspace: PathBuf::from("."),
+                default_workspace: workspace.clone(),
                 default_model: DEFAULT_TEXT_MODEL.to_string(),
                 default_mode: "agent".to_string(),
                 allow_shell: false,
@@ -2718,7 +3436,7 @@ mod tests {
         });
         let runtime_threads: SharedRuntimeThreadManager = Arc::new(RuntimeThreadManager::open(
             config,
-            PathBuf::from("."),
+            workspace.clone(),
             RuntimeThreadManagerConfig::from_task_data_dir(root.join("runtime")),
         )?);
         runtime_threads.attach_task_manager(manager.clone());
@@ -2730,7 +3448,7 @@ mod tests {
         let auth_required = runtime_token.is_some();
         let state = RuntimeApiState {
             config: Config::default(),
-            workspace: PathBuf::from("."),
+            workspace,
             task_manager: manager,
             runtime_threads: runtime_threads.clone(),
             cors_origins: Vec::new(),
@@ -2891,6 +3609,7 @@ mod tests {
             .json()
             .await?;
         assert_eq!(health["status"], "ok");
+        assert_eq!(health["service"], "codewhale-runtime-api");
 
         let created: serde_json::Value = client
             .post(format!("http://{addr}/v1/tasks"))
@@ -2975,6 +3694,22 @@ mod tests {
             .await?
             .error_for_status()?;
         assert_eq!(query_token.status(), StatusCode::OK);
+
+        let codewhale_header = client
+            .get(format!("http://{addr}/v1/threads/summary"))
+            .header("x-codewhale-runtime-token", &token)
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(codewhale_header.status(), StatusCode::OK);
+
+        let deepseek_header = client
+            .get(format!("http://{addr}/v1/threads/summary"))
+            .header("x-deepseek-runtime-token", &token)
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(deepseek_header.status(), StatusCode::OK);
 
         handle.abort();
         Ok(())
@@ -3206,6 +3941,277 @@ mod tests {
             .await?
             .status();
         assert_eq!(missing_status, StatusCode::NOT_FOUND);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("codewhale-fleet-api-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace)?;
+        let manager = FleetManager::open(&workspace)?;
+        let task = codewhale_protocol::fleet::FleetTaskSpec {
+            id: "task-a".to_string(),
+            name: "Task A".to_string(),
+            description: None,
+            objective: Some("Inspect fleet status through Runtime API".to_string()),
+            instructions: "Stay running for inspection.".to_string(),
+            worker: Some(codewhale_protocol::fleet::FleetTaskWorkerProfile {
+                role: Some("status-reviewer".to_string()),
+                tool_profile: Some("read-only".to_string()),
+                tools: vec!["rg".to_string()],
+                capabilities: vec!["fleet".to_string()],
+            }),
+            workspace: None,
+            input_files: Vec::new(),
+            context: Vec::new(),
+            budget: None,
+            tags: Vec::new(),
+            expected_artifacts: vec![FleetArtifactKind::Log],
+            scorer: None,
+            retry_policy: None,
+            alert_policy: None,
+            timeout_seconds: None,
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let report = manager.create_run(
+            crate::fleet::task_spec::FleetTaskSpecDocument {
+                name: Some("api smoke".to_string()),
+                labels: std::collections::BTreeMap::new(),
+                security_policy: None,
+                workers: Vec::new(),
+                tasks: vec![task],
+            },
+            1,
+        )?;
+        let worker_id = report.worker_ids[0].clone();
+        let sessions_dir = root.join("sessions");
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_mobile_workspace(
+                root.clone(),
+                sessions_dir,
+                None,
+                false,
+                workspace,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let runs: serde_json::Value = client
+            .get(format!("http://{addr}/v1/fleet/runs"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(runs["status"]["running"], 1);
+        assert_eq!(runs["runs"][0]["id"], report.run_id.0);
+
+        let worker: serde_json::Value = client
+            .get(format!("http://{addr}/v1/fleet/workers/{worker_id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(
+            worker["objective"],
+            "Inspect fleet status through Runtime API"
+        );
+        assert_eq!(worker["role"], "status-reviewer");
+        assert_eq!(worker["host"], "local");
+        assert_eq!(worker["artifacts"][0]["kind"], "log");
+
+        let interrupted: serde_json::Value = client
+            .post(format!(
+                "http://{addr}/v1/fleet/workers/{worker_id}/interrupt"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(interrupted["action"], "interrupt");
+        assert_eq!(interrupted["worker"]["last_error"], "cancelled by operator");
+
+        let restarted: serde_json::Value = client
+            .post(format!(
+                "http://{addr}/v1/fleet/workers/{worker_id}/restart"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(restarted["action"], "restart");
+        assert_eq!(restarted["worker"]["status"], "busy");
+
+        let stopped: serde_json::Value = client
+            .post(format!(
+                "http://{addr}/v1/fleet/runs/{}/stop",
+                report.run_id.0
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(stopped["action"], "stop");
+        assert_eq!(stopped["stopped"], 1);
+        assert_eq!(stopped["status"]["cancelled"], 1);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()> {
+        use crate::tools::subagent::{
+            AgentRunArtifactRef, AgentRunFollowUpTarget, AgentRunTakeoverTarget, AgentRunUsage,
+            AgentRunVerificationSummary, AgentWorkerEvent, AgentWorkerRecord, AgentWorkerSpec,
+            AgentWorkerStatus, AgentWorkerToolProfile, SubAgentType,
+        };
+        use std::collections::VecDeque;
+
+        let root =
+            std::env::temp_dir().join(format!("codewhale-agent-runs-api-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(workspace.join(".codewhale/state"))?;
+
+        let record = AgentWorkerRecord {
+            spec: AgentWorkerSpec {
+                worker_id: "agent_receipt".to_string(),
+                run_id: "run_receipt".to_string(),
+                parent_run_id: Some("parent_run".to_string()),
+                session_name: Some("receipt_lane".to_string()),
+                objective: "Verify run receipt projection".to_string(),
+                role: Some("verifier".to_string()),
+                agent_type: SubAgentType::Verifier,
+                model: "deepseek-v4-flash".to_string(),
+                workspace: workspace.clone(),
+                git_branch: Some("codex/v0.8.60".to_string()),
+                context_mode: "fresh".to_string(),
+                fork_context: false,
+                tool_profile: AgentWorkerToolProfile::Explicit(vec!["read_file".to_string()]),
+                max_steps: 4,
+                spawn_depth: 1,
+                max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
+            },
+            actor_kind: "subagent".to_string(),
+            parent_run_id: Some("parent_run".to_string()),
+            follow_up: AgentRunFollowUpTarget {
+                tool: "agent_eval".to_string(),
+                agent_id: "agent_receipt".to_string(),
+                session_name: Some("receipt_lane".to_string()),
+                accepted_statuses: vec![
+                    "running".to_string(),
+                    "interrupted_continuable".to_string(),
+                ],
+                latest_delivery: None,
+            },
+            takeover: AgentRunTakeoverTarget {
+                kind: "local_subagent_session".to_string(),
+                supported: true,
+                agent_id: "agent_receipt".to_string(),
+                session_name: Some("receipt_lane".to_string()),
+                instructions: "Use agent_eval with agent_id 'agent_receipt'.".to_string(),
+                unsupported_reason: None,
+            },
+            artifacts: vec![AgentRunArtifactRef {
+                kind: "transcript".to_string(),
+                name: "transcript_handle".to_string(),
+                target: "agent:agent_receipt".to_string(),
+                description: "Read with handle_read from a live projection.".to_string(),
+            }],
+            usage: AgentRunUsage {
+                status: "unknown".to_string(),
+                total_tokens: None,
+                note: "not reported".to_string(),
+            },
+            verification: AgentRunVerificationSummary {
+                status: "self_report_only".to_string(),
+                summary: "no verified receipt attached".to_string(),
+            },
+            status: AgentWorkerStatus::Completed,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            started_at_ms: Some(1),
+            completed_at_ms: Some(2),
+            latest_message: Some("completed".to_string()),
+            result_summary: Some("receipt complete".to_string()),
+            error: None,
+            steps_taken: 2,
+            events: VecDeque::from([AgentWorkerEvent {
+                seq: 1,
+                worker_id: "agent_receipt".to_string(),
+                status: AgentWorkerStatus::Completed,
+                timestamp_ms: 2,
+                message: Some("completed".to_string()),
+                step: Some(2),
+                tool_name: None,
+            }]),
+        };
+        let state_payload = json!({
+            "schema_version": 1,
+            "agents": [],
+            "workers": [record],
+        });
+        fs::write(
+            workspace.join(".codewhale/state/subagents.v1.json"),
+            serde_json::to_vec_pretty(&state_payload)?,
+        )?;
+
+        let sessions_dir = root.join("sessions");
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_mobile_workspace(
+                root.clone(),
+                sessions_dir,
+                None,
+                false,
+                workspace,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let runs: serde_json::Value = client
+            .get(format!("http://{addr}/v1/agent-runs"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(runs["runs"][0]["spec"]["run_id"], "run_receipt");
+        assert_eq!(runs["runs"][0]["follow_up"]["tool"], "agent_eval");
+        assert_eq!(
+            runs["runs"][0]["verification"]["status"],
+            "self_report_only"
+        );
+
+        let run: serde_json::Value = client
+            .get(format!("http://{addr}/v1/agent-runs/run_receipt"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(run["spec"]["worker_id"], "agent_receipt");
+        assert_eq!(run["takeover"]["supported"], true);
+        assert_eq!(run["artifacts"][0]["kind"], "transcript");
+
+        let missing = client
+            .get(format!("http://{addr}/v1/agent-runs/missing"))
+            .send()
+            .await?
+            .status();
+        assert_eq!(missing, StatusCode::NOT_FOUND);
 
         handle.abort();
         Ok(())
@@ -4236,6 +5242,196 @@ mod tests {
         Ok(())
     }
 
+    /// Create a thread over HTTP and seed it with one user/assistant turn.
+    /// Shared setup for the undo/patch-undo/retry endpoint tests.
+    async fn create_seeded_thread(
+        addr: &SocketAddr,
+        runtime_threads: &SharedRuntimeThreadManager,
+        root: &FsPath,
+        user_text: &str,
+    ) -> Result<String> {
+        let client = crate::tls::reqwest_client();
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({
+                "model": "deepseek-v4-pro",
+                "mode": "agent",
+                "workspace": root.join("workspace")
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"]
+            .as_str()
+            .context("missing thread id")?
+            .to_string();
+
+        runtime_threads
+            .seed_thread_from_messages(
+                &thread_id,
+                &[
+                    Message {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: user_text.to_string(),
+                            cache_control: None,
+                        }],
+                    },
+                    Message {
+                        role: "assistant".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: "Done — anything else?".to_string(),
+                            cache_control: None,
+                        }],
+                    },
+                ],
+            )
+            .await?;
+        Ok(thread_id)
+    }
+
+    #[tokio::test]
+    async fn undo_endpoint_forks_thread_and_returns_original_user_text() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-undo-endpoint-{}", Uuid::new_v4()));
+        let sessions_dir = root.join("sessions");
+        let Some((addr, runtime_threads, handle)) =
+            spawn_test_server_with_root(root.clone(), sessions_dir).await?
+        else {
+            return Ok(());
+        };
+        let thread_id =
+            create_seeded_thread(&addr, &runtime_threads, &root, "Please undo this turn").await?;
+        let client = crate::tls::reqwest_client();
+
+        let resp = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/undo"))
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let undone: serde_json::Value = resp.json().await?;
+        assert_eq!(undone["original_user_text"], "Please undo this turn");
+        let forked_id = undone["thread"]["id"]
+            .as_str()
+            .context("missing forked thread id")?;
+        assert_ne!(forked_id, thread_id, "undo must fork, not mutate in place");
+
+        // The forked thread has the undone turn removed.
+        let detail: serde_json::Value = client
+            .get(format!("http://{addr}/v1/threads/{forked_id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(detail["turns"].as_array().map_or(usize::MAX, Vec::len), 0);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn undo_endpoint_404s_for_missing_thread() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+        let resp = client
+            .post(format!("http://{addr}/v1/threads/thr_missing/undo"))
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn patch_undo_endpoint_forks_and_reports_file_rollback_state() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("deepseek-patch-undo-endpoint-{}", Uuid::new_v4()));
+        let sessions_dir = root.join("sessions");
+        let Some((addr, runtime_threads, handle)) =
+            spawn_test_server_with_root(root.clone(), sessions_dir).await?
+        else {
+            return Ok(());
+        };
+        let thread_id =
+            create_seeded_thread(&addr, &runtime_threads, &root, "Roll back the patch").await?;
+        let client = crate::tls::reqwest_client();
+
+        let resp = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/patch-undo"))
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let undone: serde_json::Value = resp.json().await?;
+        // The fresh workspace has no tool/pre-turn snapshots to roll back to,
+        // so the file-restore step reports failure while the conversation
+        // undo still forks the thread.
+        assert_eq!(undone["patch_result"]["files_restored"], false);
+        assert!(undone["patch_result"]["summary"].is_string());
+        assert_eq!(undone["original_user_text"], "Roll back the patch");
+        assert_ne!(undone["thread"]["id"].as_str(), Some(thread_id.as_str()));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_endpoint_reuses_dropped_user_text_to_start_a_turn() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-retry-endpoint-{}", Uuid::new_v4()));
+        let sessions_dir = root.join("sessions");
+        let Some((addr, runtime_threads, handle)) =
+            spawn_test_server_with_root(root.clone(), sessions_dir).await?
+        else {
+            return Ok(());
+        };
+        let thread_id =
+            create_seeded_thread(&addr, &runtime_threads, &root, "Retry this request").await?;
+        let client = crate::tls::reqwest_client();
+
+        let resp = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/retry"))
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let retried: serde_json::Value = resp.json().await?;
+        let forked_id = retried["thread"]["id"]
+            .as_str()
+            .context("missing forked thread id")?;
+        assert_ne!(forked_id, thread_id);
+        assert_eq!(retried["turn"]["thread_id"], forked_id);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn restore_snapshot_endpoint_helper_restores_workspace_files() -> Result<()> {
+        let _lock = lock_test_env();
+        let root = tempfile::tempdir()?;
+        let home = root.path().join("home");
+        fs::create_dir_all(&home)?;
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let workspace = root.path().join("workspace");
+        fs::create_dir_all(&workspace)?;
+        let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+        fs::write(workspace.join("a.txt"), "v1")?;
+        let snapshot_id = repo.snapshot("pre-turn:1")?;
+        fs::write(workspace.join("a.txt"), "v2")?;
+
+        restore_snapshot_for_workspace(&workspace, snapshot_id.as_str())
+            .expect("snapshot restore should succeed");
+        assert_eq!(fs::read_to_string(workspace.join("a.txt"))?, "v1");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn session_create_from_thread_rejects_active_turn() -> Result<()> {
         let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
@@ -4753,9 +5949,91 @@ mod tests {
             .error_for_status()?
             .json()
             .await?;
+        assert_eq!(info["service"], "codewhale-runtime-api");
+        assert_eq!(info["runtime_api_version"], "1.0");
+        assert_eq!(info["codewhale_version"], info["version"]);
         assert_eq!(info["bind_host"], "127.0.0.1");
         assert_eq!(info["auth_required"], false);
         assert!(info["version"].is_string());
+        assert_eq!(info["transports"], json!(["http", "sse"]));
+        assert_eq!(info["capabilities"]["threads"], true);
+        assert_eq!(info["capabilities"]["external_tools"], false);
+        assert!(info["experimental"].is_object());
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_thread_accepts_dynamic_tools_and_environments() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({
+                "model": "test-model",
+                "dynamic_tools": [
+                    {
+                        "namespace": "tau_bench",
+                        "name": "get_reservation",
+                        "description": "Look up a reservation.",
+                        "input_schema": { "type": "object" }
+                    }
+                ],
+                "environments": [
+                    { "environment_id": "local", "cwd": "/workspace" }
+                ]
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert!(created["id"].is_string());
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_turn_accepts_dynamic_tools_and_environment_id() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({ "model": "test-model" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"].as_str().context("missing thread id")?;
+
+        let started: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/turns"))
+            .json(&json!({
+                "prompt": "hello",
+                "dynamic_tools": [
+                    {
+                        "name": "simple_tool",
+                        "description": "A simple tool.",
+                        "input_schema": { "type": "object" }
+                    }
+                ],
+                "environment_id": "local"
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(started["turn"]["thread_id"], thread_id);
 
         handle.abort();
         Ok(())

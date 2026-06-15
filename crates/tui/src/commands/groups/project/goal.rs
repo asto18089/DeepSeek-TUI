@@ -1,4 +1,4 @@
-//! /hunt command — declare a quarry with token budget and verdict tracking (#2092).
+//! /goal command, with /hunt kept as a compatibility alias (#2092).
 
 use std::io::Write;
 
@@ -6,7 +6,7 @@ use crate::tui::app::{App, AppAction, HuntVerdict};
 
 use super::CommandResult;
 
-/// Declare, show, or close a hunt
+/// Declare, show, pause, resume, or close a goal.
 pub fn hunt(app: &mut App, arg: Option<&str>) -> CommandResult {
     match arg {
         Some("clear") | Some("reset") => {
@@ -14,15 +14,20 @@ pub fn hunt(app: &mut App, arg: Option<&str>) -> CommandResult {
             app.hunt.token_budget = None;
             app.hunt.started_at = None;
             app.hunt.verdict = HuntVerdict::default();
-            CommandResult::message("Hunt cleared.")
+            CommandResult::message("Goal cleared.")
         }
         Some("done") | Some("complete") | Some("hunted") => close_hunt(app, HuntVerdict::Hunted),
-        Some("wound") | Some("wounded") => close_hunt(app, HuntVerdict::Wounded),
-        Some("escape") | Some("escaped") => close_hunt(app, HuntVerdict::Escaped),
+        Some("pause") | Some("paused") | Some("wound") | Some("wounded") => {
+            close_hunt(app, HuntVerdict::Wounded)
+        }
+        Some("resume") | Some("continue") => resume_hunt(app),
+        Some("block") | Some("blocked") | Some("escape") | Some("escaped") => {
+            close_hunt(app, HuntVerdict::Escaped)
+        }
         Some(text) if !text.is_empty() => {
             let (objective, budget) = parse_hunt_budget(text);
             if objective.is_empty() || objective.chars().all(|c| c == '|') {
-                return CommandResult::error("Usage: /hunt <quarry> [budget: N]");
+                return CommandResult::error(goal_usage());
             }
             app.hunt.quarry = Some(objective.clone());
             app.hunt.token_budget = budget;
@@ -32,7 +37,7 @@ pub fn hunt(app: &mut App, arg: Option<&str>) -> CommandResult {
                 .map(|b| format!(" (budget: {b} tokens)"))
                 .unwrap_or_default();
             CommandResult::with_message_and_action(
-                format!("Hunt set: \"{objective}\"{budget_str} — tracking progress."),
+                format!("Goal set: \"{objective}\"{budget_str} - tracking progress."),
                 AppAction::SendMessage(objective),
             )
         }
@@ -57,22 +62,16 @@ pub fn hunt(app: &mut App, arg: Option<&str>) -> CommandResult {
                     })
                     .unwrap_or_default();
                 let verdict_label = match app.hunt.verdict {
-                    HuntVerdict::Hunting => "[HUNTING]",
-                    HuntVerdict::Hunted => "[HUNTED]",
-                    HuntVerdict::Wounded => "[WOUNDED]",
-                    HuntVerdict::Escaped => "[ESCAPED]",
+                    HuntVerdict::Hunting => "[ACTIVE]",
+                    HuntVerdict::Hunted => "[COMPLETE]",
+                    HuntVerdict::Wounded => "[PAUSED]",
+                    HuntVerdict::Escaped => "[BLOCKED]",
                 };
                 CommandResult::message(format!(
-                    "Hunt {verdict_label}: \"{obj}\" — elapsed: {elapsed}{budget_str}"
+                    "Goal {verdict_label}: \"{obj}\" - elapsed: {elapsed}{budget_str}"
                 ))
             } else {
-                CommandResult::message(
-                    "No hunt set. Use /hunt <quarry> [budget: N] to declare one.\n\
-                     /hunt hunted — mark complete\n\
-                     /hunt wounded — mark interrupted (resumable)\n\
-                     /hunt escaped — mark abandoned\n\
-                     /hunt clear — remove the current hunt.",
-                )
+                CommandResult::message(goal_usage())
             }
         }
     }
@@ -80,11 +79,15 @@ pub fn hunt(app: &mut App, arg: Option<&str>) -> CommandResult {
 
 fn close_hunt(app: &mut App, verdict: HuntVerdict) -> CommandResult {
     if app.hunt.quarry.as_deref().is_none_or(str::is_empty) {
-        return CommandResult::error("No hunt set. Use /hunt <quarry> [budget: N] first.");
+        return CommandResult::error("No goal set. Use /goal <objective> [budget: N] first.");
     }
 
     let prev = app.hunt.verdict;
-    let should_write_trophy = prev != verdict || !matches!(verdict, HuntVerdict::Hunted);
+    let should_write_trophy = match verdict {
+        HuntVerdict::Hunted => prev != verdict,
+        HuntVerdict::Escaped => true,
+        HuntVerdict::Wounded | HuntVerdict::Hunting => false,
+    };
     if should_write_trophy && let Err(err) = write_trophy_card(app, verdict) {
         return CommandResult::error(err);
     }
@@ -97,14 +100,42 @@ fn close_hunt(app: &mut App, verdict: HuntVerdict) -> CommandResult {
                 .started_at
                 .map(|t| crate::tui::notifications::humanize_duration(t.elapsed()))
                 .unwrap_or_else(|| "unknown".to_string());
-            CommandResult::message(format!("Hunt complete! Elapsed: {elapsed}"))
+            CommandResult::message(format!("Goal complete. Elapsed: {elapsed}"))
         }
         HuntVerdict::Wounded => {
-            CommandResult::message("Hunt wounded — progress saved, can be resumed.")
+            CommandResult::message("Goal paused. Progress is saved; use /goal resume to continue.")
         }
-        HuntVerdict::Escaped => CommandResult::message("Hunt escaped — quarry abandoned."),
-        HuntVerdict::Hunting => CommandResult::message("Hunt resumed."),
+        HuntVerdict::Escaped => CommandResult::message("Goal blocked."),
+        HuntVerdict::Hunting => CommandResult::message("Goal resumed."),
     }
+}
+
+fn resume_hunt(app: &mut App) -> CommandResult {
+    let Some(objective) = app
+        .hunt
+        .quarry
+        .as_deref()
+        .map(str::trim)
+        .filter(|objective| !objective.is_empty())
+        .map(str::to_string)
+    else {
+        return CommandResult::error("No paused goal set. Use /goal <objective> first.");
+    };
+
+    app.hunt.verdict = HuntVerdict::Hunting;
+    if app.hunt.started_at.is_none() {
+        app.hunt.started_at = Some(std::time::Instant::now());
+    }
+    CommandResult::with_message_and_action("Goal resumed.", AppAction::SendMessage(objective))
+}
+
+fn goal_usage() -> &'static str {
+    "No goal set. Use /goal <objective> [budget: N] to set one.\n\
+     /goal complete - mark complete\n\
+     /goal pause - pause without continuing\n\
+     /goal resume - resume and continue\n\
+     /goal blocked - mark blocked\n\
+     /goal clear - remove the current goal."
 }
 
 /// Parse text like "Implement login | budget: 50000" into (objective, budget).
@@ -126,14 +157,14 @@ fn parse_hunt_budget(text: &str) -> (String, Option<u32>) {
     }
 }
 
-/// Write a trophy card to `~/.codewhale/trophies/<date>-<time>-<slug>.md`
-/// for the current hunt verdict (#2092).
+/// Write a legacy trophy card to `~/.codewhale/trophies/<date>-<time>-<slug>.md`
+/// for the current goal result (#2092).
 fn write_trophy_card(app: &App, verdict: HuntVerdict) -> Result<std::path::PathBuf, String> {
     let quarry = app
         .hunt
         .quarry
         .as_deref()
-        .ok_or_else(|| "No hunt set. Use /hunt <quarry> [budget: N] first.".to_string())?;
+        .ok_or_else(|| "No goal set. Use /goal <objective> [budget: N] first.".to_string())?;
     // Collapse consecutive non-alphanumeric chars into a single '-'
     let mut slug = String::new();
     let mut last_dash = false;
@@ -149,7 +180,7 @@ fn write_trophy_card(app: &App, verdict: HuntVerdict) -> Result<std::path::PathB
     let slug = slug.trim_matches('-');
     if slug.is_empty() {
         return Err(
-            "Cannot write trophy card: hunt quarry has no filename-safe characters.".into(),
+            "Cannot write trophy card: goal objective has no filename-safe characters.".into(),
         );
     }
     let now = chrono::Local::now();
@@ -172,10 +203,10 @@ fn write_trophy_card(app: &App, verdict: HuntVerdict) -> Result<std::path::PathB
         .map(|t| crate::tui::notifications::humanize_duration(t.elapsed()))
         .unwrap_or_else(|| "unknown".to_string());
     let verdict_str = match verdict {
-        HuntVerdict::Hunting => "hunting",
-        HuntVerdict::Hunted => "hunted",
-        HuntVerdict::Wounded => "wounded",
-        HuntVerdict::Escaped => "escaped",
+        HuntVerdict::Hunting => "active",
+        HuntVerdict::Hunted => "complete",
+        HuntVerdict::Wounded => "paused",
+        HuntVerdict::Escaped => "blocked",
     };
     let tokens = app.session.total_conversation_tokens;
     let budget_str = app
@@ -214,7 +245,7 @@ struct TrophyCard<'a> {
 }
 
 fn write_trophy_card_contents(mut f: impl Write, card: TrophyCard<'_>) -> std::io::Result<()> {
-    writeln!(f, "# Trophy: {}", card.quarry)?;
+    writeln!(f, "# Goal result: {}", card.quarry)?;
     writeln!(f)?;
     writeln!(f, "- **Verdict**: {}", card.verdict)?;
     writeln!(f, "- **Date**: {}", card.date)?;
@@ -222,7 +253,7 @@ fn write_trophy_card_contents(mut f: impl Write, card: TrophyCard<'_>) -> std::i
     writeln!(f, "- **Tokens used**: {}", card.tokens)?;
     writeln!(f, "- **Token budget**: {}", card.budget)?;
     writeln!(f)?;
-    writeln!(f, "_Generated by CodeWhale `/hunt` — {}_", card.now)?;
+    writeln!(f, "_Generated by CodeWhale `/goal` - {}_", card.now)?;
     Ok(())
 }
 
@@ -260,8 +291,12 @@ mod tests {
     fn test_set_hunt() {
         let mut app = create_test_app();
         let result = hunt(&mut app, Some("Fix the login bug"));
-        assert!(result.message.unwrap().contains("Hunt set"));
+        assert!(result.message.unwrap().contains("Goal set"));
         assert_eq!(app.hunt.quarry.as_deref(), Some("Fix the login bug"));
+        assert_eq!(
+            app.hunt.verdict.goal_status(),
+            crate::tools::goal::GoalStatus::Active
+        );
         assert!(matches!(
             result.action,
             Some(AppAction::SendMessage(msg)) if msg == "Fix the login bug"
@@ -273,7 +308,7 @@ mod tests {
         let mut app = create_test_app();
         let result = hunt(&mut app, None);
         assert!(result.action.is_none());
-        assert!(result.message.as_deref().unwrap().contains("No hunt set"));
+        assert!(result.message.as_deref().unwrap().contains("No goal set"));
     }
 
     #[test]
@@ -298,7 +333,7 @@ mod tests {
                 .message
                 .as_deref()
                 .unwrap_or_default()
-                .contains("Usage: /hunt")
+                .contains("/goal <objective>")
         );
         assert_eq!(app.hunt.quarry.as_deref(), Some("existing objective"));
         assert_eq!(app.hunt.token_budget, Some(10_000));
@@ -308,9 +343,14 @@ mod tests {
     fn test_clear_hunt() {
         let mut app = create_test_app();
         app.hunt.quarry = Some("test".to_string());
+        app.hunt.token_budget = Some(100);
         let _ = hunt(&mut app, Some("clear"));
         assert!(app.hunt.quarry.is_none());
         assert!(app.hunt.token_budget.is_none());
+        assert_eq!(
+            app.hunt.verdict.goal_status(),
+            crate::tools::goal::GoalStatus::Active
+        );
     }
 
     #[test]
@@ -322,6 +362,31 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(app.hunt.verdict, HuntVerdict::Hunting);
         assert!(app.hunt.quarry.is_none());
+    }
+
+    #[test]
+    fn test_goal_pause_and_resume_update_status() {
+        let mut app = create_test_app();
+        let _ = hunt(&mut app, Some("Finish release prep"));
+
+        let paused = hunt(&mut app, Some("pause"));
+        assert!(paused.action.is_none());
+        assert_eq!(app.hunt.verdict, HuntVerdict::Wounded);
+        assert_eq!(
+            app.hunt.verdict.goal_status(),
+            crate::tools::goal::GoalStatus::Paused
+        );
+
+        let resumed = hunt(&mut app, Some("resume"));
+        assert_eq!(app.hunt.verdict, HuntVerdict::Hunting);
+        assert_eq!(
+            app.hunt.verdict.goal_status(),
+            crate::tools::goal::GoalStatus::Active
+        );
+        assert!(matches!(
+            resumed.action,
+            Some(AppAction::SendMessage(msg)) if msg == "Finish release prep"
+        ));
     }
 
     #[test]
@@ -341,7 +406,7 @@ mod tests {
     fn test_show_hunt_when_none() {
         let mut app = create_test_app();
         let result = hunt(&mut app, None);
-        assert!(result.message.unwrap().contains("No hunt set"));
+        assert!(result.message.unwrap().contains("No goal set"));
     }
 
     #[test]
