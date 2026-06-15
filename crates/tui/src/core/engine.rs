@@ -1181,7 +1181,7 @@ impl Engine {
                     prompt,
                     role_id,
                     allowed_tools,
-                    max_steps: _,
+                    max_steps,
                     output_schema,
                     expects_file_output,
                 } => {
@@ -1306,6 +1306,9 @@ impl Engine {
                                 model: None,
                                 nickname: None,
                                 fork_context: false,
+                                // [pinvou3-fork] registry 步数预算,曾被 `max_steps: _`
+                                // 静默丢弃 → 角色全按默认 200 步跑(menxia 实测 173 步永动)
+                                max_steps,
                             },
                         )
                     };

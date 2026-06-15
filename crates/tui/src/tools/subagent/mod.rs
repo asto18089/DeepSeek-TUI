@@ -675,6 +675,9 @@ pub(crate) struct SubAgentSpawnOptions {
     pub model: Option<String>,
     pub nickname: Option<String>,
     pub fork_context: bool,
+    /// [pinvou3-fork] 每次派发的步数预算(registry 角色 max_steps)。
+    /// None = 沿用 manager 全局默认。曾被静默丢弃 → 角色按默认 200 步跑。
+    pub max_steps: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1554,7 +1557,7 @@ impl SubAgentManager {
         agent.fork_context = options.fork_context;
         let agent_id = agent.id.clone();
         let started_at = agent.started_at;
-        let max_steps = self.max_steps;
+        let max_steps = options.max_steps.unwrap_or(self.max_steps);
 
         if let Some(event_tx) = runtime.event_tx.clone() {
             let _ = event_tx.try_send(Event::AgentSpawned {
@@ -2740,6 +2743,7 @@ impl ToolSpec for AgentSpawnTool {
                     model: Some(effective_model),
                     nickname: None,
                     fork_context: spawn_request.fork_context,
+                    max_steps: None,
                 },
             )
             .map_err(|e| ToolError::execution_failed(format!("Failed to spawn sub-agent: {e}")))?;
@@ -4908,6 +4912,13 @@ async fn run_subagent(
                 )
                 .await,
             );
+        }
+
+        // [pinvou3-fork] submit_output 已成功落盘即收工:结构化产出就是 schema 角色的
+        // 全部使命,继续转圈只会让 temp=0 的模型确定性地重复提交(menxia 实测
+        // 173 步×177 token 永动直到步数上限)。final_result 已在成功臂里置好。
+        if output_schema.is_some() && output_submitted.is_some() {
+            break;
         }
 
         // [pinvou3-fork] submit_output 校验失败也 fail-closed：模型反复提交不合格产出
