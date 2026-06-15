@@ -4308,6 +4308,9 @@ mod tests {
             assignment: crate::tools::subagent::SubAgentAssignment {
                 objective: "task".to_string(),
                 role: Some("worker".to_string()),
+                // [pinvou3-fork W1] 结构化产出字段,测试夹具用默认值
+                output_schema: None,
+                expects_file_output: false,
             },
             model: String::new(),
             nickname: nickname.map(str::to_string),

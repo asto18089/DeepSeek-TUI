@@ -974,6 +974,44 @@ fn tools_always_load_overrides_default_native_deferral() {
     assert!(!should_default_defer_tool("git_blame", &always_load));
 }
 
+// [pinvou3-fork] 回归保护:Yolo(GUI 生产单 session)下,pinvou3 必需但不在上游
+// DEFAULT_ACTIVE_NATIVE_TOOLS 白名单的工具(request_user_input / append_file)必须 offer
+// (不 defer),否则 GUI 调不出 request_user_input 气泡 / 大文件 append_file。此前 v0.8.47
+// sync 因上游把 deferral 从 blocklist 改 allowlist 静默踩过(symptom: 气泡消失)。
+//
+// `request_user_input` 跨所有 mode 永不 defer(Plan/Agent 也要,instructions §1.4 引导用它问
+// 澄清,工具表必须永远有它)。v0.8.57:上游 should_default_defer_tool 改 2 参,pinvou3 仍
+// mode-aware(透传 mode),Yolo 显示全部、非 Yolo 叠加上游 allowlist。
+#[test]
+fn pinvou3_yolo_offers_nonblocklisted_tools_outside_upstream_default() {
+    let always_load = HashSet::new();
+    for tool in ["request_user_input", "append_file"] {
+        assert!(
+            !pinvou3_should_defer_native_tool(tool, AppMode::Yolo, &always_load),
+            "{tool} 在 Yolo 下不应被 defer(pinvou3 blocklist 模型,GUI 必需)"
+        );
+    }
+    // 黑名单工具即便 Yolo 也 defer
+    assert!(pinvou3_should_defer_native_tool(
+        "git_show",
+        AppMode::Yolo,
+        &always_load
+    ));
+    // request_user_input 跨所有 mode 都不 defer(instructions §1.4 引导用它问澄清)
+    for mode in [AppMode::Yolo, AppMode::Plan, AppMode::Agent] {
+        assert!(
+            !pinvou3_should_defer_native_tool("request_user_input", mode, &always_load),
+            "request_user_input 在 {mode:?} 下不应被 defer(工具表必须有)"
+        );
+    }
+    // 其他非白名单工具(如 append_file)在非 Yolo 下回落上游 allowlist 被 defer
+    assert!(pinvou3_should_defer_native_tool(
+        "append_file",
+        AppMode::Agent,
+        &always_load
+    ));
+}
+
 #[test]
 #[ignore = "one-shot metric for scripts/measure-tool-catalog.py"]
 #[allow(clippy::print_stderr)]
@@ -1533,6 +1571,7 @@ fn turn_tool_registry_builder_keeps_plan_mode_read_only_for_files() {
     assert!(registry.contains("read_file"));
     assert!(registry.contains("list_dir"));
     assert!(!registry.contains("write_file"));
+    assert!(!registry.contains("append_file"));
     assert!(!registry.contains("edit_file"));
     assert!(!registry.contains("exec_shell"));
     assert!(!registry.contains("exec_shell_wait"));
@@ -3541,6 +3580,7 @@ fn tool_search_respects_and_caps_max_results() {
 }
 
 #[test]
+#[ignore = "pinvou3 fork(C2): tool_search 工具被 blocklist + ensure_advanced_tooling gate 禁用注入(防模型激活 deferred 工具),catalog 不含 tool_search,其 schema 无从校验"]
 fn tool_search_schema_exposes_max_results_default_and_cap() {
     let mut catalog = Vec::new();
     let always_load = HashSet::new();
@@ -3907,6 +3947,49 @@ fn final_tool_input_repairs_unparseable_buffer() {
     assert_eq!(final_tool_input(&state), json!({}));
 }
 
+#[test]
+fn truncated_args_hint_fires_for_file_write_missing_field() {
+    use crate::tools::spec::ToolError;
+    // write_file / append_file coming back missing a required field is the
+    // SSE-truncation signature → must carry chunking guidance.
+    let hint = truncated_args_hint("write_file", &ToolError::missing_field("path"))
+        .expect("write_file missing field should hint");
+    assert!(hint.contains("append_file"), "{hint}");
+    assert!(truncated_args_hint("append_file", &ToolError::missing_field("content")).is_some());
+    // required_str surfaces a truncated `content` as InvalidInput, not
+    // MissingField — that path must hint too (the observed pinvou3 stall loop).
+    assert!(
+        truncated_args_hint(
+            "write_file",
+            &ToolError::invalid_input("missing required field 'content'. Input provided: path")
+        )
+        .is_some(),
+        "InvalidInput naming a missing required field is a truncation artifact"
+    );
+}
+
+#[test]
+fn truncated_args_hint_skips_other_tools_and_other_errors() {
+    use crate::tools::spec::ToolError;
+    // Non-file-write tools: no hint even on missing field.
+    assert!(truncated_args_hint("exec_shell", &ToolError::missing_field("command")).is_none());
+    // write_file oversize rejection is InvalidInput (already has guidance) — no
+    // double hint. Its message is the over-the-limit text, NOT "missing required
+    // field", so the InvalidInput arm must not match it.
+    assert!(truncated_args_hint("write_file", &ToolError::invalid_input("too big")).is_none());
+    assert!(
+        truncated_args_hint(
+            "write_file",
+            &ToolError::invalid_input(
+                "write_file content is 99999 bytes — over the 64KB single-call limit. \
+                 ... append_file in ≤16KB chunks."
+            )
+        )
+        .is_none(),
+        "oversize rejection already carries guidance — must not double-hint"
+    );
+}
+
 // === #103 transparent stream-retry policy =====================================
 
 #[test]
@@ -4168,6 +4251,13 @@ fn edited_paths_for_write_file_returns_path() {
 }
 
 #[test]
+fn edited_paths_for_append_file_returns_path() {
+    let input = json!({ "path": "src/deck.html", "content": "<section></section>" });
+    let paths = edited_paths_for_tool("append_file", &input);
+    assert_eq!(paths, vec![PathBuf::from("src/deck.html")]);
+}
+
+#[test]
 fn edited_paths_for_apply_patch_with_changes_returns_each_path() {
     let input = json!({
         "changes": [
@@ -4332,4 +4422,22 @@ async fn post_edit_hook_skips_unknown_tool_names() {
     engine.run_post_edit_lsp_hook("read_file", &input).await;
     assert!(engine.pending_lsp_blocks.is_empty());
     assert_eq!(fake.call_count(), 0);
+}
+
+#[test]
+fn forkguard_tool_search_not_injected_blocks_deferred_activation() {
+    // [pinvou3-fork] 回归保护:v0.8.57 上游新增 tool_search 工具注入(ensure_advanced_tooling),
+    // 让模型能搜索并激活 deferred 工具。pinvou3 blocklist 是 defer 不删除,模型可借 tool_search
+    // 激活被 blocklist 的 agent/delegate 等 → 前端裸 JSON(sync §4 回归)。pinvou3 把 tool_search
+    // 加进 blocklist + ensure_advanced_tooling 注入处 gate → catalog 根本不含 tool_search。
+    let always_load = HashSet::new();
+    let mut catalog = vec![api_tool("read_file"), api_tool("web_search")];
+    ensure_advanced_tooling(&mut catalog, AppMode::Yolo, &always_load);
+    assert!(
+        !catalog.iter().any(|t| t.name.starts_with("tool_search_tool")),
+        "tool_search 不应被注入(否则模型可借它激活被 blocklist 的 agent/delegate);catalog={:?}",
+        catalog.iter().map(|t| t.name.clone()).collect::<Vec<_>>()
+    );
+    assert!(crate::tools::pinvou3_blocklist::is_pinvou3_hidden("tool_search_tool_regex"));
+    assert!(crate::tools::pinvou3_blocklist::is_pinvou3_hidden("tool_search_tool_bm25"));
 }

@@ -6447,6 +6447,8 @@ async fn run_exec_agent(
         workspace: workspace.clone(),
         allow_shell: auto_approve || execution_config.allow_shell(),
         trust_mode,
+        tool_whitelist: None,
+        reasoning_effort: None,
         notes_path: execution_config.notes_path(),
         mcp_config_path: execution_config.mcp_config_path(),
         skills_dir: execution_config.skills_dir(),
@@ -6741,7 +6743,7 @@ async fn run_exec_agent(
             {
                 eprintln!("sub-agent {id}: {status}");
             }
-            Event::AgentComplete { id, result }
+            Event::AgentComplete { id, result, .. }
                 if output_format == ExecOutputFormat::Text && !json_output =>
             {
                 eprintln!(

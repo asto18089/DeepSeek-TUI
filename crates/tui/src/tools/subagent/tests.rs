@@ -1297,6 +1297,40 @@ fn test_subagent_tool_registry_reports_unavailable_tools() {
     );
 }
 
+/// [pinvou3-fork] Sub-agent registries must include web tools. Workflow roles
+/// such as researcher/product_manager may be spawned with explicit
+/// `web_search`/`fetch_url` allowlists; missing registration makes them die at
+/// spawn time before the model can produce fresh artifacts.
+#[test]
+fn forkguard_subagent_registry_includes_web_tools() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    runtime.allow_shell = false;
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::Custom,
+        Some(vec![
+            "read_file".to_string(),
+            "write_file".to_string(),
+            "web_search".to_string(),
+            "fetch_url".to_string(),
+        ]),
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    );
+    assert!(
+        registry.unavailable_allowed_tools().is_empty(),
+        "web_search/fetch_url must be registered for workflow sub-agents"
+    );
+}
+
+/// [pinvou3-fork] Sub-agent model calls are deterministic for workflow gates.
+#[test]
+fn forkguard_subagent_request_temperature_is_zero() {
+    assert_eq!(SUBAGENT_TEMPERATURE, 0.0);
+}
+
 #[test]
 fn test_review_agent_tools_exclude_agent_spawn() {
     let tmp = tempdir().expect("tempdir");
@@ -3000,6 +3034,7 @@ fn stub_runtime() -> SubAgentRuntime {
         fork_context: None,
         mcp_pool: None,
         step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
+        user_input_tx: None,
         speech_output_dir: None,
     }
 }
@@ -3571,6 +3606,39 @@ fn model_catalog_only_advertises_canonical_subagent_tools() {
     }
 }
 
+// [pinvou3-fork] 项目目录识别按 _state/workflow_progress.json 标记,与目录名前缀无关。
+// 回归:6/12 前缀 ppt-→wf- 后,旧实现(starts_with("ppt-"))找不到项目目录,
+// 结构化产出落到会话根,taizi 硬闸 FAIL"文件不存在: zhiyi.json"。
+#[test]
+fn find_project_dir_matches_marker_not_prefix() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws = tmp.path();
+
+    // 无标记的目录(哪怕叫 ppt-*)不算项目
+    std::fs::create_dir_all(ws.join("ppt-20260601-000000-x")).unwrap();
+    assert_eq!(super::find_project_dir_in_workspace(ws), None);
+
+    // wf- 前缀 + 标记 → 命中
+    let proj = ws.join("wf-20260612-023105-sansheng_liubu");
+    std::fs::create_dir_all(proj.join("_state")).unwrap();
+    std::fs::write(proj.join("_state/workflow_progress.json"), "{}").unwrap();
+    assert_eq!(super::find_project_dir_in_workspace(ws), Some(proj.clone()));
+
+    // 两个候选 → 取 progress mtime 最新的(后写的 ppt- 旧前缀项目也认)
+    let proj2 = ws.join("ppt-20260611-135848-sansheng_liubu");
+    std::fs::create_dir_all(proj2.join("_state")).unwrap();
+    std::fs::write(proj2.join("_state/workflow_progress.json"), "{}").unwrap();
+    let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    let f = std::fs::File::options()
+        .write(true)
+        .open(proj2.join("_state/workflow_progress.json"))
+        .unwrap();
+    f.set_modified(newer).unwrap();
+    assert_eq!(super::find_project_dir_in_workspace(ws), Some(proj2));
+}
+
+// ── 上游 v0.8.60 新增 subagent 测试(provider-aware 路由 / interactive launch gate 等);
+//    与上面 pinvou3 工作流测试 union 保留 ──
 // ── #3018: provider-aware auto routing and model validation ─────────────────
 
 #[tokio::test]

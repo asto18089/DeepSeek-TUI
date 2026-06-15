@@ -18,7 +18,7 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use serde_json::json;
-use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::DeepSeekClient;
@@ -45,9 +45,9 @@ use crate::tools::shell::{SharedShellManager, new_shared_shell_manager};
 use crate::tools::spec::RuntimeToolServices;
 use crate::tools::spec::{ApprovalRequirement, ToolError, ToolResult};
 use crate::tools::subagent::{
-    Mailbox, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext, SubAgentResult,
-    SubAgentRuntime, SubAgentStatus, SubAgentType, new_shared_subagent_manager_with_timeout,
-    resolve_subagent_assignment_route,
+    Mailbox, SharedSubAgentManager, SubAgentAssignment, SubAgentCompletion, SubAgentForkContext,
+    SubAgentResult, SubAgentRuntime, SubAgentSpawnOptions, SubAgentStatus, SubAgentType,
+    new_shared_subagent_manager_with_timeout, resolve_subagent_assignment_route,
 };
 use crate::tools::todo::{SharedTodoList, TodoListSnapshot, new_shared_todo_list};
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
@@ -252,6 +252,19 @@ pub struct EngineConfig {
     pub allow_shell: bool,
     /// Enable trust mode (skip approvals) when true.
     pub trust_mode: bool,
+    /// [pinvou3-fork] Hard tool whitelist for this engine. When `Some`, the
+    /// model-visible catalog is filtered down to exactly these tool names — a
+    /// true allowlist, not a `defer_loading` soft-hide: non-whitelisted tools
+    /// are removed entirely so `tool_search` cannot re-activate them. Used to
+    /// structurally constrain the workflow-session supervisor (品悟) to
+    /// read + review tools only.
+    pub tool_whitelist: Option<std::collections::HashSet<String>>,
+    /// [pinvou3-fork] 会话初始 reasoning_effort。session 原本只在第一条
+    /// SendMessage 时才获得该值;纯 SpawnSubAgent 驱动的会话(工作流宿主,
+    /// 取消对话型品悟后无任何 SendMessage)会一直停留在 None →
+    /// 对 vLLM/Qwen3.6 即回落到默认 thinking 全开。宿主对本地 vLLM 应填
+    /// Some("off")。后续 SendMessage 仍可按 op 覆盖。
+    pub reasoning_effort: Option<String>,
     /// Path to the notes file used by the notes tool.
     pub notes_path: PathBuf,
     /// Path to the MCP configuration file.
@@ -389,6 +402,8 @@ impl Default for EngineConfig {
             workspace: PathBuf::from("."),
             allow_shell: true,
             trust_mode: false,
+            tool_whitelist: None,
+            reasoning_effort: None,
             notes_path: PathBuf::from("notes.txt"),
             mcp_config_path: PathBuf::from("mcp.json"),
             skills_dir: crate::skills::default_skills_dir(),
@@ -496,7 +511,7 @@ pub struct EngineHandle {
     /// Send approval decisions to the engine
     tx_approval: mpsc::Sender<ApprovalDecision>,
     /// Send user input responses to the engine
-    tx_user_input: mpsc::Sender<UserInputDecision>,
+    tx_user_input: broadcast::Sender<UserInputDecision>,
     /// Send steer input for an in-flight turn.
     tx_steer: mpsc::Sender<String>,
     /// Shared pause flag set by the TUI and read by the turn loop.
@@ -521,7 +536,10 @@ pub struct Engine {
     api_provider: ApiProvider,
     rx_op: mpsc::Receiver<Op>,
     rx_approval: mpsc::Receiver<ApprovalDecision>,
-    rx_user_input: mpsc::Receiver<UserInputDecision>,
+    rx_user_input: broadcast::Receiver<UserInputDecision>,
+    /// [pinvou3-fork] Broadcast sender retained on the engine so spawned
+    /// sub-agents can subscribe to `request_user_input` replies by tool id.
+    tx_user_input: broadcast::Sender<UserInputDecision>,
     rx_steer: mpsc::Receiver<String>,
     tx_event: mpsc::Sender<Event>,
     /// Wakeup channel for the parent turn loop when a direct child sub-agent
@@ -675,7 +693,10 @@ impl Engine {
         let (tx_op, rx_op) = mpsc::channel(32);
         let (tx_event, rx_event) = mpsc::channel(256);
         let (tx_approval, rx_approval) = mpsc::channel(64);
-        let (tx_user_input, rx_user_input) = mpsc::channel(32);
+        // [pinvou3-fork] Broadcast lets the parent turn loop and any
+        // sub-agent that surfaced `request_user_input` wait on the same GUI
+        // response bus, filtering by `tool_call_id`.
+        let (tx_user_input, rx_user_input) = broadcast::channel(32);
         let (tx_steer, rx_steer) = mpsc::channel(64);
         let (tx_subagent_completion, rx_subagent_completion) = mpsc::unbounded_channel();
         let cancel_token = CancellationToken::new();
@@ -700,6 +721,9 @@ impl Engine {
             config.notes_path.clone(),
             config.mcp_config_path.clone(),
         );
+        // [pinvou3-fork] 无对话消息的会话(工作流宿主)也要有正确的思考开关,
+        // 不能依赖"碰巧先来过一条 SendMessage"。
+        session.reasoning_effort = config.reasoning_effort.clone();
         // Set up stable system prompt with project context (default to agent mode).
         // Per-turn working-set metadata is injected into the latest user
         // message at request time so file churn does not rewrite this prefix.
@@ -831,6 +855,7 @@ impl Engine {
             rx_op,
             rx_approval,
             rx_user_input,
+            tx_user_input: tx_user_input.clone(),
             rx_steer,
             tx_event,
             tx_subagent_completion,
@@ -1191,7 +1216,26 @@ impl Engine {
                         .send(Event::status(format!("Denied tool call: {id}")))
                         .await;
                 }
-                Op::SpawnSubAgent { prompt } => {
+                Op::SpawnSubAgent {
+                    prompt,
+                    role_id,
+                    allowed_tools,
+                    max_steps,
+                    output_schema,
+                    expects_file_output,
+                } => {
+                    // [pinvou3-fork] Custom sub-agents require a non-empty tool
+                    // whitelist (build_allowed_tools enforces this); fail fast
+                    // with a clear message rather than a generic spawn error.
+                    if allowed_tools.is_empty() {
+                        let _ = self
+                            .tx_event
+                            .send(Event::error(ErrorEnvelope::fatal(format!(
+                                "Cannot spawn role '{role_id}': empty allowed_tools whitelist"
+                            ))))
+                            .await;
+                        continue;
+                    }
                     let Some(client) = self.deepseek_client.clone() else {
                         let message = self
                             .deepseek_client_error
@@ -1213,6 +1257,36 @@ impl Engine {
                         None
                     };
 
+                    // [pinvou3-fork edict-obs] workflow SubAgent 也挂 mailbox：
+                    // TokenUsage / ToolCallStarted 等信封只走 mailbox 不走 event_tx
+                    // (subagent/mod.rs:4298 MailboxMessage::token_usage)，不挂 = 静默丢弃。
+                    // 泵写法同 turn-loop 路径(本文件 ~1706)。drainer 在所有 sender drop
+                    // 后自然退出，或 tx_event 关闭(引擎 teardown)时经 is_err() 退出。
+                    let mailbox_for_op = {
+                        let cancel_token = self.cancel_token.child_token();
+                        let (mailbox, mut receiver) = Mailbox::new(cancel_token);
+                        let tx_event_clone = self.tx_event.clone();
+                        spawn_supervised(
+                            "subagent-mailbox-drainer-op",
+                            std::panic::Location::caller(),
+                            async move {
+                                while let Some(envelope) = receiver.recv().await {
+                                    if tx_event_clone
+                                        .send(Event::SubAgentMailbox {
+                                            seq: envelope.seq,
+                                            message: envelope.message,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            },
+                        );
+                        mailbox
+                    };
+
                     let mut runtime = SubAgentRuntime::new(
                         client,
                         self.session.model.clone(),
@@ -1230,14 +1304,16 @@ impl Engine {
                     )
                     .with_max_spawn_depth(self.config.max_spawn_depth)
                     .with_step_api_timeout(self.config.subagent_api_timeout)
+                    .with_user_input_tx(self.tx_user_input.clone())
                     .with_speech_output_dir(self.config.speech_output_dir.clone())
                     .with_mcp_pool(mcp_pool)
+                    .with_mailbox(mailbox_for_op)
                     .background_runtime();
                     let route = resolve_subagent_assignment_route(
                         &runtime,
                         None,
                         &prompt,
-                        &SubAgentType::General,
+                        &SubAgentType::Custom,
                     )
                     .await;
                     runtime.model = route.model;
@@ -1246,12 +1322,33 @@ impl Engine {
 
                     let result = {
                         let mut manager = self.subagent_manager.write().await;
-                        manager.spawn_background(
+                        // [pinvou3-fork] Custom agent with the registry role's
+                        // tool whitelist + step budget. name=None on purpose: a
+                        // role gets re-dispatched on gate L1/L2 failure or user
+                        // rejection, and the manager rejects a duplicate
+                        // `session_name` (mod.rs ~1377), which would silently drop
+                        // the rerun. The forwarder correlates the result via
+                        // harness_phase (`executing:{role}`), not the session name.
+                        manager.spawn_background_with_assignment_options(
                             Arc::clone(&self.subagent_manager),
                             runtime,
-                            SubAgentType::General,
+                            SubAgentType::Custom,
                             prompt.clone(),
-                            None,
+                            // [pinvou3-fork] role=role_id(修 transcript role 显示 custom 的问题);
+                            // output_schema 透传以触发 submit_output 强制提交。
+                            SubAgentAssignment::new(prompt.clone(), Some(role_id.clone()))
+                                .with_output_schema(output_schema)
+                                .with_expects_file_output(expects_file_output),
+                            Some(allowed_tools),
+                            SubAgentSpawnOptions {
+                                name: None,
+                                model: None,
+                                nickname: None,
+                                fork_context: false,
+                                // [pinvou3-fork] registry 步数预算,曾被 `max_steps: _`
+                                // 静默丢弃 → 角色全按默认 200 步跑(menxia 实测 173 步永动)
+                                max_steps,
+                            },
                         )
                     };
 
@@ -1263,6 +1360,19 @@ impl Engine {
                                     "Spawned sub-agent {}",
                                     snapshot.agent_id
                                 )))
+                                .await;
+                            // [pinvou3-fork edict-obs] 复用 AgentSpawned 做 agent_id→role_id
+                            // 关联（prompt 字段装 role_id）。app 路径此事件原本无消费者；
+                            // pinvou3 forwarder 靠它把 TokenUsage(只带 agent_id)归属到角色。
+                            // 注意：spawn_background_with_assignment_options 内部已先
+                            // try_send 过一次 AgentSpawned(prompt=任务文本，subagent/mod.rs:1518)；
+                            // 本事件是同 channel 的第二发，FIFO 保证后到，消费方必须 last-write-wins。
+                            let _ = self
+                                .tx_event
+                                .send(Event::AgentSpawned {
+                                    id: snapshot.agent_id.clone(),
+                                    prompt: role_id.clone(),
+                                })
                                 .await;
                         }
                         Err(err) => {
@@ -2807,7 +2917,7 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
     let (tx_op, rx_op) = mpsc::channel(32);
     let (tx_event, rx_event) = mpsc::channel(256);
     let (tx_approval, rx_approval) = mpsc::channel(64);
-    let (tx_user_input, _rx_user_input) = mpsc::channel(32);
+    let (tx_user_input, _rx_user_input) = broadcast::channel(32);
     let (tx_steer, rx_steer) = mpsc::channel(64);
     let cancel_token = CancellationToken::new();
     let shared_cancel_token = Arc::new(StdMutex::new(cancel_token.clone()));
@@ -2883,6 +2993,7 @@ use self::dispatch::{
     final_tool_input, format_tool_error, mcp_tool_approval_description, mcp_tool_is_parallel_safe,
     mcp_tool_is_read_only, parse_parallel_tool_calls, parse_tool_input,
     plan_tool_execution_batches, should_force_update_plan_first, should_stop_after_plan_tool,
+    truncated_args_hint,
 };
 use self::loop_guard::{AttemptDecision, LoopGuard, OutcomeDecision};
 #[cfg(test)]
@@ -2898,14 +3009,14 @@ use self::streaming::{
 use self::tool_catalog::{
     CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME,
     REQUEST_USER_INPUT_NAME, active_tools_for_step, apply_provider_tool_policy,
-    build_model_tool_catalog, ensure_advanced_tooling, execute_code_execution_tool,
+    apply_tool_whitelist, build_model_tool_catalog, ensure_advanced_tooling, execute_code_execution_tool,
     execute_tool_search, initial_active_tools, is_tool_search_tool,
     maybe_hydrate_requested_deferred_tool, missing_tool_error_message,
 };
 #[cfg(test)]
 use self::tool_catalog::{
     TOOL_SEARCH_BM25_NAME, TOOL_SEARCH_REGEX_NAME, maybe_activate_requested_deferred_tool,
-    preflight_requested_deferred_tool, should_default_defer_tool,
+    pinvou3_should_defer_native_tool, preflight_requested_deferred_tool, should_default_defer_tool,
 };
 use self::tool_execution::emit_tool_audit;
 use self::tool_setup::sandbox_policy_for_mode;
