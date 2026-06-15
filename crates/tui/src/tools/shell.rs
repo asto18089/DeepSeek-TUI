@@ -2175,8 +2175,7 @@ impl ToolSpec for ExecShellTool {
 
         // Safety analysis: Dangerous commands are BLOCKED in ALL modes (including YOLO).
         // Rationale: YOLO 模式只是免 approval 弹窗,不该等于"允许破坏性命令"。
-        // pinvou v1 careful hook: 破坏性命令拦截是确定性规则,与工作流模式正交,默认始终生效。
-        // 改动来源: docs/Pinvou-嘴替设计.md §4.1
+        // careful hook: 破坏性命令拦截是确定性规则,与工作流模式正交,默认始终生效。
         let safety = analyze_command(command);
         if matches!(safety.level, SafetyLevel::Dangerous) {
             let reasons = safety.reasons.join("; ");

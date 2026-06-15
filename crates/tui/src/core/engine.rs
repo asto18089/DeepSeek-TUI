@@ -255,13 +255,18 @@ pub struct EngineConfig {
     /// [pinvou3-fork] Hard tool whitelist for this engine. When `Some`, the
     /// model-visible catalog is filtered down to exactly these tool names — a
     /// true allowlist, not a `defer_loading` soft-hide: non-whitelisted tools
-    /// are removed entirely so `tool_search` cannot re-activate them. Used to
-    /// structurally constrain the workflow-session supervisor (品悟) to
-    /// read + review tools only.
+    /// are removed entirely so `tool_search` cannot re-activate them.
+    ///
+    /// 两层工具门控模型(与 C2 blocklist 互补,**不冲突**):
+    ///  - blocklist(全局):build_model_tool_catalog 时减掉黑名单 → 所有会话基线 ~23 工具。
+    ///  - tool_whitelist(per-session):turn_loop 最后 `apply_tool_whitelist` 只 retain 白名单,
+    ///    仅 workflow/skill 宿主会话设置(限其为只读+编排工具,见 supervisor_tool_whitelist)。
+    /// whitelist 在 blocklist 已过滤的集合上 retain,数学上无法重新暴露被 blocklist 的工具。
+    /// None = 普通会话不额外限制(只受全局 blocklist)。
     pub tool_whitelist: Option<std::collections::HashSet<String>>,
     /// [pinvou3-fork] 会话初始 reasoning_effort。session 原本只在第一条
-    /// SendMessage 时才获得该值;纯 SpawnSubAgent 驱动的会话(工作流宿主,
-    /// 取消对话型品悟后无任何 SendMessage)会一直停留在 None →
+    /// SendMessage 时才获得该值;纯 SpawnSubAgent 驱动的会话(工作流宿主
+    /// 无任何 SendMessage)会一直停留在 None →
     /// 对 vLLM/Qwen3.6 即回落到默认 thinking 全开。宿主对本地 vLLM 应填
     /// Some("off")。后续 SendMessage 仍可按 op 覆盖。
     pub reasoning_effort: Option<String>,
