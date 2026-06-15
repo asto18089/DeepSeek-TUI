@@ -930,6 +930,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork patch #41: workspace skill dirs no longer scanned"]
     fn test_list_skills_merges_workspace_and_configured_dirs() {
         let tmpdir = TempDir::new().unwrap();
         let _home = IsolatedHome::new(&tmpdir);
