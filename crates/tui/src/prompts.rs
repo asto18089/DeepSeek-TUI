@@ -171,20 +171,21 @@ for the current turn."
 /// places) and `codewhale_version`(原 deepseek_version,env!("CARGO_PKG_VERSION")
 /// 返回 codewhale-tui crate 版本而非 pinvou3-app 版本 —— 对模型既confusing又unused)。
 /// `locale_tag` 参数保留作 API 兼容,改名 `_locale_tag` 消 unused 警告。
-fn render_environment_block(workspace: &Path, _locale_tag: &str) -> String {
+fn render_environment_block(_workspace: &Path, _locale_tag: &str) -> String {
     let platform = std::env::consts::OS;
     let shell = crate::shell_dispatcher::global_dispatcher()
         .kind()
         .binary()
         .to_string();
-    let pwd = workspace.display();
 
+    // [pinvou3 fork] pwd 移出静态 system → 改走 per-turn <turn_meta> 的 Current workspace。
+    // 每 session 变的 workspace 路径若进 cached system prefix, vLLM prefix-cache MISS 时
+    // 工具调用会退化成裸文本(实测 single subagent 25%→~100%)。platform/shell 启动内静态,保留。
     format!(
         "## Environment\n\
          \n\
          - platform: {platform}\n\
-         - shell: {shell}\n\
-         - pwd: {pwd}"
+         - shell: {shell}"
     )
 }
 
@@ -1947,7 +1948,9 @@ mod tests {
         let block = render_environment_block(tmp.path(), "zh-Hans");
         assert!(block.starts_with("## Environment"));
         // [pinvou3-fork] lang / codewhale_version 已从 env block 砍掉,不断言。
-        assert!(block.contains(&format!("- pwd: {}", tmp.path().display())));
+        // [pinvou3-fork] pwd 已移出静态 system → per-turn <turn_meta> 的 Current workspace,
+        // 以保持 system prefix 跨 session 字节静态、命中 vLLM prefix-cache(否则工具调用退化)。
+        assert!(!block.contains("- pwd:"), "pwd 应已移出 ## Environment(改走 turn_meta)");
         assert!(block.contains("- platform:"));
         assert!(block.contains("- shell:"));
         // pinvou3 fork (P2-2): `lang` + `codewhale_version` dropped —
@@ -1961,6 +1964,21 @@ mod tests {
         assert!(
             !block.contains("codewhale_version"),
             "pinvou3 fork drops `codewhale_version` — wrong layer's version, confusing"
+        );
+    }
+
+    /// [pinvou3 fork] 守护"pwd 已移出 ## Environment → per-turn `<turn_meta>`"。
+    /// 每 session 变的 workspace 路径若留在静态 system prefix,会让 vLLM prefix-cache
+    /// 在 workspace 处部分命中,叠加投机解码(mtp)→ 工具调用退化成裸文本(实测 25%)。
+    /// sync 时上游若把 pwd 加回 render_environment_block,本测失败。
+    #[test]
+    fn forkguard_environment_block_omits_volatile_pwd() {
+        let tmp = tempdir().expect("tempdir");
+        let block = render_environment_block(tmp.path(), "zh-Hans");
+        assert!(
+            !block.contains("- pwd:"),
+            "[pinvou3 fork] pwd 必须移出静态 ## Environment(改走 per-turn turn_meta),\
+             否则每 session 变的 workspace 破坏 vLLM prefix-cache(部分命中×投机解码→工具调用退化)"
         );
     }
 

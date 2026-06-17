@@ -1604,6 +1604,9 @@ impl Engine {
 
         let mut lines = vec![
             format!("Current local date: {today}"),
+            // [pinvou3 fork] workspace 路径从静态 system(## Environment.pwd)挪到这里,
+            // 让 system prefix 跨 session 字节静态以命中 vLLM prefix-cache(避免工具调用退化)。
+            format!("Current workspace: {}", self.config.workspace.display()),
             format!("Current model: {routed_model}"),
         ];
         if auto_model {
