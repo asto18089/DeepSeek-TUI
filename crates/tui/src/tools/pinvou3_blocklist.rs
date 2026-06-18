@@ -24,13 +24,13 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     "pr_attempt_list",
     "pr_attempt_read",
     "pr_attempt_preflight",
-    // 状态管理 - subagent（留给后续 workflow 阶段，模型不应直接调）
-    "agent_open",
-    "agent_spawn", // agent_open 的新版本（fork_context=true 路径）
-    "agent_eval",
+    // 状态管理 - subagent:放出 agent_open→agent_eval→agent_close 一条干净生命周期供模型
+    // 直接派/收/关子 agent;spawn 单一走 agent_open,故隐藏实验性 tool_agent;其余仍隐藏。
+    // (首轮工具调用漂移已由 session 启动 cache warmup 根治,与放通 subagent 无关。)
+    "tool_agent",
+    "agent_spawn", // agent_open 的新版本（fork_context=true 路径，与 agent_open 重复）
     "agent_result",
     "agent_cancel",
-    "agent_close",
     "agent_list",
     "resume_agent",
     "delegate_to_agent",
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn hides_known_state_management_tools() {
         assert!(is_pinvou3_hidden("task_create"));
-        assert!(is_pinvou3_hidden("agent_open"));
+        assert!(is_pinvou3_hidden("tool_agent")); // spawn 单一走 agent_open,tool_agent 隐藏
         assert!(is_pinvou3_hidden("rlm_eval"));
         assert!(is_pinvou3_hidden("pr_attempt_record"));
     }
@@ -160,6 +160,14 @@ mod tests {
         assert!(!is_pinvou3_hidden("update_plan"));
         // 视觉:Qwen3.6 有视觉能力,image_analyze 已放出供 LLM 读用户附图
         assert!(!is_pinvou3_hidden("image_analyze"));
+        // subagent 干净生命周期可见:agent_open(spawn) → agent_eval(收) → agent_close(关)
+        assert!(!is_pinvou3_hidden("agent_open"));
+        assert!(!is_pinvou3_hidden("agent_eval"));
+        assert!(!is_pinvou3_hidden("agent_close"));
+        // spawn 单一走 agent_open:实验性 tool_agent + id-API 重复链路仍隐藏
+        // (用 delegate_to_agent 而非 agent_spawn 当代表,避开 env_override 测试的全局 env 竞争)
+        assert!(is_pinvou3_hidden("tool_agent"));
+        assert!(is_pinvou3_hidden("delegate_to_agent"));
     }
 
     #[test]
@@ -178,17 +186,19 @@ mod tests {
         // 且测试函数末尾 remove_var 复原。2024 edition std::env::set_var
         // 标 unsafe 因多线程 race,本场景不 race。
         unsafe {
-            // baseline: agent_spawn 在 blocklist 里
+            // baseline: agent_spawn / agent_result 在 blocklist 里
+            // (agent_eval/open/close 已放出,不再适合做 override 例子)
             std::env::remove_var("PINVOU3_BLOCKLIST_OVERRIDE");
             assert!(is_pinvou3_hidden("agent_spawn"));
+            assert!(is_pinvou3_hidden("agent_result"));
 
-            // 设 env 解锁 agent_spawn + agent_eval
-            std::env::set_var("PINVOU3_BLOCKLIST_OVERRIDE", "agent_spawn, agent_eval");
+            // 设 env 解锁 agent_spawn + agent_result
+            std::env::set_var("PINVOU3_BLOCKLIST_OVERRIDE", "agent_spawn, agent_result");
             assert!(
                 !is_pinvou3_hidden("agent_spawn"),
                 "agent_spawn 应被 env 豁免"
             );
-            assert!(!is_pinvou3_hidden("agent_eval"), "agent_eval 应被 env 豁免");
+            assert!(!is_pinvou3_hidden("agent_result"), "agent_result 应被 env 豁免");
             // 未列出的工具仍隐藏
             assert!(
                 is_pinvou3_hidden("task_create"),
