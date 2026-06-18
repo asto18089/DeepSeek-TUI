@@ -637,6 +637,7 @@ impl HookExecutor {
         {
             use std::os::windows::process::CommandExt as _;
             let mut cmd = Command::new("cmd");
+            crate::utils::suppress_console_window(&mut cmd);
             // raw_arg: cmd.exe does not parse the CRT-style \" escapes that
             // Command::arg would insert, so pass the command line verbatim.
             cmd.arg("/C").raw_arg(command);

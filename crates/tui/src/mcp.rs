@@ -1503,6 +1503,7 @@ impl McpConnection {
             }
         } else if let Some(command) = &config.command {
             let mut cmd = tokio::process::Command::new(command);
+            crate::utils::suppress_tokio_console_window(&mut cmd);
             cmd.args(&config.args)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())

@@ -1153,6 +1153,7 @@ impl ShellManager {
         let args = exec_env.args();
 
         let mut cmd = Command::new(program);
+        crate::utils::suppress_console_window(&mut cmd);
         push_shell_args(&mut cmd, program, args);
         cmd.current_dir(working_dir)
             .stdout(Stdio::piped())
@@ -1311,6 +1312,7 @@ impl ShellManager {
         let args = exec_env.args();
 
         let mut cmd = Command::new(program);
+        crate::utils::suppress_console_window(&mut cmd);
         push_shell_args(&mut cmd, program, args);
         cmd.current_dir(working_dir)
             .stdin(Stdio::inherit())
@@ -1495,6 +1497,7 @@ impl ShellManager {
             }
         } else {
             let mut cmd = Command::new(program);
+            crate::utils::suppress_console_window(&mut cmd);
             push_shell_args(&mut cmd, program, args);
             cmd.current_dir(working_dir)
                 .stdin(Stdio::piped())

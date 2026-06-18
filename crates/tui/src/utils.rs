@@ -34,6 +34,26 @@ pub fn redacted_identifier_for_log(identifier: &str) -> String {
     format!("<redacted:{hash:016x}>")
 }
 
+#[cfg(windows)]
+pub(crate) fn suppress_console_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+pub(crate) fn suppress_console_window(_cmd: &mut Command) {}
+
+#[cfg(windows)]
+pub(crate) fn suppress_tokio_console_window(cmd: &mut tokio::process::Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+pub(crate) fn suppress_tokio_console_window(_cmd: &mut tokio::process::Command) {}
+
 // === Project Mapping Helpers ===
 
 /// Identify if a file is a "key" file for project identification.
