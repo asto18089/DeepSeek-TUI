@@ -108,6 +108,12 @@ pub enum Op {
     /// Update the SSE idle timeout used for subsequent streamed turns.
     SetStreamChunkTimeout { timeout_secs: u64 },
 
+    /// pinvou3: session-scoped disabled tools (model-facing full names, lowercase).
+    /// Empty = none disabled. Host pushes this when the user toggles a connector;
+    /// the engine writes it into `config.disallowed_tools`, so the next turn's
+    /// `filter_tool_catalog_for_gates` hides those tools from the model.
+    SetDisallowedTools { tools: Vec<String> },
+
     /// Sync engine session state (used for resume/load)
     SyncSession {
         session_id: Option<String>,

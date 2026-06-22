@@ -1443,6 +1443,11 @@ impl Engine {
                         )))
                         .await;
                 }
+                Op::SetDisallowedTools { tools } => {
+                    // pinvou3 会话级工具开关:写入 config.disallowed_tools,下一轮
+                    // filter_tool_catalog_for_gates 即把这些工具对模型隐藏。空 = 不禁用。
+                    self.config.disallowed_tools = if tools.is_empty() { None } else { Some(tools) };
+                }
                 Op::SyncSession {
                     session_id,
                     messages,
