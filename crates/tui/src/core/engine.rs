@@ -241,6 +241,21 @@ fn append_plan_list(out: &mut String, label: &str, values: &[String]) {
 
 // === Types ===
 
+/// [pinvou3-fork] Application-layer custom tools injected into every turn's tool
+/// registry. Lets an embedding application (e.g. pinvou3-app) register its own
+/// `ToolSpec` (such as a knowledge-base search tool) without forking the tool
+/// catalog — entries are appended after built-ins in
+/// `build_turn_tool_registry_builder`. Newtype because `Arc<dyn ToolSpec>` is not
+/// `Debug`; the manual impl renders tool names only so `EngineConfig: Debug` holds.
+#[derive(Clone, Default)]
+pub struct ExtraTools(pub Vec<std::sync::Arc<dyn crate::tools::spec::ToolSpec>>);
+
+impl std::fmt::Debug for ExtraTools {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.iter().map(|t| t.name())).finish()
+    }
+}
+
 /// Configuration for the engine
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -398,6 +413,9 @@ pub struct EngineConfig {
     /// Applied to the per-turn tool registry after built-in tools are registered.
     /// When `None`, no overrides or plugin loading occurs.
     pub tools: Option<crate::config::ToolsConfig>,
+    /// [pinvou3-fork] Application-injected custom tools, appended to every turn's
+    /// registry after built-ins. Empty by default. See [`ExtraTools`].
+    pub extra_tools: ExtraTools,
 }
 
 impl Default for EngineConfig {
@@ -462,6 +480,7 @@ impl Default for EngineConfig {
             prefer_bwrap: false,
             verbosity: None,
             tools: None,
+            extra_tools: ExtraTools::default(),
         }
     }
 }

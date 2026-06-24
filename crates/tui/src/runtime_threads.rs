@@ -2164,6 +2164,7 @@ impl RuntimeThreadManager {
             tools_always_load: self.config.tools_always_load(),
             tools: self.config.tools.clone(),
             verbosity: self.config.verbosity.clone(),
+            extra_tools: Default::default(), // [pinvou3-fork] no app tools in TUI path
         };
 
         let engine = spawn_engine(engine_cfg, &self.config);
