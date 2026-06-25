@@ -461,23 +461,30 @@ pub fn skills_directories(workspace: &Path) -> Vec<PathBuf> {
 }
 
 fn skills_directories_with_home(_workspace: &Path, home_dir: Option<&Path>) -> Vec<PathBuf> {
-    // pinvou3 fork (patch #41): 砍掉底座的 10 路径扫描清单(`.agents/skills`,
-    // `.opencode/skills`, `.claude/skills`, `.cursor/skills`, `.codewhale/skills`
-    // 等工具约定 + workspace + home 重叠版本),只保留:
+    // pinvou3 fork (patch #41): 砍掉底座的 10 路径扫描清单(`.opencode/skills`,
+    // `.claude/skills`, `.cursor/skills`, `.codewhale/skills` 等工具约定 +
+    // workspace 重叠版本),只保留两个全局 skill 区:
     //
-    //   1. `~/.agents/skills`        — 唯一全局共享约定(用户多 AI 工具共用)
-    //   2. `EngineConfig.skills_dir` — pinvou3 通过 fork patch #25/#26 注入,
-    //                                  union 在调用方 `discover_for_workspace_and_dir`
-    //                                  里追加,**不在本函数返回**
+    //   1. `~/.pinvou3/bundle/skills/` — pinvou3 私有区(技能市场装的技能 + bundle
+    //      内置)。它就是 `EngineConfig.skills_dir`(fork patch #25/#26 注入的值)。
+    //   2. `~/.agents/skills/`         — 全局共享约定, 飞书(lark)等技能装在这。
     //
-    // 为什么砍:pinvou3 是 GUI 单一 embedder,workspace=$HOME → 原 10 路径全部
-    // 重叠 / 冗余 / 噪音;`.opencode` / `.cursor` / `.codewhale` 等命名约定对
-    // pinvou3 用户无意义。简化扫描 = prompt 短 + 行为可预期。
+    // 为什么 bundle/skills **必须**在本函数返回(随技能市场上线加,2026-06-22):
+    //   `discover_in_workspace`(`load_skill` 工具用)只走本函数、**不** union
+    //   `EngineConfig.skills_dir`。若本函数不含 bundle/skills, 就会出现"prompt
+    //   catalogue 列了 bundle/skills 的技能(走 `_and_dir` 带了 skills_dir)、但
+    //   load_skill 扫不到 → 报 skill not found"(技能市场真机实测到, 模型只好绕
+    //   find/read_file)。把 bundle/skills 放进本函数, 两条发现路径对齐, load_skill
+    //   一步加载。`~/.agents/skills` 同时保留, 否则飞书技能从 prompt 消失。
+    //
+    // 为什么砍其余路径:pinvou3 是 GUI 单一 embedder,workspace=$HOME → 原工具约定
+    // 路径重叠/冗余/噪音;`.opencode`/`.cursor`/`.codewhale` 对 pinvou3 用户无意义。
     //
     // 不通用,**纯 pinvou3 fork** 决策,不适合上游 PR。
     let _ = _workspace;
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(home) = home_dir {
+        candidates.push(home.join(".pinvou3").join("bundle").join("skills"));
         candidates.push(home.join(".agents").join("skills"));
     }
     existing_skill_dirs(candidates)
@@ -1662,13 +1669,14 @@ mod tests {
         );
     }
 
-    /// pinvou3 fork-guard (patches #25/#26 + #41): the only skill sources
-    /// pinvou3 scans are `~/.agents/skills` (single global convention) and
-    /// `EngineConfig.skills_dir` (the pinvou3 bundle path). Workspace
-    /// search and other tool-convention dirs (`.opencode` / `.cursor` /
-    /// `.claude` / `.codewhale` / `.deepseek`) were removed in #41.
-    /// Regression: any of those reappear, or `skills_dir` gets short-
-    /// circuited again.
+    /// pinvou3 fork-guard (patches #25/#26 + #41 + 技能市场目录, 2026-06-22):
+    /// pinvou3 scans exactly two home-rooted skill roots — `~/.pinvou3/bundle/
+    /// skills` (private: marketplace + bundle, also what `load_skill`'s
+    /// `discover_in_workspace` walks) and `~/.agents/skills` (global, e.g. lark
+    /// skills) — plus `EngineConfig.skills_dir` unioned in by the prompt builder.
+    /// Other tool-convention dirs (`.opencode` / `.cursor` / `.claude` /
+    /// `.codewhale` / `.deepseek`) are NOT scanned. Regression: either home root
+    /// drops, a dropped dir reappears, or `skills_dir` gets short-circuited.
     #[test]
     fn forkguard_skills_dir_unions_with_home_rooted_workspace_skills() {
         let tmpdir = TempDir::new().unwrap();
@@ -1679,15 +1687,27 @@ mod tests {
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::create_dir_all(&fake_home).unwrap();
 
-        // home-rooted skill (the single global path pinvou3 keeps after #41).
-        std::fs::create_dir_all(fake_home.join(".agents/skills/from-home")).unwrap();
+        // pinvou3 private skill area (`~/.pinvou3/bundle/skills`): load_skill's
+        // discover_in_workspace walks this, aligning it with the prompt
+        // catalogue (the point of the marketplace move).
+        std::fs::create_dir_all(fake_home.join(".pinvou3/bundle/skills/from-bundle-skills"))
+            .unwrap();
         std::fs::write(
-            fake_home.join(".agents/skills/from-home/SKILL.md"),
-            "---\nname: from-home\ndescription: home-rooted skill\n---\nbody",
+            fake_home.join(".pinvou3/bundle/skills/from-bundle-skills/SKILL.md"),
+            "---\nname: from-bundle-skills\ndescription: pinvou3 private skill area\n---\nbody",
         )
         .unwrap();
 
-        // A different tool-convention dir that pinvou3 fork #41 explicitly drops.
+        // global shared convention (`~/.agents/skills`): lark/feishu skills live
+        // here and MUST stay visible.
+        std::fs::create_dir_all(fake_home.join(".agents/skills/from-agents")).unwrap();
+        std::fs::write(
+            fake_home.join(".agents/skills/from-agents/SKILL.md"),
+            "---\nname: from-agents\ndescription: global agents skill (e.g. lark)\n---\nbody",
+        )
+        .unwrap();
+
+        // A tool-convention dir pinvou3 fork #41 drops — must NOT be scanned.
         std::fs::create_dir_all(fake_home.join(".deepseek/skills/should-be-ignored")).unwrap();
         std::fs::write(
             fake_home.join(".deepseek/skills/should-be-ignored/SKILL.md"),
@@ -1707,8 +1727,12 @@ mod tests {
             super::discover_for_workspace_and_dir_with_home(&workspace, &bundle, Some(&fake_home));
         let names: Vec<&str> = registry.list().iter().map(|s| s.name.as_str()).collect();
         assert!(
-            names.contains(&"from-home"),
-            "~/.agents/skills must remain visible. Got: {names:?}"
+            names.contains(&"from-bundle-skills"),
+            "~/.pinvou3/bundle/skills must be scanned (load_skill alignment). Got: {names:?}"
+        );
+        assert!(
+            names.contains(&"from-agents"),
+            "~/.agents/skills must remain visible (lark/global skills). Got: {names:?}"
         );
         assert!(
             names.contains(&"from-bundle"),
