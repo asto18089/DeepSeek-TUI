@@ -959,6 +959,7 @@ fn new_caches_workspace_skills_for_slash_menu() {
 }
 
 #[test]
+#[ignore = "pinvou3-fork #41: skills 扫描收窄为只 ~/.agents/skills,workspace/cross-tool 目录不扫描"]
 fn cached_skills_merges_across_candidate_directories() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let workspace = tmp.path().join("workspace");
@@ -1109,6 +1110,7 @@ fn cached_skills_include_configured_directory() {
 }
 
 #[test]
+#[ignore = "pinvou3-fork #41: skills 扫描收窄为只 ~/.agents/skills,workspace/cross-tool 目录不扫描"]
 fn cached_skills_preserve_configured_directory_in_codewhale_only_scan() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let workspace = tmp.path().join("workspace");

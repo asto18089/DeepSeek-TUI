@@ -1299,6 +1299,12 @@ fn fleet_worker_json_includes_runtime_state_projection() {
     assert_eq!(worker["runtime_state"]["has_session"], true);
 }
 
+// [pinvou3-fork 决策③] 上游 worker-receipts/token-budget 遥测(AgentRunUsage 的
+// token_budget/budget_scope/budget_remaining、AgentRunRecommendedAction、
+// AgentWorkerRecord.recommended_action)是 v0.8.61+ 的 scope-gate 资源机制;fork 基底
+// 用步数上限,不实现这套遥测。该测试构造上游不存在于 fork 的字段/类型,故用
+// `#[cfg(any())]`(永假)把整个测试排除出编译——保留源码,待(若)港 token-budget 全套后启用。
+#[cfg(any())]
 #[tokio::test]
 async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()> {
     use crate::tools::subagent::{
@@ -3674,6 +3680,7 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
 /// `/etc` (or any other path) into the skills loader.
 #[cfg(unix)]
 #[test]
+#[ignore = "pinvou3-fork #41: skills 扫描收窄为只 ~/.agents/skills,workspace/cross-tool 目录不扫描"]
 fn resolve_skills_dir_rejects_symlink_escaping_workspace() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let workspace_root = tmp.path().join("workspace");
