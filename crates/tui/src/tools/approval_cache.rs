@@ -140,7 +140,7 @@ impl ApprovalCache {
 #[must_use]
 pub fn build_approval_key(tool_name: &str, input: &serde_json::Value) -> ApprovalKey {
     let fingerprint = match tool_name {
-        "apply_patch" | "write_file" | "edit_file" | "fim_edit" => {
+        "apply_patch" | "write_file" | "append_file" | "edit_file" | "fim_edit" => {
             format!("file:{tool_name}:{}", hash_json_value(input))
         }
         "exec_shell"
