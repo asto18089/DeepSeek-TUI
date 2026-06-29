@@ -17,6 +17,7 @@ use serde_json::Value;
 use crate::client::DeepSeekClient;
 use crate::models::Tool;
 
+use super::pinvou3_blocklist;
 use super::schema_canonicalize;
 use super::schema_sanitize;
 use super::spec::{
@@ -235,7 +236,9 @@ impl ToolRegistry {
                     description: tool.description().to_string(),
                     input_schema: schema,
                     allowed_callers: Some(vec!["direct".to_string()]),
-                    defer_loading: Some(tool.defer_loading()),
+                    defer_loading: Some(
+                        tool.defer_loading() || pinvou3_blocklist::is_pinvou3_hidden(tool.name()),
+                    ),
                     input_examples: None,
                     strict: None,
                     cache_control: None,
@@ -510,12 +513,13 @@ impl ToolRegistryBuilder {
         self
     }
 
-    /// Include file tools (read, write, edit, list).
+    /// Include file tools (read, write, append, edit, list).
     #[must_use]
     pub fn with_file_tools(self) -> Self {
-        use super::file::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
+        use super::file::{AppendFileTool, EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
         self.with_tool(Arc::new(ReadFileTool))
             .with_tool(Arc::new(WriteFileTool))
+            .with_tool(Arc::new(AppendFileTool))
             .with_tool(Arc::new(EditFileTool))
             .with_tool(Arc::new(ListDirTool))
     }
@@ -1022,6 +1026,9 @@ impl ToolRegistryBuilder {
             .with_review_tool(client.clone(), model.clone())
             .with_rlm_tool(client, model)
             .with_speech_tools(speech_client, speech_output_dir)
+            // [pinvou3-fork] Sub-agents inherit web_search/fetch_url/web.run;
+            // workflow PM/research roles rely on this surface.
+            .with_web_tools()
             .with_subagent_tools(manager, runtime)
     }
 
@@ -1056,15 +1063,29 @@ impl ToolRegistryBuilder {
     }
 
     /// Include sub-agent management tools.
+    ///
+    /// [pinvou3-fork] Keeps the conversation-level multi-tool surface
+    /// (`agent_open`/`agent_eval`/`tool_agent`/`agent_close`) rather than
+    /// upstream v0.8.65's single `agent` tool — the fork harness + Qwen3.6
+    /// usability depend on these discrete tools.
     #[must_use]
     pub fn with_subagent_tools(
         self,
         manager: super::subagent::SharedSubAgentManager,
         runtime: super::subagent::SubAgentRuntime,
     ) -> Self {
-        use super::subagent::AgentTool;
+        use super::subagent::{AgentCloseTool, AgentEvalTool, AgentOpenTool, ToolAgentTool};
 
-        self.with_tool(Arc::new(AgentTool::new(manager, runtime)))
+        self.with_tool(Arc::new(AgentOpenTool::new(
+            manager.clone(),
+            runtime.clone(),
+        )))
+        .with_tool(Arc::new(AgentEvalTool::new(manager.clone())))
+        .with_tool(Arc::new(ToolAgentTool::new(
+            manager.clone(),
+            runtime.clone(),
+        )))
+        .with_tool(Arc::new(AgentCloseTool::new(manager)))
     }
 
     /// Build the registry with the given context.
