@@ -88,6 +88,14 @@ impl ToolSpec for LoadSkillTool {
             ));
         }
 
+        // [pinvou3-fork] 技能市场开关:被禁用技能已从 catalogue 隐藏,模型本不该点名;
+        // 但若点了(陈旧/幻觉名),按不可用处理,绝不端出已关技能的正文。
+        if crate::skills::is_skill_disabled(name) {
+            return Err(ToolError::execution_failed(format!(
+                "skill `{name}` is disabled"
+            )));
+        }
+
         // #432: walk every candidate skill directory (workspace
         // .agents/skills, skills, .opencode/skills, .claude/skills,
         // .cursor/skills, ~/.agents/skills, global default), merging with

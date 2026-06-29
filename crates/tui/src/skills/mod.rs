@@ -493,26 +493,26 @@ fn skills_directories_with_home_and_mode(
     home_dir: Option<&Path>,
     mode: SkillDiscoveryMode,
 ) -> Vec<PathBuf> {
-    // pinvou3 fork (patch #41): 砍掉底座的 10 路径扫描清单(`.agents/skills`,
-    // `.opencode/skills`, `.claude/skills`, `.cursor/skills`, `.codewhale/skills`
-    // 等工具约定 + workspace + home 重叠版本),只保留:
+    // pinvou3 fork (patch #41 + 技能市场 2026-06-25/29): 砍掉底座的 10 路径扫描清单
+    // (`.agents/skills`, `.opencode/skills`, `.claude/skills`, `.cursor/skills`,
+    // `.codewhale/skills` 等工具约定 + workspace + home 重叠版本),**只保留**:
     //
-    //   1. `~/.agents/skills`        — 唯一全局共享约定(用户多 AI 工具共用)
-    //   2. `EngineConfig.skills_dir` — pinvou3 通过 fork patch #25/#26 注入,
-    //                                  union 在调用方 `discover_for_workspace_and_dir`
-    //                                  里追加,**不在本函数返回**
+    //   1. `~/.pinvou3/bundle/skills/` — pinvou3 私有区(技能市场装的技能 + bundle
+    //      内置)。它就是 `EngineConfig.skills_dir`(fork patch #25/#26 注入的值)。
+    //   2. `EngineConfig.skills_dir` — union 在调用方 `_and_dir` 追加(不在本函数返回)
     //
-    // 为什么砍:pinvou3 是 GUI 单一 embedder,workspace=$HOME → 原 10 路径全部
-    // 重叠 / 冗余 / 噪音;`.opencode` / `.cursor` / `.codewhale` 等命名约定对
-    // pinvou3 用户无意义。简化扫描 = prompt 短 + 行为可预期。
+    // ⚠️ 为什么 bundle/skills **必须**在本函数返回:`discover_in_workspace`(`load_skill`
+    //   工具用)只走本函数、**不** union `skills_dir`。不含 bundle/skills 就会出现
+    //   "catalogue 列了、load_skill 报 not found"(技能市场真机实测)。两条发现路径对齐。
     //
-    // 上游 v0.8.65 的 SkillDiscoveryMode(Compatible/CodeWhaleOnly)签名保留作 API
-    // 兼容,但收窄后两 mode 行为一致(均只返回 ~/.agents/skills)。不通用,**纯
-    // pinvou3 fork** 决策,不适合上游 PR。
+    // 2026-06-29:`~/.agents/skills` 也砍掉(用户决策)——pinvou3 技能统一走技能市场
+    // 落 bundle/skills,不再扫全局 .agents/skills。上游 v0.8.65 的 SkillDiscoveryMode
+    // (Compatible/CodeWhaleOnly)签名保留作 API 兼容,收窄后两 mode 行为一致。
+    // 纯 pinvou3 fork 决策,不适合上游 PR。
     let _ = mode;
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(home) = home_dir {
-        candidates.push(home.join(".agents").join("skills"));
+        candidates.push(home.join(".pinvou3").join("bundle").join("skills"));
     }
     existing_skill_dirs(candidates)
 }
@@ -730,6 +730,31 @@ pub fn render_available_skills_context_for_workspace_and_dir_with_mode(
     render_skills_block(&registry)
 }
 
+// [pinvou3-fork] 技能市场开关。技能只经 `## Skills` catalogue(render_skills_block)
+// 和 `load_skill` 工具触达模型——两者都查本进程级 disabled 集合,故被关掉的技能从
+// catalogue 消失、也 load 不到。全局(非 per-session)对齐连接器 chip 的"全局持久"语义:
+// 一次 toggle 全 session/窗口继承。bridge 从 `~/.pinvou3/disabled_skills.json` 启动 +
+// 每次 toggle 重设;重设改下一次 prompt 字节 → 一次 prefix-cache miss 后又稳定,与
+// `disabled_connectors`/`disallowed_tools` 同理。不上游(依赖 pinvou3 市场 + bundle/skills)。
+static DISABLED_SKILLS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// [pinvou3-fork] 替换被禁用技能名集合(SKILL.md frontmatter `name`,= 磁盘目录名)。
+/// app/bridge 调用;空列表 = 全部已装技能启用。
+pub fn set_disabled_skills(names: Vec<String>) {
+    if let Ok(mut guard) = DISABLED_SKILLS.write() {
+        *guard = names;
+    }
+}
+
+/// [pinvou3-fork] `name` 当前是否在技能市场被关掉。
+#[must_use]
+pub fn is_skill_disabled(name: &str) -> bool {
+    DISABLED_SKILLS
+        .read()
+        .map(|guard| guard.iter().any(|n| n == name))
+        .unwrap_or(false)
+}
+
 fn render_skills_block(registry: &SkillRegistry) -> Option<String> {
     if registry.is_empty() {
         return None;
@@ -747,6 +772,11 @@ instructions when using a specific skill.\n\n",
 
     let mut omitted = 0usize;
     for skill in registry.list() {
+        // [pinvou3-fork] 技能市场开关:跳过用户关掉的技能,使其从 prompt catalogue
+        // 消失(见 `DISABLED_SKILLS`)。
+        if is_skill_disabled(&skill.name) {
+            continue;
+        }
         // Use the real on-disk path captured at discovery — the directory
         // name can differ from the frontmatter `name` for community
         // installs, in which case `<dir>/<name>/SKILL.md` would not exist
@@ -1783,11 +1813,20 @@ mod tests {
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::create_dir_all(&fake_home).unwrap();
 
-        // home-rooted skill (the single global path pinvou3 keeps after #41).
-        std::fs::create_dir_all(fake_home.join(".agents/skills/from-home")).unwrap();
+        // home-rooted skill — the single home path pinvou3 keeps after #41
+        // (2026-06-29 决策:`~/.pinvou3/bundle/skills`,技能市场私有区)。
+        std::fs::create_dir_all(fake_home.join(".pinvou3/bundle/skills/from-home")).unwrap();
         std::fs::write(
-            fake_home.join(".agents/skills/from-home/SKILL.md"),
+            fake_home.join(".pinvou3/bundle/skills/from-home/SKILL.md"),
             "---\nname: from-home\ndescription: home-rooted skill\n---\nbody",
+        )
+        .unwrap();
+
+        // `~/.agents/skills` 在 2026-06-29 也被 #41 砍掉 — 必须 NOT 扫描。
+        std::fs::create_dir_all(fake_home.join(".agents/skills/should-be-ignored-agents")).unwrap();
+        std::fs::write(
+            fake_home.join(".agents/skills/should-be-ignored-agents/SKILL.md"),
+            "---\nname: should-be-ignored-agents\ndescription: dropped by pinvou3 #41\n---\nbody",
         )
         .unwrap();
 
@@ -1843,6 +1882,38 @@ mod tests {
         assert_eq!(
             skill.description,
             "See also:   the config file   the env var"
+        );
+    }
+
+    /// [pinvou3-fork] 技能市场开关:被禁用的技能名必须从 `## Skills` catalogue 略去,
+    /// 启用的保留。回归:`render_skills_block` 不再查 `DISABLED_SKILLS`,或全局
+    /// setter/predicate 坏掉。
+    #[test]
+    fn forkguard_disabled_skill_hidden_from_catalogue() {
+        let tmpdir = TempDir::new().unwrap();
+        for n in ["fg-kept-skill", "fg-victim-skill"] {
+            let dir = tmpdir.path().join(n);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {n}\ndescription: probe\n---\nbody"),
+            )
+            .unwrap();
+        }
+        let registry = super::SkillRegistry::discover(tmpdir.path());
+
+        // 唯一禁用名,避免并行测试的共享全局互相影响。
+        super::set_disabled_skills(vec!["fg-victim-skill".to_string()]);
+        let rendered = super::render_skills_block(&registry).expect("skills block");
+        super::set_disabled_skills(Vec::new()); // 断言前重置共享全局
+
+        assert!(
+            rendered.contains("fg-kept-skill"),
+            "enabled skill must remain: {rendered}"
+        );
+        assert!(
+            !rendered.contains("fg-victim-skill"),
+            "disabled skill must be hidden: {rendered}"
         );
     }
 }
