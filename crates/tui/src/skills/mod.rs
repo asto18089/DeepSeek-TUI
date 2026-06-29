@@ -489,37 +489,30 @@ pub fn skills_directories_for_mode(workspace: &Path, mode: SkillDiscoveryMode) -
 }
 
 fn skills_directories_with_home_and_mode(
-    workspace: &Path,
+    _workspace: &Path,
     home_dir: Option<&Path>,
     mode: SkillDiscoveryMode,
 ) -> Vec<PathBuf> {
-    let mut candidates = match mode {
-        SkillDiscoveryMode::Compatible => vec![
-            workspace.join(".agents").join("skills"),
-            workspace.join("skills"),
-            workspace.join(".opencode").join("skills"),
-            workspace.join(".claude").join("skills"),
-            workspace.join(".cursor").join("skills"),
-            workspace.join(".codewhale").join("skills"),
-        ],
-        SkillDiscoveryMode::CodeWhaleOnly => codewhale_workspace_skills_dir(workspace)
-            .into_iter()
-            .collect(),
-    };
+    // pinvou3 fork (patch #41): 砍掉底座的 10 路径扫描清单(`.agents/skills`,
+    // `.opencode/skills`, `.claude/skills`, `.cursor/skills`, `.codewhale/skills`
+    // 等工具约定 + workspace + home 重叠版本),只保留:
+    //
+    //   1. `~/.agents/skills`        — 唯一全局共享约定(用户多 AI 工具共用)
+    //   2. `EngineConfig.skills_dir` — pinvou3 通过 fork patch #25/#26 注入,
+    //                                  union 在调用方 `discover_for_workspace_and_dir`
+    //                                  里追加,**不在本函数返回**
+    //
+    // 为什么砍:pinvou3 是 GUI 单一 embedder,workspace=$HOME → 原 10 路径全部
+    // 重叠 / 冗余 / 噪音;`.opencode` / `.cursor` / `.codewhale` 等命名约定对
+    // pinvou3 用户无意义。简化扫描 = prompt 短 + 行为可预期。
+    //
+    // 上游 v0.8.65 的 SkillDiscoveryMode(Compatible/CodeWhaleOnly)签名保留作 API
+    // 兼容,但收窄后两 mode 行为一致(均只返回 ~/.agents/skills)。不通用,**纯
+    // pinvou3 fork** 决策,不适合上游 PR。
+    let _ = mode;
+    let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(home) = home_dir {
-        match mode {
-            SkillDiscoveryMode::Compatible => {
-                candidates.push(home.join(".agents").join("skills"));
-                candidates.push(home.join(".claude").join("skills"));
-                candidates.push(home.join(".codewhale").join("skills"));
-                candidates.push(home.join(".deepseek").join("skills"));
-            }
-            SkillDiscoveryMode::CodeWhaleOnly => {
-                candidates.push(home.join(".codewhale").join("skills"));
-            }
-        }
-    } else {
-        candidates.push(PathBuf::from("/tmp/codewhale/skills"));
+        candidates.push(home.join(".agents").join("skills"));
     }
     existing_skill_dirs(candidates)
 }
@@ -689,6 +682,7 @@ pub fn render_available_skills_context_for_workspace(workspace: &Path) -> Option
     render_skills_block(&registry)
 }
 
+// 注:pinvou3 的 #41「skills 扫描路径只留 ~/.agents/skills」收窄在 skills_directories。
 #[must_use]
 pub fn render_available_skills_context_for_workspace_with_mode(
     workspace: &Path,
@@ -1035,6 +1029,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork patch #41: workspace-rooted skill dirs scrapped; only ~/.agents/skills + EngineConfig.skills_dir scanned"]
     fn skills_directories_returns_existing_dirs_in_precedence_order() {
         let tmpdir = TempDir::new().unwrap();
         let workspace = tmpdir.path();
@@ -1117,6 +1112,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork patch #41: workspace-rooted skill dirs scrapped"]
     fn discover_in_workspace_merges_with_first_wins_precedence() {
         let tmpdir = TempDir::new().unwrap();
         let workspace = tmpdir.path();
@@ -1164,6 +1160,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork patch #41: .opencode/skills no longer scanned"]
     fn discover_in_workspace_pulls_skills_from_opencode_dir() {
         let tmpdir = TempDir::new().unwrap();
         let workspace = tmpdir.path();
@@ -1182,6 +1179,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork patch #41: .cursor/skills no longer scanned"]
     fn discover_in_workspace_pulls_skills_from_cursor_dir() {
         let tmpdir = TempDir::new().unwrap();
         let workspace = tmpdir.path();
@@ -1240,6 +1238,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "pinvou3 fork patch #41: cross-tool workspace skill dirs no longer scanned"]
     fn render_available_skills_context_for_workspace_picks_up_cross_tool_dirs() {
         let tmpdir = TempDir::new().unwrap();
         let workspace = tmpdir.path();
@@ -1255,107 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn codewhale_only_mode_ignores_cross_tool_skill_dirs() {
-        let tmpdir = TempDir::new().unwrap();
-        let workspace = tmpdir.path().join("workspace");
-        let home = tmpdir.path().join("home");
-        let configured_dir = home.join(".codewhale").join("skills");
-        std::fs::create_dir_all(&workspace).unwrap();
-        write_skill(
-            &workspace.join(".claude").join("skills"),
-            "from-claude",
-            "claude-style skill",
-            "body",
-        );
-        write_skill(
-            &workspace.join(".codewhale").join("skills"),
-            "from-codewhale",
-            "codewhale skill",
-            "body",
-        );
-        write_skill(
-            &home.join(".agents").join("skills"),
-            "from-agents",
-            "agents skill",
-            "body",
-        );
-        write_skill(
-            &configured_dir,
-            "configured-codewhale",
-            "configured skill",
-            "body",
-        );
-
-        let registry = super::discover_for_workspace_and_dir_with_home_and_mode(
-            &workspace,
-            &configured_dir,
-            Some(&home),
-            super::SkillDiscoveryMode::CodeWhaleOnly,
-        );
-        let names: Vec<&str> = registry.list().iter().map(|s| s.name.as_str()).collect();
-
-        assert!(names.contains(&"from-codewhale"));
-        assert!(names.contains(&"configured-codewhale"));
-        assert!(
-            !names.contains(&"from-claude") && !names.contains(&"from-agents"),
-            "CodeWhale-only mode must not import cross-tool skills: {names:?}"
-        );
-    }
-
-    #[test]
-    fn codewhale_only_mode_still_honors_explicit_configured_dir() {
-        let tmpdir = TempDir::new().unwrap();
-        let workspace = tmpdir.path().join("workspace");
-        let home = tmpdir.path().join("home");
-        let configured_dir = tmpdir.path().join("my-skills");
-        std::fs::create_dir_all(&workspace).unwrap();
-        write_skill(
-            &configured_dir,
-            "configured-skill",
-            "explicit configured skill",
-            "body",
-        );
-
-        let registry = super::discover_for_workspace_and_dir_with_home_and_mode(
-            &workspace,
-            &configured_dir,
-            Some(&home),
-            super::SkillDiscoveryMode::CodeWhaleOnly,
-        );
-        let names: Vec<&str> = registry.list().iter().map(|s| s.name.as_str()).collect();
-
-        assert_eq!(names, vec!["configured-skill"]);
-    }
-
-    #[test]
-    fn codewhale_only_mode_rejects_workspace_codewhale_symlink_escape() {
-        let tmpdir = TempDir::new().unwrap();
-        let workspace = tmpdir.path().join("workspace");
-        let home = tmpdir.path().join("home");
-        let escape_target = tmpdir.path().join("escape-target");
-        std::fs::create_dir_all(workspace.join(".codewhale")).unwrap();
-        write_skill(&escape_target, "escaped-skill", "escaped skill", "body");
-
-        let link_path = workspace.join(".codewhale").join("skills");
-        if let Err(err) = create_dir_symlink(&escape_target, &link_path) {
-            eprintln!("skipping symlink escape assertion: {err}");
-            return;
-        }
-
-        let registry = super::discover_for_workspace_and_dir_with_home_and_mode(
-            &workspace,
-            &tmpdir.path().join("missing-configured-skills"),
-            Some(&home),
-            super::SkillDiscoveryMode::CodeWhaleOnly,
-        );
-
-        assert!(
-            registry.get("escaped-skill").is_none(),
-            "CodeWhale-only mode must not follow workspace .codewhale/skills outside the workspace"
-        );
-    }
-
-    #[test]
+    #[ignore = "pinvou3 fork(#41): workspace skill 目录(.claude/skills 等)不扫描,只留 ~/.agents/skills + 配置 dir"]
     fn discover_for_workspace_and_dir_merges_workspace_and_configured_sources() {
         let tmpdir = TempDir::new().unwrap();
         let workspace = tmpdir.path().join("workspace");
@@ -1610,6 +1509,7 @@ mod tests {
     /// `.agents/skills/` and a global skill in `~/.codewhale/skills/`
     /// must both be discoverable.
     #[test]
+    #[ignore = "pinvou3 fork patch #41: workspace skill dirs no longer scanned"]
     fn discover_finds_both_workspace_and_global_skills() {
         let tmpdir = TempDir::new().unwrap();
         let workspace = tmpdir.path().join("workspace");
@@ -1864,6 +1764,71 @@ mod tests {
             skill.description,
             "Usage:\n  $ deepseek --model auto\n  $ deepseek doctor"
         );
+    }
+
+    /// pinvou3 fork-guard (patches #25/#26 + #41): the only skill sources
+    /// pinvou3 scans are `~/.agents/skills` (single global convention) and
+    /// `EngineConfig.skills_dir` (the pinvou3 bundle path). Workspace
+    /// search and other tool-convention dirs (`.opencode` / `.cursor` /
+    /// `.claude` / `.codewhale` / `.deepseek`) were removed in #41.
+    /// Regression: any of those reappear, or `skills_dir` gets short-
+    /// circuited again.
+    #[test]
+    fn forkguard_skills_dir_unions_with_home_rooted_workspace_skills() {
+        let tmpdir = TempDir::new().unwrap();
+        let workspace = tmpdir.path().join("ws");
+        let bundle = tmpdir.path().join("bundle");
+        let fake_home = tmpdir.path().join("fake-home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        // home-rooted skill (the single global path pinvou3 keeps after #41).
+        std::fs::create_dir_all(fake_home.join(".agents/skills/from-home")).unwrap();
+        std::fs::write(
+            fake_home.join(".agents/skills/from-home/SKILL.md"),
+            "---\nname: from-home\ndescription: home-rooted skill\n---\nbody",
+        )
+        .unwrap();
+
+        // A different tool-convention dir that pinvou3 fork #41 explicitly drops.
+        std::fs::create_dir_all(fake_home.join(".deepseek/skills/should-be-ignored")).unwrap();
+        std::fs::write(
+            fake_home.join(".deepseek/skills/should-be-ignored/SKILL.md"),
+            "---\nname: should-be-ignored\ndescription: dropped by pinvou3\n---\nbody",
+        )
+        .unwrap();
+
+        // bundle skill (analogous to pinvou3's `~/.pinvou3/bundle/skills`).
+        std::fs::create_dir_all(bundle.join("from-bundle")).unwrap();
+        std::fs::write(
+            bundle.join("from-bundle/SKILL.md"),
+            "---\nname: from-bundle\ndescription: bundle skill\n---\nbody",
+        )
+        .unwrap();
+
+        let registry =
+            super::discover_for_workspace_and_dir_with_home(&workspace, &bundle, Some(&fake_home));
+        let names: Vec<&str> = registry.list().iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"from-home"),
+            "~/.agents/skills must remain visible. Got: {names:?}"
+        );
+        assert!(
+            names.contains(&"from-bundle"),
+            "skills_dir-supplied skill must be unioned in, not short-circuited. Got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"should-be-ignored"),
+            "pinvou3 fork #41 dropped .deepseek/skills — must NOT be scanned. Got: {names:?}"
+        );
+
+        // And the public render path the prompt builder uses must surface it too.
+        let rendered =
+            super::render_available_skills_context_for_workspace_and_dir(&workspace, &bundle)
+                .expect("rendered block should be non-empty");
+        assert!(rendered.contains("from-bundle"));
+        assert!(!rendered.contains("should-be-ignored"));
     }
 
     /// Folded (`>`) block scalars also preserve relative indentation
