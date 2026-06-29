@@ -1905,6 +1905,8 @@ fn live_subagent_result(
         assignment: SubAgentAssignment {
             objective: summarize_tool_output(objective),
             role: role.map(str::to_string),
+            output_schema: None,
+            expects_file_output: false,
         },
         model: String::new(),
         nickname,
@@ -2268,6 +2270,7 @@ fn agent_type_order(agent_type: &SubAgentType) -> u8 {
         SubAgentType::Verifier => 4,
         SubAgentType::Review => 5,
         SubAgentType::Custom => 6,
+        SubAgentType::ToolAgent => 7,
     }
 }
 
@@ -2452,6 +2455,8 @@ mod tests {
             assignment: SubAgentAssignment {
                 objective: "read the docs".to_string(),
                 role: None,
+                output_schema: None,
+                expects_file_output: false,
             },
             model: "deepseek-v4-flash".to_string(),
             nickname: None,

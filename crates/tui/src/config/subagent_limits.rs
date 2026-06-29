@@ -9,6 +9,11 @@
 
 pub const DEFAULT_MAX_SUBAGENTS: usize = 20;
 pub const MAX_SUBAGENTS: usize = 20;
+/// [pinvou3-fork] Default instantaneous launch-gate width for depth-1 sub-agent
+/// fanout (#3095). Upstream v0.8.65 renamed the per-config field to
+/// `launch_concurrency`, but the fork sub-agent manager still keys its launch
+/// gate off this constant; kept at the historical default of 4.
+pub const DEFAULT_INTERACTIVE_LAUNCH_LIMIT: usize = 4;
 /// Upper bound for queued + running sub-agent admissions. This is deliberately
 /// higher than the instantaneous concurrency cap so Workflow-style fanout can
 /// opt into large bounded populations without unbounded queue growth.

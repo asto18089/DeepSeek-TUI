@@ -5,14 +5,18 @@
 //! independently; close-as-cancel lets a single signal both stop new mail and
 //! propagate cancellation through nested children.
 
+// Some surface here is producer-only inside this crate today and consumed by
+// #128's UI cards in a follow-up; suppress the dead-code warnings until then
+// rather than deleting capabilities the design depends on.
+#![allow(dead_code)]
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(test)]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::models::Usage;
@@ -50,7 +54,7 @@ pub enum MailboxMessage {
     /// A child agent was spawned by this agent.
     ChildSpawned { parent_id: String, child_id: String },
     /// Agent completed successfully (carries the summary line shown in the
-    /// transcript; full result is still available through the transcript handle).
+    /// transcript; full result is still available via `agent_result`).
     Completed { agent_id: String, summary: String },
     /// Agent failed with the carried error message.
     Failed { agent_id: String, error: String },
@@ -141,7 +145,6 @@ struct MailboxInner {
     next_seq: AtomicU64,
     seq_tx: watch::Sender<u64>,
     closed: AtomicBool,
-    #[cfg(test)]
     cancel_token: CancellationToken,
 }
 
@@ -157,11 +160,9 @@ impl Mailbox {
     /// Create a new mailbox bound to the given cancellation token. Closing
     /// the mailbox (or dropping the last sender) cancels this token. Runtimes
     /// that derive from the same token observe that cancellation; detached
-    /// background `agent` sessions use their own runtime token.
+    /// background `agent_open` sessions use their own runtime token.
     #[must_use]
     pub fn new(cancel_token: CancellationToken) -> (Self, MailboxReceiver) {
-        #[cfg(not(test))]
-        let _ = cancel_token;
         let (tx, rx) = mpsc::unbounded_channel();
         let (seq_tx, _) = watch::channel(0);
         let inner = MailboxInner {
@@ -169,7 +170,6 @@ impl Mailbox {
             next_seq: AtomicU64::new(0),
             seq_tx,
             closed: AtomicBool::new(false),
-            #[cfg(test)]
             cancel_token,
         };
         (
@@ -187,7 +187,6 @@ impl Mailbox {
     /// sequence counter advances, signaling new mail without copying it —
     /// the consumer then calls `drain` (or `recv_one` on its own receiver).
     /// Multiple subscribers may exist; this is the fanout primitive.
-    #[cfg(test)]
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.inner.seq_tx.subscribe()
@@ -210,7 +209,6 @@ impl Mailbox {
     }
 
     /// Whether the mailbox has been closed.
-    #[cfg(test)]
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire)
@@ -221,9 +219,8 @@ impl Mailbox {
     /// "Close-as-cancel": there's no useful state where the consumer is gone
     /// but producers bound to this mailbox token should keep publishing.
     /// Closing cancels the bound token; directly derived `child_runtime()`
-    /// children observe it, while detached `agent` sessions rely on their
+    /// children observe it, while detached `agent_open` sessions rely on their
     /// own explicit cancellation.
-    #[cfg(test)]
     pub fn close(&self) {
         if !self.inner.closed.swap(true, Ordering::AcqRel) {
             self.inner.cancel_token.cancel();
@@ -232,7 +229,6 @@ impl Mailbox {
 }
 
 impl MailboxReceiver {
-    #[cfg(test)]
     fn sync_pending(&mut self) {
         while let Ok(env) = self.rx.try_recv() {
             self.pending.push_back(env);
@@ -240,14 +236,12 @@ impl MailboxReceiver {
     }
 
     /// Whether any envelopes are buffered (or arrived since last check).
-    #[cfg(test)]
     pub fn has_pending(&mut self) -> bool {
         self.sync_pending();
         !self.pending.is_empty()
     }
 
     /// Drain all currently available envelopes, in delivery order.
-    #[cfg(test)]
     pub fn drain(&mut self) -> Vec<MailboxEnvelope> {
         self.sync_pending();
         self.pending.drain(..).collect()
@@ -263,7 +257,7 @@ impl MailboxReceiver {
     }
 
     /// Awaits the next envelope with a timeout. Useful in tests.
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub async fn recv_timeout(&mut self, timeout: Duration) -> Option<MailboxEnvelope> {
         tokio::time::timeout(timeout, self.recv())
             .await
@@ -271,6 +265,10 @@ impl MailboxReceiver {
             .flatten()
     }
 }
+
+/// Convenience handle: a mailbox + the matching cancellation token, ready to
+/// hand to a runtime. The receiver lives on the spawning side.
+pub type SharedMailbox = Arc<Mutex<Option<MailboxReceiver>>>;
 
 #[cfg(test)]
 mod tests {

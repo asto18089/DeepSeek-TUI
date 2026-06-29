@@ -162,6 +162,9 @@ impl WorkerRuntimeProfile {
             }
             // Custom starts locked down; the caller opens specific tools explicitly.
             SubAgentType::Custom => (PermissionSet::read_only(), ShellPolicy::None),
+            // [pinvou3-fork] ToolAgent is the in-conversation agent_open/eval/close
+            // surface; lock it down like Custom (read-only, no shell by default).
+            SubAgentType::ToolAgent => (PermissionSet::read_only(), ShellPolicy::None),
         };
         Self {
             role,
