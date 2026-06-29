@@ -6518,6 +6518,8 @@ async fn run_exec_agent(
         workspace: workspace.clone(),
         allow_shell: auto_approve || execution_config.allow_shell(),
         trust_mode,
+        tool_whitelist: None,
+        reasoning_effort: None,
         notes_path: execution_config.notes_path(),
         mcp_config_path: execution_config.mcp_config_path(),
         skills_dir: execution_config.skills_dir(),
@@ -6601,6 +6603,7 @@ async fn run_exec_agent(
         tools_always_load: execution_config.tools_always_load(),
         tools: execution_config.tools.clone(),
         verbosity: execution_config.verbosity.clone(),
+        extra_tools: Default::default(), // [pinvou3-fork] no app tools in TUI path
         workspace_follow_symlinks: settings.workspace_follow_symlinks,
         exec_policy_engine: execution_config.exec_policy_engine.clone(),
     };
@@ -6818,7 +6821,7 @@ async fn run_exec_agent(
             {
                 eprintln!("sub-agent {id}: {status}");
             }
-            Event::AgentComplete { id, result }
+            Event::AgentComplete { id, result, .. }
                 if output_format == ExecOutputFormat::Text && !json_output =>
             {
                 eprintln!(
