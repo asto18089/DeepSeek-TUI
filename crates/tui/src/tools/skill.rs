@@ -84,6 +84,16 @@ impl ToolSpec for LoadSkillTool {
             ));
         }
 
+        // [pinvou3-fork] marketplace toggle: a disabled skill is hidden from the
+        // prompt catalogue, so the model should never name it here — but if it
+        // does (stale/hallucinated name), treat it as unavailable rather than
+        // serving a switched-off skill's body.
+        if crate::skills::is_skill_disabled(name) {
+            return Err(ToolError::execution_failed(format!(
+                "skill `{name}` is disabled"
+            )));
+        }
+
         // #432: walk every candidate skill directory (workspace
         // .agents/skills, skills, .opencode/skills, .claude/skills,
         // .cursor/skills, ~/.agents/skills, global default), merging with

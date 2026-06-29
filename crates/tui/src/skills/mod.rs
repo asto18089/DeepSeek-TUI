@@ -633,6 +633,41 @@ pub fn render_available_skills_context_for_workspace_and_dir(
     render_skills_block(&registry)
 }
 
+// [pinvou3-fork] Marketplace skill on/off toggle.
+//
+// The pinvou3 skill marketplace (app layer) lets users disable an installed
+// skill without uninstalling it. Skills reach the model only through the
+// `## Skills` prompt catalogue (`render_skills_block`) and the `load_skill`
+// tool — both consult this process-global disabled set, so a disabled skill
+// vanishes from the catalogue and can't be loaded.
+//
+// Global (not per-session) to match the connector chip's "全局持久" semantics
+// (one toggle, all sessions/windows inherit). The bridge sets it from
+// `~/.pinvou3/disabled_skills.json` at startup and on every toggle. Re-setting
+// changes the next prompt build's bytes → one prefix-cache miss, then stable
+// again — exactly like `disabled_connectors` / `disallowed_tools`.
+//
+// Not upstream-bound: depends on the pinvou3 marketplace + bundle/skills.
+static DISABLED_SKILLS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// [pinvou3-fork] Replace the set of disabled skill names (the SKILL.md
+/// frontmatter `name`, which equals the on-disk directory name). Called by the
+/// app/bridge; an empty list means every installed skill is enabled.
+pub fn set_disabled_skills(names: Vec<String>) {
+    if let Ok(mut guard) = DISABLED_SKILLS.write() {
+        *guard = names;
+    }
+}
+
+/// [pinvou3-fork] True if `name` is currently toggled off in the marketplace.
+#[must_use]
+pub fn is_skill_disabled(name: &str) -> bool {
+    DISABLED_SKILLS
+        .read()
+        .map(|guard| guard.iter().any(|n| n == name))
+        .unwrap_or(false)
+}
+
 fn render_skills_block(registry: &SkillRegistry) -> Option<String> {
     if registry.is_empty() {
         return None;
@@ -650,6 +685,11 @@ instructions when using a specific skill.\n\n",
 
     let mut omitted = 0usize;
     for skill in registry.list() {
+        // [pinvou3-fork] marketplace toggle: drop skills the user switched off
+        // so they vanish from the prompt catalogue (see `DISABLED_SKILLS`).
+        if is_skill_disabled(&skill.name) {
+            continue;
+        }
         // Use the real on-disk path captured at discovery — the directory
         // name can differ from the frontmatter `name` for community
         // installs, in which case `<dir>/<name>/SKILL.md` would not exist
@@ -1763,6 +1803,40 @@ mod tests {
         assert_eq!(
             skill.description,
             "See also:   the config file   the env var"
+        );
+    }
+
+    /// [pinvou3-fork] marketplace skill toggle: a disabled skill name must be
+    /// omitted from the rendered `## Skills` catalogue, while enabled skills
+    /// stay. Regression: `render_skills_block` stops consulting
+    /// `DISABLED_SKILLS`, or the global setter/predicate breaks.
+    #[test]
+    fn forkguard_disabled_skill_hidden_from_catalogue() {
+        let tmpdir = TempDir::new().unwrap();
+        for n in ["fg-kept-skill", "fg-victim-skill"] {
+            let dir = tmpdir.path().join(n);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {n}\ndescription: probe\n---\nbody"),
+            )
+            .unwrap();
+        }
+        let registry = super::SkillRegistry::discover(tmpdir.path());
+
+        // Unique disabled name so a parallel test rendering its own
+        // (differently-named) skills can't be affected by this shared global.
+        super::set_disabled_skills(vec!["fg-victim-skill".to_string()]);
+        let rendered = super::render_skills_block(&registry).expect("skills block");
+        super::set_disabled_skills(Vec::new()); // reset shared global before asserts
+
+        assert!(
+            rendered.contains("fg-kept-skill"),
+            "enabled skill must remain: {rendered}"
+        );
+        assert!(
+            !rendered.contains("fg-victim-skill"),
+            "disabled skill must be hidden: {rendered}"
         );
     }
 }
