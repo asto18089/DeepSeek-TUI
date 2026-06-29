@@ -139,6 +139,12 @@ impl Engine {
         // so there's no failure mode worth gating on.
         builder = builder.with_notify_tool();
 
+        // [pinvou3-fork] Append application-injected custom tools (e.g. pinvou3's
+        // kb_search). Registered after built-ins; last-writer-wins on name clash.
+        for tool in &self.config.extra_tools.0 {
+            builder = builder.with_tool(tool.clone());
+        }
+
         builder
     }
 }

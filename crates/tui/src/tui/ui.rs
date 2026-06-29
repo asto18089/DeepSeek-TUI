@@ -1121,6 +1121,8 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         workspace: app.workspace.clone(),
         allow_shell: app.allow_shell,
         trust_mode: app.trust_mode,
+        tool_whitelist: None,
+        reasoning_effort: None,
         notes_path: config.notes_path(),
         mcp_config_path: config.mcp_config_path(),
         skills_dir: app.skills_dir.clone(),
@@ -1197,6 +1199,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         search_base_url: config.search.as_ref().and_then(|s| s.base_url.clone()),
         tools_always_load: config.tools_always_load(),
         tools: config.tools.clone(),
+        extra_tools: Default::default(), // [pinvou3-fork] no app tools in TUI path
         workspace_follow_symlinks: app.workspace_follow_symlinks,
         exec_policy_engine: config.exec_policy_engine.clone(),
     }
@@ -2692,7 +2695,7 @@ async fn run_event_loop(
                             received_engine_event = redraw_requested_before_event;
                         }
                     }
-                    EngineEvent::AgentComplete { id, result } => {
+                    EngineEvent::AgentComplete { id, result, .. } => {
                         execute_subagent_observer_hook(
                             app,
                             HookEvent::SubagentComplete,
