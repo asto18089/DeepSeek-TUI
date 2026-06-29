@@ -47,6 +47,44 @@ fn validate_mcp_config_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn expand_env_placeholders(value: &str) -> Result<String> {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            anyhow::bail!("unterminated environment placeholder in MCP config value");
+        };
+        let name = &after[..end];
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            anyhow::bail!("invalid environment placeholder in MCP config value");
+        }
+        let env_value = std::env::var(name).with_context(|| {
+            format!("environment variable {name} required by MCP config is not set")
+        })?;
+        out.push_str(&env_value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+fn expand_env_placeholders_map(
+    values: &HashMap<String, String>,
+    context: &str,
+) -> Result<HashMap<String, String>> {
+    let mut expanded = HashMap::new();
+    for (key, value) in values {
+        expanded.insert(
+            key.clone(),
+            expand_env_placeholders(value)
+                .with_context(|| format!("failed to expand MCP {context} value for {key}"))?,
+        );
+    }
+    Ok(expanded)
+}
+
 /// Mask a URL so any embedded credentials in the userinfo portion (e.g.
 /// `https://user:secret@host`) are replaced with `***`. Failures fall back to
 /// the original string so we don't lose context — we never want masking to
@@ -1393,13 +1431,16 @@ impl McpConnection {
                 }
             }
             let client = client_builder.build()?;
+            let mut auth_config = config.clone();
+            auth_config.headers = expand_env_placeholders_map(&config.headers, "headers")
+                .with_context(|| format!("MCP server '{name}' header expansion failed"))?;
             let oauth_runtime = match oauth::build_default_headers(
-                &config.headers,
-                &config.env_headers,
+                &auth_config.headers,
+                &auth_config.env_headers,
             ) {
                 Ok(default_headers) => match oauth::McpOAuthRuntime::from_server_config(
                     &name,
-                    &config,
+                    &auth_config,
                     default_headers,
                 )
                 .await
@@ -1425,7 +1466,7 @@ impl McpConnection {
                     None
                 }
             };
-            let http_auth = McpHttpAuth::from_config(&config, oauth_runtime);
+            let http_auth = McpHttpAuth::from_config(&auth_config, oauth_runtime);
             if is_legacy_sse_transport(&config) {
                 Box::new(
                     SseTransport::connect(
@@ -1476,10 +1517,15 @@ impl McpConnection {
             // bootstrap variables (NVM_DIR, NODE_OPTIONS, NPM_CONFIG_*,
             // HTTP(S)_PROXY, …) reach the child. See `sanitized_mcp_env`
             // and #1244 for context.
-            child_env::apply_to_tokio_command_mcp(&mut cmd, child_env::string_map_env(&config.env));
+            let expanded_env = expand_env_placeholders_map(&config.env, "env")
+                .with_context(|| format!("MCP server '{name}' env expansion failed"))?;
+            child_env::apply_to_tokio_command_mcp(
+                &mut cmd,
+                child_env::string_map_env(&expanded_env),
+            );
 
             let mut child = cmd.spawn().with_context(|| {
-                let env_keys: Vec<&str> = config.env.keys().map(String::as_str).collect();
+                let env_keys: Vec<&str> = expanded_env.keys().map(String::as_str).collect();
                 format!(
                     "MCP stdio spawn failed (transport=stdio server={name} cmd={command:?} args={:?} env_keys={env_keys:?})",
                     config.args,

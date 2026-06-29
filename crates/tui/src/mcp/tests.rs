@@ -230,6 +230,61 @@ fn mcp_server_config_omits_headers_when_empty() {
     );
 }
 
+#[test]
+fn expand_env_placeholders_expands_authorization_header() {
+    let _lock = crate::test_support::lock_test_env();
+    let _secret = crate::test_support::EnvVarGuard::set(
+        "PINVOU3_MCP_SECRET_QCC_API_KEY",
+        "test-qcc-secret-123456",
+    );
+    let mut headers = HashMap::new();
+    headers.insert(
+        "Authorization".to_string(),
+        "Bearer ${PINVOU3_MCP_SECRET_QCC_API_KEY}".to_string(),
+    );
+
+    let expanded = expand_env_placeholders_map(&headers, "headers").unwrap();
+
+    assert_eq!(
+        expanded.get("Authorization").map(String::as_str),
+        Some("Bearer test-qcc-secret-123456")
+    );
+}
+
+#[test]
+fn expand_env_placeholders_expands_stdio_env_value() {
+    let _lock = crate::test_support::lock_test_env();
+    let _secret = crate::test_support::EnvVarGuard::set(
+        "PINVOU3_MCP_SECRET_AMAP_KEY",
+        "test-amap-secret-123456",
+    );
+    let mut env = HashMap::new();
+    env.insert(
+        "AMAP_KEY".to_string(),
+        "${PINVOU3_MCP_SECRET_AMAP_KEY}".to_string(),
+    );
+
+    let expanded = expand_env_placeholders_map(&env, "env").unwrap();
+
+    assert_eq!(
+        expanded.get("AMAP_KEY").map(String::as_str),
+        Some("test-amap-secret-123456")
+    );
+}
+
+#[test]
+fn expand_env_placeholders_reports_missing_variable_without_secret_value() {
+    let _lock = crate::test_support::lock_test_env();
+    let _missing = crate::test_support::EnvVarGuard::remove("PINVOU3_MCP_SECRET_MISSING");
+
+    let err = expand_env_placeholders("Bearer ${PINVOU3_MCP_SECRET_MISSING}")
+        .expect_err("missing env should fail")
+        .to_string();
+
+    assert!(err.contains("PINVOU3_MCP_SECRET_MISSING"));
+    assert!(!err.contains("Bearer "));
+}
+
 #[tokio::test]
 async fn mcp_http_auth_prefers_static_authorization_over_bearer_env() {
     let mut headers = HashMap::new();
