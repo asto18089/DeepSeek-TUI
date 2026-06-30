@@ -2846,7 +2846,15 @@ pub(super) fn command_denies_tool(disallowed_tools: Option<&[String]>, tool_name
     let Some(disallowed_tools) = disallowed_tools else {
         return false;
     };
-    disallowed_tools.contains(&tool_name.to_ascii_lowercase())
+    let tool_name = tool_name.to_ascii_lowercase();
+    disallowed_tools.iter().any(|rule| {
+        let rule = rule.to_ascii_lowercase();
+        if let Some(prefix) = rule.strip_suffix('*') {
+            tool_name.starts_with(prefix)
+        } else {
+            tool_name == rule
+        }
+    })
 }
 
 fn resolve_tool_definition<'a>(
@@ -3221,6 +3229,19 @@ mod tests {
     fn disallowed_tools_gate_blocks_case_insensitively() {
         let disallowed = vec!["exec_shell".to_string()];
         assert!(command_denies_tool(Some(&disallowed), "Exec_Shell"));
+    }
+
+    #[test]
+    fn disallowed_tools_gate_blocks_prefix_wildcard() {
+        let disallowed = vec!["mcp_qcc-company_*".to_string()];
+        assert!(command_denies_tool(
+            Some(&disallowed),
+            "mcp_qcc-company_get_company_profile"
+        ));
+        assert!(!command_denies_tool(
+            Some(&disallowed),
+            "mcp_gongwen_make_gongwen"
+        ));
     }
 
     #[test]
