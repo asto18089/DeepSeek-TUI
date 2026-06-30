@@ -604,10 +604,40 @@ impl BackgroundShell {
         #[cfg(windows)]
         terminate_and_close_windows_job(self.windows_job.take());
         if let Some(handle) = self.stdout_thread.take() {
-            let _ = handle.join();
+            #[cfg(windows)]
+            {
+                if matches!(self.status, ShellStatus::Killed) {
+                    tracing::debug!(
+                        task_id = %self.id,
+                        "detaching stdout reader after killed Windows shell"
+                    );
+                    drop(handle);
+                } else {
+                    let _ = handle.join();
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = handle.join();
+            }
         }
         if let Some(handle) = self.stderr_thread.take() {
-            let _ = handle.join();
+            #[cfg(windows)]
+            {
+                if matches!(self.status, ShellStatus::Killed) {
+                    tracing::debug!(
+                        task_id = %self.id,
+                        "detaching stderr reader after killed Windows shell"
+                    );
+                    drop(handle);
+                } else {
+                    let _ = handle.join();
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = handle.join();
+            }
         }
         self.stdin = None;
         self.child = None;
