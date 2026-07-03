@@ -3851,8 +3851,11 @@ mod approval;
 mod context;
 mod handle;
 pub(crate) use context::compact_tool_result_for_context;
+// [pinvou3-fork] app-facing:让 bridge 复用底座同款 emergency input budget 数学
+// (避免镜像 500K/262144/output 预留/公式后 sync 静默倒置)。可上游。
+pub use context::context_input_budget_for_route;
 use context::{
-    MAX_CONTEXT_RECOVERY_ATTEMPTS, MIN_RECENT_MESSAGES_TO_KEEP, context_input_budget_for_route,
+    MAX_CONTEXT_RECOVERY_ATTEMPTS, MIN_RECENT_MESSAGES_TO_KEEP,
     effective_max_output_tokens_for_route, extract_compaction_summary_prompt,
     is_context_length_error_message, summarize_text,
 };
