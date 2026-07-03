@@ -5597,3 +5597,30 @@ fn forkguard_tool_search_not_injected_blocks_deferred_activation() {
     );
     assert!(crate::tools::pinvou3_blocklist::is_pinvou3_hidden("tool_search"));
 }
+
+#[test]
+fn forkguard_yolo_no_deferred_activator_first_class() {
+    // [pinvou3-fork] Golden snapshot(注入层):`ensure_advanced_tooling(Yolo)` 之后,除输入的
+    // native 外不得让**任何**工具首轮可见(defer_loading=false)。用**精确相等**而非"查固定名单":
+    // 上游无论新增/改名/折叠一个 activator(如 tool_search),只要它首轮可见,active 集就多出一项 →
+    // fail,不依赖预判它叫什么名。堵的正是 2026-07-03 三盲区全穿(非 ToolSpec + 改名非新增 +
+    // 断言查错前缀,见 `docs/工具表精简方案.md` §8.2)。配套 blocklist 名单守护见
+    // `pinvou3_blocklist::tests::forkguard_blocklist_golden`。
+    let always_load = HashSet::new();
+    let mut catalog = vec![api_tool("read_file"), api_tool("web_search")];
+    ensure_advanced_tooling(&mut catalog, AppMode::Yolo, &always_load);
+    let active: std::collections::BTreeSet<&str> = catalog
+        .iter()
+        .filter(|t| !t.defer_loading.unwrap_or(false))
+        .map(|t| t.name.as_str())
+        .collect();
+    // code_execution/js_execution 按环境可能被注入,但必须 defer(不进 active);
+    // tool_search 类 activator 必须被 blocklist gate 掉(根本不注入)。故 active 只应剩输入的两个。
+    let expected: std::collections::BTreeSet<&str> =
+        ["read_file", "web_search"].into_iter().collect();
+    assert_eq!(
+        active, expected,
+        "ensure_advanced_tooling(Yolo) 注入了非预期的首轮可见工具:多出的可能是能激活 deferred 的 \
+         activator(如 tool_search 折叠改名)→ 击穿 blocklist 隔离。逐项确认后更新此 expected 集。"
+    );
+}

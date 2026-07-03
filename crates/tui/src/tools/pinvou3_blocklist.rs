@@ -150,6 +150,51 @@ pub fn is_pinvou3_hidden(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// [pinvou3-fork] Golden 名单守护:blocklist 的**精确**内容必须 == golden。sync 后上游
+    /// 增/删 model-facing 工具、或 pinvou3 调整 blocklist,都会让本测试 fail → 强制逐项确认
+    /// (上游新增→评估是否补黑名单;上游改名/折叠→门控名是否跟上;pinvou3 有意增删→更新此
+    /// golden)。避免"静默漂移":2026-07-03 tool_search 折叠单名事故正是"改名"没被间接检查
+    /// (对比 ToolSpec name / grep 新增注入路径)抓到,见 `docs/工具表精简方案.md` §8.2。配套
+    /// `engine::tests::forkguard_yolo_no_deferred_activator_first_class` 守护注入层结果。
+    #[test]
+    fn forkguard_blocklist_golden() {
+        use std::collections::BTreeSet;
+        let actual: BTreeSet<&str> = PINVOU3_HIDDEN_TOOLS.iter().copied().collect();
+        let golden: BTreeSet<&str> = [
+            "task_create", "task_list", "task_read", "task_cancel",
+            "task_gate_run", "task_shell_start", "task_shell_wait", "pr_attempt_record",
+            "pr_attempt_list", "pr_attempt_read", "pr_attempt_preflight", "tool_agent",
+            "agent_spawn", "agent_result", "agent_cancel", "agent_list",
+            "resume_agent", "delegate_to_agent", "rlm_open", "rlm_eval",
+            "rlm_configure", "rlm_close", "create_goal", "get_goal",
+            "update_goal", "git_status", "git_diff", "git_log",
+            "git_show", "git_blame", "apply_patch", "fim_edit",
+            "pandoc_convert", "image_ocr", "todo_write", "todo_add",
+            "todo_update", "todo_list", "exec_shell_cancel", "exec_shell_interact",
+            "exec_wait", "exec_interact", "automation_create", "automation_delete",
+            "automation_list", "automation_pause", "automation_read", "automation_resume",
+            "automation_run", "automation_update", "github_issue_context", "github_pr_context",
+            "github_comment", "github_close_issue", "finance", "web.run",
+            "diagnostics", "multi_tool_use.parallel", "note", "validate_data",
+            "run_tests", "handle_read", "retrieve_tool_result", "project_map",
+            "recall_archive", "review", "notify", "remember",
+            "web_run", "speech", "tts", "rlm_session_objects",
+            "github_close_pr", "run_verifiers", "slop_ledger_append", "slop_ledger_export",
+            "slop_ledger_query", "slop_ledger_update", "tool_search", "tool_search_tool_regex",
+            "tool_search_tool_bm25",
+        ]
+        .into_iter()
+        .collect();
+        let missing: Vec<&str> = golden.difference(&actual).copied().collect();
+        let extra: Vec<&str> = actual.difference(&golden).copied().collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "blocklist 名单漂移!golden 有但当前缺={missing:?};当前多出={extra:?}。\
+             上游新增 model-facing 工具→评估补黑名单;上游改名/折叠→门控名跟上;\
+             pinvou3 有意增删→更新此 golden。"
+        );
+    }
+
     #[test]
     fn hides_known_state_management_tools() {
         assert!(is_pinvou3_hidden("task_create"));
