@@ -2493,7 +2493,12 @@ impl McpPool {
             });
         }
 
-        if !self.config.servers.is_empty() {
+        // [pinvou3-fork] 通用优化:上游原条件是 `!self.config.servers.is_empty()` —— 只要注册了任何
+        // MCP server 就无条件注入 list_mcp_resources / list_mcp_resource_templates,与 server 是否真的
+        // 暴露 resources/templates 无关。pinvou3 的 MCP server 全部 tools-only(present_artifact/gongwen/
+        // weather/iwencai 的 resources/list 均返回 -32601),这两个元工具永久空转、纯占工具槽+token。
+        // 改为按对应集合非空分别 gate,与下方 mcp_read_resource(`!resources.is_empty()`)一致。可上游。
+        if !self.all_resources().is_empty() {
             api_tools.push(crate::models::Tool {
                 tool_type: None,
                 name: "list_mcp_resources".to_string(),
@@ -2510,6 +2515,8 @@ impl McpPool {
                 strict: None,
                 cache_control: None,
             });
+        }
+        if !self.all_resource_templates().is_empty() {
             api_tools.push(crate::models::Tool {
                 tool_type: None,
                 name: "list_mcp_resource_templates".to_string(),

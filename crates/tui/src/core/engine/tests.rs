@@ -5586,11 +5586,14 @@ fn forkguard_tool_search_not_injected_blocks_deferred_activation() {
     let always_load = HashSet::new();
     let mut catalog = vec![api_tool("read_file"), api_tool("web_search")];
     ensure_advanced_tooling(&mut catalog, AppMode::Yolo, &always_load);
+    // v0.8.65 上游把 tool_search 折叠成**单名 `tool_search`**(旧双名 tool_search_tool_regex/bm25 废弃)。
+    // 门控 is_pinvou3_hidden(TOOL_SEARCH_NAME="tool_search") 依赖 blocklist 含**裸单名**。必须查精确名:
+    // 旧断言查 `starts_with("tool_search_tool")`,而单名 `"tool_search".starts_with("tool_search_tool")`
+    // 恒 false → 断言恒真通过、给虚假保证(2026-07-03 实测 sync 后 tool_search 已漏注入,此测试却仍绿)。
     assert!(
-        !catalog.iter().any(|t| t.name.starts_with("tool_search_tool")),
+        !catalog.iter().any(|t| t.name == "tool_search"),
         "tool_search 不应被注入(否则模型可借它激活被 blocklist 的 agent/delegate);catalog={:?}",
         catalog.iter().map(|t| t.name.clone()).collect::<Vec<_>>()
     );
-    assert!(crate::tools::pinvou3_blocklist::is_pinvou3_hidden("tool_search_tool_regex"));
-    assert!(crate::tools::pinvou3_blocklist::is_pinvou3_hidden("tool_search_tool_bm25"));
+    assert!(crate::tools::pinvou3_blocklist::is_pinvou3_hidden("tool_search"));
 }
