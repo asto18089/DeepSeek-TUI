@@ -43,7 +43,10 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     "create_goal",
     "get_goal",
     "update_goal",
-    // git（模型用 `exec_shell git ...` 替代；git_status/git_diff 已释放）
+    // git（模型用 `exec_shell git ...` 替代）。2026-07-03 纯办公定位决策:git_status/git_diff 一并
+    // 隐藏(原为代码辅助释放,pinvou3 放弃代码辅助定位后与 log/show/blame 一致全隐藏;需要走 exec_shell git)。
+    "git_status",
+    "git_diff",
     "git_log",
     "git_show",
     "git_blame",
@@ -82,7 +85,9 @@ pub const PINVOU3_HIDDEN_TOOLS: &[&str] = &[
     // 杂项 - 金融数据 + 旧版 web_run（保留 fetch_url）
     "finance",
     "web.run",
-    // 元工具（pinvou3 普通用户场景用不到；diagnostics 已释放）
+    // 元工具（pinvou3 普通用户场景用不到）。2026-07-03:diagnostics 一并隐藏(环境自检=报 workspace/
+    // git 检测/sandbox/Rust 工具链版本,办公用户用不到;代码诊断走自动 post-edit LSP hook,不依赖此工具)。
+    "diagnostics",
     "multi_tool_use.parallel",
     "note",
     "validate_data",
