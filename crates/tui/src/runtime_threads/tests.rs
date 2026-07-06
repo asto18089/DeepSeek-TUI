@@ -2156,6 +2156,7 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
                             message: "auto compact done".to_string(),
                             messages_before: Some(7),
                             messages_after: Some(3),
+                            pruned_bytes: Some(0),
                         })
                         .await;
                     let _ = tx_event
@@ -2188,6 +2189,7 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
                             message: "manual compact done".to_string(),
                             messages_before: Some(5),
                             messages_after: Some(2),
+                            pruned_bytes: Some(0),
                         })
                         .await;
                     let _ = tx_event

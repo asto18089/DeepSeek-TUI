@@ -244,23 +244,20 @@ impl Engine {
                             self.session.messages = result.messages.into();
                             self.merge_compaction_summary(result.summary_prompt);
                             self.emit_session_updated().await;
-                            let removed = auto_messages_before.saturating_sub(auto_messages_after);
-                            let status = if result.retries_used > 0 {
-                                format!(
-                                    "Auto-compaction complete: {auto_messages_before} → {auto_messages_after} messages ({removed} removed, {} retries)",
-                                    result.retries_used
-                                )
-                            } else {
-                                format!(
-                                    "Auto-compaction complete: {auto_messages_before} → {auto_messages_after} messages ({removed} removed)"
-                                )
-                            };
+                            let status = crate::compaction::compaction_status_message(
+                                "Auto-compaction complete",
+                                auto_messages_before,
+                                auto_messages_after,
+                                result.retries_used,
+                                result.pruned_bytes,
+                            );
                             self.emit_compaction_completed(
                                 compaction_id.clone(),
                                 true,
                                 status.clone(),
                                 Some(auto_messages_before),
                                 Some(auto_messages_after),
+                                Some(result.pruned_bytes),
                             )
                             .await;
                             let _ = self.tx_event.send(Event::status(status)).await;

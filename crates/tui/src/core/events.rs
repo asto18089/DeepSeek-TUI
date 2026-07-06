@@ -116,6 +116,9 @@ pub enum Event {
         /// Number of messages after compaction.
         #[allow(dead_code)]
         messages_after: Option<usize>,
+        /// Bytes saved by local tool-result pruning.
+        #[allow(dead_code)]
+        pruned_bytes: Option<usize>,
     },
 
     /// Context purge started.

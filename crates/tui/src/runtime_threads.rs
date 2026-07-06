@@ -2985,6 +2985,7 @@ impl RuntimeThreadManager {
                     message,
                     messages_before,
                     messages_after,
+                    ..
                 } => {
                     if let Some(item_id) = compaction_items.remove(&id) {
                         let mut item = self.store.load_item(&item_id)?;
