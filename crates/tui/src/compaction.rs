@@ -901,52 +901,8 @@ pub struct CompactionResult {
     /// Messages that were removed from the active window
     #[allow(dead_code)]
     pub removed_messages: Vec<Message>,
-    /// Bytes saved by local tool-result pruning before any LLM summary.
-    pub pruned_bytes: usize,
     /// Number of retries used before success
     pub retries_used: u32,
-}
-
-fn format_pruned_bytes(bytes: usize) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else {
-        format!("{:.1} KiB", bytes as f64 / 1024.0)
-    }
-}
-
-pub fn compaction_status_message(
-    prefix: &str,
-    messages_before: usize,
-    messages_after: usize,
-    retries_used: u32,
-    pruned_bytes: usize,
-) -> String {
-    let removed = messages_before.saturating_sub(messages_after);
-    let retry_suffix = if retries_used > 0 {
-        format!(", {retries_used} retries")
-    } else {
-        String::new()
-    };
-
-    if pruned_bytes > 0 && removed == 0 {
-        return format!(
-            "{prefix}: {messages_before} messages unchanged (tool results pruned, {} saved{retry_suffix})",
-            format_pruned_bytes(pruned_bytes)
-        );
-    }
-
-    let prune_suffix = if pruned_bytes > 0 {
-        format!(
-            ", {} saved by tool-result pruning",
-            format_pruned_bytes(pruned_bytes)
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        "{prefix}: {messages_before} → {messages_after} messages ({removed} removed{prune_suffix}{retry_suffix})"
-    )
 }
 
 /// Check if an error is transient and worth retrying. Categories that map to
@@ -1036,7 +992,6 @@ pub async fn compact_messages_safe(
                 messages: pruned_messages,
                 summary_prompt: None,
                 removed_messages: Vec::new(),
-                pruned_bytes,
                 retries_used: 0,
             });
         }
@@ -1069,7 +1024,6 @@ pub async fn compact_messages_safe(
                     messages: msgs,
                     summary_prompt: prompt,
                     removed_messages: removed,
-                    pruned_bytes,
                     retries_used: attempt,
                 });
             }
@@ -2897,34 +2851,12 @@ mod tests {
             messages: vec![],
             summary_prompt: None,
             removed_messages: vec![],
-            pruned_bytes: 0,
             retries_used: 2,
         };
 
         assert_eq!(result.retries_used, 2);
         assert!(result.messages.is_empty());
         assert!(result.removed_messages.is_empty());
-    }
-
-    #[test]
-    fn compaction_status_keeps_existing_removed_message_shape() {
-        let status = compaction_status_message("Auto-compaction complete", 10, 4, 0, 0);
-
-        assert_eq!(
-            status,
-            "Auto-compaction complete: 10 → 4 messages (6 removed)"
-        );
-    }
-
-    #[test]
-    fn compaction_status_reports_local_prune_when_message_count_is_unchanged() {
-        let status = compaction_status_message("Auto-compaction complete", 677, 677, 0, 2048);
-
-        assert_eq!(
-            status,
-            "Auto-compaction complete: 677 messages unchanged (tool results pruned, 2.0 KiB saved)"
-        );
-        assert!(!status.contains("0 removed"));
     }
 
     #[test]

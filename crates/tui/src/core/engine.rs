@@ -25,8 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::DeepSeekClient;
 use crate::compaction::{
-    CompactionConfig, compact_messages_safe, compaction_status_message, merge_system_prompts,
-    should_compact,
+    CompactionConfig, compact_messages_safe, merge_system_prompts, should_compact,
 };
 use crate::config::{ApiProvider, Config, DEFAULT_MAX_SUBAGENTS, DEFAULT_TEXT_MODEL};
 use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, StreamError};
@@ -747,7 +746,6 @@ impl Engine {
         message: String,
         messages_before: Option<usize>,
         messages_after: Option<usize>,
-        pruned_bytes: Option<usize>,
     ) {
         let _ = self
             .tx_event
@@ -757,7 +755,6 @@ impl Engine {
                 message,
                 messages_before,
                 messages_after,
-                pruned_bytes,
             })
             .await;
     }
@@ -2759,20 +2756,23 @@ impl Engine {
                     self.session.messages = result.messages.into();
                     self.merge_compaction_summary(result.summary_prompt);
                     self.emit_session_updated().await;
-                    let message = compaction_status_message(
-                        "Compaction complete",
-                        messages_before,
-                        messages_after,
-                        result.retries_used,
-                        result.pruned_bytes,
-                    );
+                    let removed = messages_before.saturating_sub(messages_after);
+                    let message = if result.retries_used > 0 {
+                        format!(
+                            "Compaction complete: {messages_before} → {messages_after} messages ({removed} removed, {} retries)",
+                            result.retries_used
+                        )
+                    } else {
+                        format!(
+                            "Compaction complete: {messages_before} → {messages_after} messages ({removed} removed)"
+                        )
+                    };
                     self.emit_compaction_completed(
                         id,
                         false,
                         message,
                         Some(messages_before),
                         Some(messages_after),
-                        Some(result.pruned_bytes),
                     )
                     .await;
                 } else {
@@ -2993,7 +2993,6 @@ impl Engine {
                 details.clone(),
                 Some(before_count),
                 Some(after_count),
-                None,
             )
             .await;
             let _ = self.tx_event.send(Event::status(details)).await;
