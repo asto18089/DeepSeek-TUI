@@ -83,13 +83,6 @@ pub struct Session {
     /// state before every subsequent request. None until the first turn.
     pub frozen_prefix: Option<FrozenPrefix>,
 
-    /// [pinvou3-fork] 本 session 是否已做过 cache warmup。首请求前置一次
-    /// `build_cache_warmup_request` 把 `[system][tools]` 冷前缀喂进 vLLM
-    /// prefix-cache，避免首轮冷启动 × mtp 投机解码把工具调用采歪成裸文本
-    /// （实测:首轮漂、问一句自愈)。运行时标志,不持久化(重载 session 也会
-    /// 重新预热)。
-    pub cache_warmup_done: bool,
-
     /// Monotonic counter bumped on every direct mutation of `messages`.
     /// Consumed by [`crate::core::engine::token_estimate_cache::TokenEstimateCache`]
     /// to memoize the per-turn token estimate without re-walking the message
@@ -170,7 +163,6 @@ impl Session {
             working_set: WorkingSet::default(),
             prefix_stability: None,
             frozen_prefix: None,
-            cache_warmup_done: false,
             messages_revision: 0,
         }
     }
