@@ -478,28 +478,6 @@ impl Engine {
             // first call) so we can resend it on a transparent retry below
             // when the wire dies before any content was streamed (#103).
             let stream_request = request;
-            // [pinvou3-fork] 首请求 cache warmup(v2):本 session 第一次发请求前,先用
-            // **完整的本请求前缀(含 system+tools+当前轮 user 消息及其 `<turn_meta>`)**发一个
-            // max_tokens=1、tool_choice=none、响应丢弃的预热请求,把整段冷前缀喂进 vLLM
-            // prefix-cache → 真请求逐字节完整命中 → mtp 投机解码无冷分叉可采歪 → 首轮不再
-            // 把工具调用/`<turn_meta>`/系统指令采歪成裸文本。
-            // ⚠️ v1 曾用 build_cache_warmup_request(剥掉当前轮 user 消息),漏预热 turn_meta
-            //    那个真正的冷分叉点 → 模型在 turn_meta 处复读采歪。v2 连 turn_meta 一起预热,
-            //    精确复刻"用户先问一句即自愈"的手动 warmup。一次性 / 不进 context /
-            //    await 确保预热先于真请求完成;30s 超时防 vLLM 卡死拖垮 turn。
-            if !self.session.cache_warmup_done {
-                self.session.cache_warmup_done = true;
-                let mut warmup = stream_request.clone();
-                warmup.max_tokens = 1;
-                warmup.tool_choice = Some(json!("none"));
-                warmup.stream = None;
-                warmup.temperature = Some(0.0);
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    client.create_message(warmup),
-                )
-                .await;
-            }
             let stream_result = tokio::select! {
                 biased;
                 () = self.cancel_token.cancelled() => {
