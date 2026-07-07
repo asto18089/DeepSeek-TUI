@@ -494,11 +494,17 @@ impl Engine {
                 warmup.tool_choice = Some(json!("none"));
                 warmup.stream = None;
                 warmup.temperature = Some(0.0);
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    client.create_message(warmup),
-                )
-                .await;
+                tokio::select! {
+                    biased;
+                    () = self.cancel_token.cancelled() => {
+                        let _ = self.tx_event.send(Event::status("Request cancelled")).await;
+                        return (TurnOutcomeStatus::Interrupted, None);
+                    }
+                    _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        client.create_message(warmup),
+                    ) => {}
+                }
             }
             let stream_result = tokio::select! {
                 biased;
