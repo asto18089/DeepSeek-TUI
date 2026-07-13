@@ -8,7 +8,7 @@ use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use std::fs;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -19,12 +19,15 @@ impl crate::task_manager::TaskExecutor for MockExecutor {
     async fn execute(
         &self,
         _task: crate::task_manager::ExecutionTask,
-        events: mpsc::UnboundedSender<crate::task_manager::TaskExecutionEvent>,
+        reporter: crate::task_manager::TaskExecutionReporter,
         cancel: tokio_util::sync::CancellationToken,
     ) -> crate::task_manager::TaskExecutionResult {
-        let _ = events.send(crate::task_manager::TaskExecutionEvent::Status {
-            message: "started".to_string(),
-        });
+        reporter
+            .report(crate::task_manager::TaskExecutionEvent::Status {
+                message: "started".to_string(),
+            })
+            .await
+            .expect("persist task status");
         sleep(Duration::from_millis(100)).await;
         if cancel.is_cancelled() {
             return crate::task_manager::TaskExecutionResult {
@@ -1103,6 +1106,81 @@ async fn workspace_and_automation_endpoints_work() -> Result<()> {
         .await?
         .status();
     assert_eq!(missing_status, StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn automation_run_endpoint_reuses_idempotency_key() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let created: serde_json::Value = client
+        .post(format!("http://{addr}/v1/automations"))
+        .json(&json!({
+            "name": "Idempotent automation",
+            "prompt": "run once for one invocation",
+            "rrule": "FREQ=HOURLY;INTERVAL=2",
+            "status": "active"
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let automation_id = created["id"]
+        .as_str()
+        .context("missing automation id")?
+        .to_string();
+    let invocation_id = Uuid::new_v4().to_string();
+    let run_url = format!("http://{addr}/v1/automations/{automation_id}/run");
+
+    let first: serde_json::Value = client
+        .post(&run_url)
+        .header("Idempotency-Key", &invocation_id)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let second: serde_json::Value = client
+        .post(&run_url)
+        .header("idempotency-key", &invocation_id)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    assert_eq!(first["id"], second["id"]);
+    assert_eq!(first["task_id"], second["task_id"]);
+
+    let tasks: serde_json::Value = client
+        .get(format!("http://{addr}/v1/tasks"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        tasks["tasks"]
+            .as_array()
+            .context("tasks should be an array")?
+            .len(),
+        1
+    );
+
+    let runs: serde_json::Value = client
+        .get(format!("http://{addr}/v1/automations/{automation_id}/runs"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(runs.as_array().context("runs should be an array")?.len(), 1);
 
     handle.abort();
     Ok(())

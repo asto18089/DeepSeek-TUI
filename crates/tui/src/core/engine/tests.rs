@@ -1,7 +1,7 @@
 use super::*;
 
 use super::context::{COMPACTION_SUMMARY_MARKER, TURN_MAX_OUTPUT_TOKENS};
-use super::turn_loop::registered_tool_approval_required;
+use super::turn_loop::{registered_tool_approval_force_prompt, registered_tool_approval_required};
 use crate::config::ApiProvider;
 use crate::models::SystemBlock;
 use crate::test_support::lock_test_env;
@@ -528,6 +528,22 @@ fn rlm_eval_required_approval_ignores_generic_auto_approve() {
         "rlm_eval",
         ApprovalRequirement::Required,
         true
+    ));
+}
+
+#[test]
+fn only_non_bypassable_registered_approval_is_marked_force_prompt() {
+    assert!(registered_tool_approval_force_prompt(
+        "rlm_eval",
+        ApprovalRequirement::Required,
+    ));
+    assert!(!registered_tool_approval_force_prompt(
+        "exec_shell",
+        ApprovalRequirement::Required,
+    ));
+    assert!(!registered_tool_approval_force_prompt(
+        "rlm_eval",
+        ApprovalRequirement::Auto,
     ));
 }
 
@@ -2217,6 +2233,156 @@ async fn run_shell_command_op_skips_approval_when_auto_approved() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn yolo_hook_ask_emits_non_bypassable_force_prompt() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = lock_test_env();
+    let workspace = tempdir().expect("tempdir");
+    let hook_output = workspace.path().join("hook-decision.json");
+    std::fs::write(&hook_output, r#"{"decision":"ask"}"#).expect("hook decision");
+    #[cfg(windows)]
+    let hook_command = format!("type \"{}\"", hook_output.display());
+    #[cfg(not(windows))]
+    let hook_command = format!("cat '{}'", hook_output.display());
+    let hook_executor = std::sync::Arc::new(crate::hooks::HookExecutor::new(
+        crate::hooks::HooksConfig {
+            enabled: true,
+            hooks: vec![crate::hooks::Hook::new(
+                crate::hooks::HookEvent::ToolCallBefore,
+                &hook_command,
+            )],
+            working_dir: Some(workspace.path().to_path_buf()),
+            ..crate::hooks::HooksConfig::default()
+        },
+        workspace.path().to_path_buf(),
+    ));
+    let server = MockServer::start().await;
+    let tool_call_sse = concat!(
+        "data: {\"id\":\"chatcmpl-hook\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"call_hook\",\"type\":\"function\",\"function\":{\"name\":\"exec_shell\",",
+        "\"arguments\":\"{\\\"command\\\":\\\"echo hook-force-marker\\\"}\"}}",
+        "]},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-hook\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let done_sse = concat!(
+        "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("denied by user"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(done_sse),
+        )
+        .expect(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(tool_call_sse),
+        )
+        .expect(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let api_config = Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(server.uri()),
+        ..Config::default()
+    };
+    let (engine, handle) = Engine::new(
+        EngineConfig {
+            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            workspace: workspace.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            ..EngineConfig::default()
+        },
+        &api_config,
+    );
+    let run_task = tokio::spawn(engine.run());
+    handle
+        .send(Op::SendMessage {
+            content: "exercise a hook-forced approval".to_string(),
+            mode: AppMode::Yolo,
+            provider: None,
+            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: true,
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: crate::tui::approval::ApprovalMode::Auto,
+            translation_enabled: false,
+            show_thinking: true,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: Some(hook_executor),
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        })
+        .await
+        .expect("send model turn");
+
+    let mut saw_force_prompt = false;
+    let mut saw_denied_tool = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("timed out waiting for engine event")
+    {
+        match event {
+            Event::ApprovalRequired {
+                id,
+                tool_name,
+                approval_force_prompt,
+                ..
+            } => {
+                assert_eq!(tool_name, "exec_shell");
+                assert!(
+                    approval_force_prompt,
+                    "hook ask must be non-bypassable even when auto_approve is true"
+                );
+                saw_force_prompt = true;
+                handle.deny_tool_call(id).await.expect("deny forced prompt");
+            }
+            Event::ToolCallComplete { name, result, .. } if name == "exec_shell" => {
+                saw_denied_tool = true;
+                assert!(result.is_err(), "force-denied tool must not execute");
+            }
+            Event::TurnComplete { status, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(rx);
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+    assert!(saw_force_prompt);
+    assert!(saw_denied_tool);
+}
+
+#[tokio::test]
 async fn yolo_mode_does_not_prompt_for_typed_ask_rule() {
     // #3386: a command matching a typed ask-rule (permissions.toml) must not
     // surface an approval modal in YOLO mode, even though Yolo resolves to
@@ -2622,9 +2788,7 @@ async fn workflow_subagent_submit_output_round_trip_emits_agent_complete() {
     let mut complete: Option<(Option<String>, bool, String)> = None;
     {
         let mut rx = handle.rx_event.write().await;
-        while let Ok(Some(event)) =
-            tokio::time::timeout(Duration::from_secs(20), rx.recv()).await
-        {
+        while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(20), rx.recv()).await {
             match event {
                 Event::AgentSpawned { prompt, .. } => {
                     // 引擎复用 AgentSpawned.prompt 装 role_id 做 agent_id→role 关联(W1)。
@@ -2750,9 +2914,7 @@ async fn workflow_subagent_invalid_output_fails_closed_after_retries() {
     let mut complete: Option<(bool, String)> = None;
     {
         let mut rx = handle.rx_event.write().await;
-        while let Ok(Some(event)) =
-            tokio::time::timeout(Duration::from_secs(20), rx.recv()).await
-        {
+        while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(20), rx.recv()).await {
             if let Event::AgentComplete { failed, result, .. } = event {
                 complete = Some((failed, result));
                 break;
@@ -5593,7 +5755,9 @@ fn forkguard_tool_search_not_injected_blocks_deferred_activation() {
         "tool_search 不应被注入(否则模型可借它激活被 blocklist 的 agent/delegate);catalog={:?}",
         catalog.iter().map(|t| t.name.clone()).collect::<Vec<_>>()
     );
-    assert!(crate::tools::pinvou3_blocklist::is_pinvou3_hidden("tool_search"));
+    assert!(crate::tools::pinvou3_blocklist::is_pinvou3_hidden(
+        "tool_search"
+    ));
 }
 
 #[test]
