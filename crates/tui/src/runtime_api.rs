@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use async_stream::stream;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Html;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -2298,12 +2298,26 @@ async fn delete_automation(
 async fn run_automation(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<AutomationRunRecord>, ApiError> {
     let manager = state.automations.lock().await;
-    let run = manager
-        .run_now(&id, &state.task_manager)
-        .await
-        .map_err(map_automation_err)?;
+    let invocation_id = headers
+        .get("idempotency-key")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ApiError::bad_request("Idempotency-Key must be valid ASCII"))
+        })
+        .transpose()?;
+    let run = match invocation_id {
+        Some(invocation_id) => {
+            manager
+                .run_now_idempotent(&id, invocation_id, &state.task_manager)
+                .await
+        }
+        None => manager.run_now(&id, &state.task_manager).await,
+    }
+    .map_err(map_automation_err)?;
     Ok(Json(run))
 }
 
