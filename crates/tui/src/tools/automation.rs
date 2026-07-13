@@ -29,7 +29,7 @@ impl ToolSpec for AutomationCreateTool {
     }
 
     fn description(&self) -> &'static str {
-        "Create a durable scheduled automation. Creation requires approval and recurrence is constrained to supported MINUTELY/HOURLY/WEEKLY RRULE forms. Runs enqueue normal durable tasks."
+        "Create a durable scheduled automation. Creation requires approval and recurrence is constrained to supported HOURLY/WEEKLY RRULE forms. Runs enqueue normal durable tasks."
     }
 
     fn input_schema(&self) -> Value {
@@ -40,10 +40,9 @@ impl ToolSpec for AutomationCreateTool {
                 "prompt": { "type": "string" },
                 "rrule": {
                     "type": "string",
-                    "description": "Supported: FREQ=MINUTELY;INTERVAL=N, FREQ=HOURLY;INTERVAL=N[;BYDAY=MO,TU], or FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=30"
+                    "description": "Supported: FREQ=HOURLY;INTERVAL=N[;BYDAY=MO,TU] or FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=30"
                 },
                 "cwds": { "type": "array", "items": { "type": "string" } },
-                "model": { "type": "string", "description": "Model name for scheduled runs. Uses the task manager default when omitted." },
                 "mode": { "type": "string", "description": "Task mode for scheduled runs. Defaults to agent when omitted." },
                 "allow_shell": { "type": "boolean", "default": false },
                 "trust_mode": { "type": "boolean", "default": false },
@@ -78,7 +77,6 @@ impl ToolSpec for AutomationCreateTool {
                 .into_iter()
                 .map(PathBuf::from)
                 .collect(),
-            model: optional_str(&input, "model").map(ToString::to_string),
             mode: optional_str(&input, "mode").map(ToString::to_string),
             allow_shell: optional_bool_value(&input, "allow_shell"),
             trust_mode: optional_bool_value(&input, "trust_mode"),
@@ -201,7 +199,6 @@ impl ToolSpec for AutomationUpdateTool {
                 "prompt": { "type": "string" },
                 "rrule": { "type": "string" },
                 "cwds": { "type": "array", "items": { "type": "string" } },
-                "model": { "type": "string", "description": "Model name for scheduled runs." },
                 "mode": { "type": "string", "description": "Task mode for scheduled runs. Defaults to agent when omitted." },
                 "allow_shell": { "type": "boolean" },
                 "trust_mode": { "type": "boolean" },
@@ -246,7 +243,6 @@ impl ToolSpec for AutomationUpdateTool {
             } else {
                 None
             },
-            model: optional_str(&input, "model").map(ToString::to_string),
             mode: optional_str(&input, "mode").map(ToString::to_string),
             allow_shell: optional_bool_value(&input, "allow_shell"),
             trust_mode: optional_bool_value(&input, "trust_mode"),
@@ -329,13 +325,7 @@ impl ToolSpec for AutomationRunTool {
     }
 
     fn input_schema(&self) -> Value {
-        let mut schema = automation_id_schema(true);
-        schema["properties"]["invocation_id"] = json!({
-            "type": "string",
-            "format": "uuid",
-            "description": "Optional stable invocation UUID. Reusing it retries the same durable manual run without creating a duplicate task."
-        });
-        schema
+        automation_id_schema(true)
     }
 
     fn capabilities(&self) -> Vec<ToolCapability> {
@@ -358,16 +348,10 @@ impl ToolSpec for AutomationRunTool {
             .as_ref()
             .ok_or_else(|| ToolError::not_available("TaskManager is not attached"))?;
         let manager = manager.lock().await;
-        let automation_id = required_str(&input, "automation_id")?;
-        let run = match optional_str(&input, "invocation_id") {
-            Some(invocation_id) => {
-                manager
-                    .run_now_idempotent(automation_id, invocation_id, task_manager)
-                    .await
-            }
-            None => manager.run_now(automation_id, task_manager).await,
-        }
-        .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        let run = manager
+            .run_now(required_str(&input, "automation_id")?, task_manager)
+            .await
+            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
         ToolResult::json(&run).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
 }
@@ -407,110 +391,12 @@ fn optional_bool_value(input: &Value, field: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-
-    use crate::automation_manager::AutomationManager;
-    use crate::task_manager::{
-        ExecutionTask, TaskExecutionReporter, TaskExecutionResult, TaskExecutor, TaskManager,
-        TaskManagerConfig, TaskStatus,
-    };
     use crate::tools::spec::ToolSpec;
-    use tokio_util::sync::CancellationToken;
-    use uuid::Uuid;
-
-    struct AutomationToolNoopExecutor;
-
-    #[async_trait]
-    impl TaskExecutor for AutomationToolNoopExecutor {
-        async fn execute(
-            &self,
-            _task: ExecutionTask,
-            _reporter: TaskExecutionReporter,
-            _cancel: CancellationToken,
-        ) -> TaskExecutionResult {
-            TaskExecutionResult {
-                status: TaskStatus::Completed,
-                result_text: Some("done".to_string()),
-                error: None,
-            }
-        }
-    }
-
-    fn task_config(root: PathBuf) -> TaskManagerConfig {
-        TaskManagerConfig {
-            data_dir: root,
-            worker_count: 1,
-            default_workspace: PathBuf::from("."),
-            default_model: "deepseek-v4-flash".to_string(),
-            default_mode: "agent".to_string(),
-            allow_shell: false,
-            trust_mode: false,
-            max_subagents: 1,
-        }
-    }
 
     #[test]
     fn create_schema_exposes_rrule() {
         let schema = AutomationCreateTool.input_schema();
         assert!(schema["properties"]["rrule"].is_object());
-        assert!(schema["properties"]["model"].is_object());
         assert_eq!(schema["required"][0], "name");
-    }
-
-    #[test]
-    fn run_schema_exposes_optional_invocation_id() {
-        let schema = AutomationRunTool.input_schema();
-        assert_eq!(schema["properties"]["invocation_id"]["type"], "string");
-        assert_eq!(schema["properties"]["invocation_id"]["format"], "uuid");
-        assert_eq!(schema["required"], json!(["automation_id"]));
-    }
-
-    #[tokio::test]
-    async fn run_tool_routes_stable_invocation_id_to_idempotent_run() -> anyhow::Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let manager = AutomationManager::open(tempdir.path().join("automations"))?;
-        let automation = manager.create_automation(CreateAutomationRequest {
-            name: "Tool automation".to_string(),
-            prompt: "Run through the tool".to_string(),
-            rrule: "FREQ=HOURLY;INTERVAL=1".to_string(),
-            cwds: Vec::new(),
-            model: None,
-            mode: None,
-            allow_shell: None,
-            trust_mode: None,
-            auto_approve: None,
-            status: Some(AutomationStatus::Paused),
-        })?;
-        let manager = Arc::new(tokio::sync::Mutex::new(manager));
-        let task_manager = TaskManager::start_with_executor(
-            task_config(tempdir.path().join("tasks")),
-            Arc::new(AutomationToolNoopExecutor),
-        )
-        .await?;
-        let mut context = ToolContext::new(tempdir.path());
-        context.runtime.automations = Some(manager.clone());
-        context.runtime.task_manager = Some(task_manager.clone());
-        let invocation_id = Uuid::new_v4().to_string();
-        let input = json!({
-            "automation_id": automation.id,
-            "invocation_id": invocation_id,
-        });
-
-        AutomationRunTool
-            .execute(input.clone(), &context)
-            .await
-            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-        AutomationRunTool
-            .execute(input, &context)
-            .await
-            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-
-        assert_eq!(task_manager.list_tasks(None).await.len(), 1);
-        assert_eq!(
-            manager.lock().await.list_runs(&automation.id, None)?.len(),
-            1
-        );
-        task_manager.shutdown();
-        Ok(())
     }
 }

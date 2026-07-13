@@ -17,8 +17,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use thiserror::Error;
-use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -34,172 +33,7 @@ const DEFAULT_WORKERS: usize = 2;
 const MAX_WORKERS: usize = 8;
 const TIMELINE_SUMMARY_LIMIT: usize = 240;
 const ARTIFACT_THRESHOLD: usize = 1200;
-const CURRENT_TASK_SCHEMA_VERSION: u32 = 3;
-const MAX_TASK_ID_GENERATION_ATTEMPTS: usize = 32;
-const TASK_PERSIST_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-
-type TaskIdGenerator = Arc<dyn Fn() -> String + Send + Sync>;
-
-#[cfg(test)]
-#[derive(Default)]
-struct TestPersistenceProbe {
-    task_writes: std::sync::atomic::AtomicUsize,
-    queue_writes: std::sync::atomic::AtomicUsize,
-    task_writes_by_id: std::sync::Mutex<HashMap<String, usize>>,
-    task_writes_by_status: std::sync::Mutex<HashMap<(String, String), usize>>,
-    artifact_writes_by_id: std::sync::Mutex<HashMap<String, usize>>,
-    fail_next_task_write: std::sync::atomic::AtomicBool,
-    fail_next_queue_write: std::sync::atomic::AtomicBool,
-    block_artifact_writes: std::sync::atomic::AtomicBool,
-    blocked_status: std::sync::Mutex<Option<TaskStatus>>,
-    blocked_timeline_summary: std::sync::Mutex<Option<String>>,
-}
-
-#[cfg(test)]
-impl TestPersistenceProbe {
-    fn before_task_write(&self, task: &TaskRecord) -> Result<()> {
-        self.task_writes
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        *self
-            .task_writes_by_id
-            .lock()
-            .expect("test task write count lock")
-            .entry(task.id.clone())
-            .or_default() += 1;
-        *self
-            .task_writes_by_status
-            .lock()
-            .expect("test task status write count lock")
-            .entry((task.id.clone(), format!("{:?}", task.status)))
-            .or_default() += 1;
-        if self
-            .fail_next_task_write
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            bail!("injected task persistence failure");
-        }
-        if self
-            .blocked_status
-            .lock()
-            .expect("test blocked task status lock")
-            .is_some_and(|status| status == task.status)
-        {
-            bail!("injected {:?} task persistence failure", task.status);
-        }
-        if let Some(summary) = self
-            .blocked_timeline_summary
-            .lock()
-            .expect("test blocked timeline summary lock")
-            .as_ref()
-            && task.timeline.iter().any(|entry| &entry.summary == summary)
-        {
-            bail!("injected task event persistence failure");
-        }
-        Ok(())
-    }
-
-    fn before_queue_write(&self) -> Result<()> {
-        self.queue_writes
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self
-            .fail_next_queue_write
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            bail!("injected queue persistence failure");
-        }
-        Ok(())
-    }
-
-    fn before_artifact_write(&self, task_id: &str) -> Result<()> {
-        *self
-            .artifact_writes_by_id
-            .lock()
-            .expect("test artifact write count lock")
-            .entry(task_id.to_string())
-            .or_default() += 1;
-        if self
-            .block_artifact_writes
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            bail!("injected artifact persistence failure");
-        }
-        Ok(())
-    }
-
-    fn block_status(&self, status: TaskStatus) {
-        *self
-            .blocked_status
-            .lock()
-            .expect("test blocked task status lock") = Some(status);
-    }
-
-    fn unblock_status(&self) {
-        *self
-            .blocked_status
-            .lock()
-            .expect("test blocked task status lock") = None;
-    }
-
-    fn block_timeline_summary(&self, summary: impl Into<String>) {
-        *self
-            .blocked_timeline_summary
-            .lock()
-            .expect("test blocked timeline summary lock") = Some(summary.into());
-    }
-
-    fn unblock_timeline_summary(&self) {
-        *self
-            .blocked_timeline_summary
-            .lock()
-            .expect("test blocked timeline summary lock") = None;
-    }
-
-    fn task_write_count(&self, task_id: &str) -> usize {
-        self.task_writes_by_id
-            .lock()
-            .expect("test task write count lock")
-            .get(task_id)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    fn task_status_write_count(&self, task_id: &str, status: TaskStatus) -> usize {
-        self.task_writes_by_status
-            .lock()
-            .expect("test task status write count lock")
-            .get(&(task_id.to_string(), format!("{status:?}")))
-            .copied()
-            .unwrap_or_default()
-    }
-
-    fn artifact_write_count(&self, task_id: &str) -> usize {
-        self.artifact_writes_by_id
-            .lock()
-            .expect("test artifact write count lock")
-            .get(task_id)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    fn reset_write_counts(&self) {
-        self.task_writes
-            .store(0, std::sync::atomic::Ordering::SeqCst);
-        self.queue_writes
-            .store(0, std::sync::atomic::Ordering::SeqCst);
-        self.task_writes_by_id
-            .lock()
-            .expect("test task write count lock")
-            .clear();
-        self.task_writes_by_status
-            .lock()
-            .expect("test task status write count lock")
-            .clear();
-        self.artifact_writes_by_id
-            .lock()
-            .expect("test artifact write count lock")
-            .clear();
-    }
-}
+const CURRENT_TASK_SCHEMA_VERSION: u32 = 2;
 
 const fn default_task_schema_version() -> u32 {
     CURRENT_TASK_SCHEMA_VERSION
@@ -217,6 +51,7 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
+    #[cfg(test)]
     #[must_use]
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Canceled)
@@ -356,8 +191,6 @@ pub struct TaskRecord {
     pub trust_mode: bool,
     #[serde(default = "default_auto_approve")]
     pub auto_approve: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idempotency_key: Option<String>,
     pub status: TaskStatus,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
@@ -520,54 +353,9 @@ pub struct ExecutionTask {
     auto_approve: bool,
 }
 
-impl ExecutionTask {
-    #[must_use]
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    #[must_use]
-    pub fn prompt(&self) -> &str {
-        &self.prompt
-    }
-
-    #[must_use]
-    pub fn model(&self) -> &str {
-        &self.model
-    }
-
-    #[must_use]
-    pub fn workspace(&self) -> &Path {
-        &self.workspace
-    }
-
-    #[must_use]
-    pub fn mode_label(&self) -> &str {
-        &self.mode_label
-    }
-
-    #[must_use]
-    pub const fn allow_shell(&self) -> bool {
-        self.allow_shell
-    }
-
-    #[must_use]
-    pub const fn trust_mode(&self) -> bool {
-        self.trust_mode
-    }
-
-    #[must_use]
-    pub const fn auto_approve(&self) -> bool {
-        self.auto_approve
-    }
-}
-
 /// Event stream produced by an executor while a task runs.
 #[derive(Debug, Clone)]
 pub enum TaskExecutionEvent {
-    ThreadCreated {
-        thread_id: String,
-    },
     ThreadLinked {
         thread_id: String,
         turn_id: String,
@@ -604,73 +392,6 @@ pub enum TaskExecutionEvent {
     },
 }
 
-#[derive(Debug)]
-struct PendingTaskExecutionEvent {
-    event: TaskExecutionEvent,
-    ack: oneshot::Sender<std::result::Result<(), String>>,
-}
-
-/// Durable event reporter passed to task executors.
-///
-/// Every report completes only after the task manager has applied and persisted
-/// the event. Executors can therefore order critical runtime work after the
-/// durable acknowledgement instead of relying on fire-and-forget delivery.
-#[derive(Clone)]
-pub struct TaskExecutionReporter {
-    tx: mpsc::UnboundedSender<PendingTaskExecutionEvent>,
-    cancel: CancellationToken,
-}
-
-impl std::fmt::Debug for TaskExecutionReporter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TaskExecutionReporter")
-            .finish_non_exhaustive()
-    }
-}
-
-impl TaskExecutionReporter {
-    fn new(
-        tx: mpsc::UnboundedSender<PendingTaskExecutionEvent>,
-        cancel: CancellationToken,
-    ) -> Self {
-        Self { tx, cancel }
-    }
-
-    /// Report an executor event and wait for its durable TaskManager ack.
-    pub async fn report(
-        &self,
-        event: TaskExecutionEvent,
-    ) -> std::result::Result<(), TaskExecutionReportError> {
-        let (ack_tx, ack_rx) = oneshot::channel();
-        let outcome = match self
-            .tx
-            .send(PendingTaskExecutionEvent { event, ack: ack_tx })
-        {
-            Ok(()) => match ack_rx.await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(message)) => Err(TaskExecutionReportError::Rejected(message)),
-                Err(_) => Err(TaskExecutionReportError::AcknowledgementDropped),
-            },
-            Err(_) => Err(TaskExecutionReportError::Closed),
-        };
-        if outcome.is_err() {
-            self.cancel.cancel();
-        }
-        outcome
-    }
-}
-
-/// Failure to durably report an executor event.
-#[derive(Debug, Clone, Error, PartialEq, Eq)]
-pub enum TaskExecutionReportError {
-    #[error("task execution reporter is closed")]
-    Closed,
-    #[error("task execution event acknowledgement was dropped")]
-    AcknowledgementDropped,
-    #[error("task execution event persistence failed: {0}")]
-    Rejected(String),
-}
-
 /// Final executor result.
 #[derive(Debug, Clone)]
 pub struct TaskExecutionResult {
@@ -679,384 +400,15 @@ pub struct TaskExecutionResult {
     pub error: Option<String>,
 }
 
-impl TaskExecutionResult {
-    fn reporting_failed(error: TaskExecutionReportError, captured_text: &str) -> Self {
-        Self {
-            status: TaskStatus::Failed,
-            result_text: (!captured_text.trim().is_empty()).then(|| captured_text.to_string()),
-            error: Some(format!("Failed to persist task execution event: {error}")),
-        }
-    }
-}
-
 /// Abstraction for task execution.
 #[async_trait]
 pub trait TaskExecutor: Send + Sync {
     async fn execute(
         &self,
         task: ExecutionTask,
-        reporter: TaskExecutionReporter,
+        events: mpsc::UnboundedSender<TaskExecutionEvent>,
         cancel: CancellationToken,
     ) -> TaskExecutionResult;
-}
-
-#[async_trait]
-trait TaskTurnRuntime: Send + Sync {
-    fn events_since(
-        &self,
-        thread_id: &str,
-        since_seq: Option<u64>,
-    ) -> Result<Vec<crate::runtime_threads::RuntimeEventRecord>>;
-
-    async fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> Result<()>;
-}
-
-#[async_trait]
-impl TaskTurnRuntime for RuntimeThreadManager {
-    fn events_since(
-        &self,
-        thread_id: &str,
-        since_seq: Option<u64>,
-    ) -> Result<Vec<crate::runtime_threads::RuntimeEventRecord>> {
-        RuntimeThreadManager::events_since(self, thread_id, since_seq)
-    }
-
-    async fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> Result<()> {
-        RuntimeThreadManager::interrupt_turn(self, thread_id, turn_id)
-            .await
-            .map(|_| ())
-    }
-}
-
-enum ActiveTurnExit {
-    Terminal(TaskExecutionResult),
-    Abort(TaskExecutionResult),
-}
-
-async fn interrupt_active_turn_once(
-    runtime: &dyn TaskTurnRuntime,
-    thread_id: &str,
-    turn_id: &str,
-    interrupt_requested: &mut bool,
-) {
-    if *interrupt_requested {
-        return;
-    }
-    *interrupt_requested = true;
-    if let Err(err) = runtime.interrupt_turn(thread_id, turn_id).await {
-        tracing::warn!("Failed to interrupt runtime thread {thread_id} turn {turn_id}: {err}");
-    }
-}
-
-async fn drive_active_turn(
-    runtime: &dyn TaskTurnRuntime,
-    task_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-    reporter: &TaskExecutionReporter,
-    cancel: &CancellationToken,
-) -> TaskExecutionResult {
-    let mut interrupt_requested = false;
-    let exit = drive_active_turn_inner(
-        runtime,
-        task_id,
-        thread_id,
-        turn_id,
-        reporter,
-        cancel,
-        &mut interrupt_requested,
-    )
-    .await;
-    match exit {
-        ActiveTurnExit::Terminal(result) => result,
-        ActiveTurnExit::Abort(result) => {
-            interrupt_active_turn_once(runtime, thread_id, turn_id, &mut interrupt_requested).await;
-            result
-        }
-    }
-}
-
-async fn drive_active_turn_inner(
-    runtime: &dyn TaskTurnRuntime,
-    task_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-    reporter: &TaskExecutionReporter,
-    cancel: &CancellationToken,
-    interrupt_requested: &mut bool,
-) -> ActiveTurnExit {
-    if let Err(err) = reporter
-        .report(TaskExecutionEvent::ThreadLinked {
-            thread_id: thread_id.to_string(),
-            turn_id: turn_id.to_string(),
-        })
-        .await
-    {
-        return ActiveTurnExit::Abort(TaskExecutionResult::reporting_failed(err, ""));
-    }
-    if let Err(err) = reporter
-        .report(TaskExecutionEvent::Status {
-            message: format!("Task {task_id} started"),
-        })
-        .await
-    {
-        return ActiveTurnExit::Abort(TaskExecutionResult::reporting_failed(err, ""));
-    }
-
-    let mut final_text = String::new();
-    let mut seen_seq = 0u64;
-    let mut terminal_status: Option<RuntimeTurnStatus> = None;
-    let mut terminal_error: Option<String> = None;
-
-    loop {
-        if cancel.is_cancelled() && !*interrupt_requested {
-            interrupt_active_turn_once(runtime, thread_id, turn_id, interrupt_requested).await;
-            if let Err(err) = reporter
-                .report(TaskExecutionEvent::Status {
-                    message: "Cancellation requested".to_string(),
-                })
-                .await
-            {
-                return ActiveTurnExit::Abort(TaskExecutionResult::reporting_failed(
-                    err,
-                    &final_text,
-                ));
-            }
-        }
-
-        let batch = match runtime.events_since(thread_id, Some(seen_seq)) {
-            Ok(batch) => batch,
-            Err(err) => {
-                return ActiveTurnExit::Abort(TaskExecutionResult {
-                    status: TaskStatus::Failed,
-                    result_text: if final_text.trim().is_empty() {
-                        None
-                    } else {
-                        Some(final_text)
-                    },
-                    error: Some(format!("Failed to read runtime events: {err}")),
-                });
-            }
-        };
-
-        for event in batch {
-            seen_seq = seen_seq.max(event.seq);
-            if let Err(err) = reporter
-                .report(TaskExecutionEvent::RuntimeEvent {
-                    seq: event.seq,
-                    event: event.event.clone(),
-                    summary: summarize_text(&event.payload.to_string(), TIMELINE_SUMMARY_LIMIT),
-                })
-                .await
-            {
-                return ActiveTurnExit::Abort(TaskExecutionResult::reporting_failed(
-                    err,
-                    &final_text,
-                ));
-            }
-
-            match event.event.as_str() {
-                "item.delta" => {
-                    let kind = event
-                        .payload
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if kind == "agent_message" {
-                        if let Some(content) = event.payload.get("delta").and_then(Value::as_str) {
-                            final_text.push_str(content);
-                            if let Err(err) = reporter
-                                .report(TaskExecutionEvent::MessageDelta {
-                                    content: content.to_string(),
-                                })
-                                .await
-                            {
-                                return ActiveTurnExit::Abort(
-                                    TaskExecutionResult::reporting_failed(err, &final_text),
-                                );
-                            }
-                        }
-                    } else if kind == "tool_call" {
-                        let output = event
-                            .payload
-                            .get("delta")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        if let Err(err) = reporter
-                            .report(TaskExecutionEvent::ToolProgress {
-                                id: event.item_id.clone().unwrap_or_default(),
-                                output,
-                            })
-                            .await
-                        {
-                            return ActiveTurnExit::Abort(TaskExecutionResult::reporting_failed(
-                                err,
-                                &final_text,
-                            ));
-                        }
-                    }
-                }
-                "item.started" => {
-                    if let Some(tool) = event.payload.get("tool") {
-                        let id = tool
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        let name = tool
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        let input = tool.get("input").cloned().unwrap_or_else(|| json!({}));
-                        if let Err(err) = reporter
-                            .report(TaskExecutionEvent::ToolStarted { id, name, input })
-                            .await
-                        {
-                            return ActiveTurnExit::Abort(TaskExecutionResult::reporting_failed(
-                                err,
-                                &final_text,
-                            ));
-                        }
-                    }
-                }
-                "item.completed" | "item.failed" => {
-                    if let Some(item) = event.payload.get("item") {
-                        let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
-                        if kind == "tool_call"
-                            || kind == "file_change"
-                            || kind == "command_execution"
-                        {
-                            let id = item
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string();
-                            let name = item
-                                .get("summary")
-                                .and_then(Value::as_str)
-                                .unwrap_or("tool")
-                                .split(':')
-                                .next()
-                                .unwrap_or("tool")
-                                .trim()
-                                .to_string();
-                            let output = item
-                                .get("detail")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string();
-                            let metadata = item.get("metadata").cloned();
-                            if let Err(err) = reporter
-                                .report(TaskExecutionEvent::ToolCompleted {
-                                    id,
-                                    name,
-                                    success: event.event == "item.completed",
-                                    output,
-                                    metadata,
-                                })
-                                .await
-                            {
-                                return ActiveTurnExit::Abort(
-                                    TaskExecutionResult::reporting_failed(err, &final_text),
-                                );
-                            }
-                        } else if kind == "status" {
-                            let message = item
-                                .get("detail")
-                                .and_then(Value::as_str)
-                                .or_else(|| item.get("summary").and_then(Value::as_str))
-                                .unwrap_or_default()
-                                .to_string();
-                            if let Err(err) = reporter
-                                .report(TaskExecutionEvent::Status { message })
-                                .await
-                            {
-                                return ActiveTurnExit::Abort(
-                                    TaskExecutionResult::reporting_failed(err, &final_text),
-                                );
-                            }
-                        } else if kind == "error" {
-                            let message = item
-                                .get("detail")
-                                .and_then(Value::as_str)
-                                .or_else(|| item.get("summary").and_then(Value::as_str))
-                                .unwrap_or_default()
-                                .to_string();
-                            if let Err(err) =
-                                reporter.report(TaskExecutionEvent::Error { message }).await
-                            {
-                                return ActiveTurnExit::Abort(
-                                    TaskExecutionResult::reporting_failed(err, &final_text),
-                                );
-                            }
-                        }
-                    }
-                }
-                "turn.completed" => {
-                    if let Some(turn_payload) = event.payload.get("turn") {
-                        let status = turn_payload
-                            .get("status")
-                            .and_then(Value::as_str)
-                            .unwrap_or("failed");
-                        terminal_status = Some(match status {
-                            "completed" => RuntimeTurnStatus::Completed,
-                            "interrupted" => RuntimeTurnStatus::Interrupted,
-                            "canceled" => RuntimeTurnStatus::Canceled,
-                            _ => RuntimeTurnStatus::Failed,
-                        });
-                        terminal_error = turn_payload
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .map(ToString::to_string);
-                    } else {
-                        terminal_status = Some(RuntimeTurnStatus::Completed);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if terminal_status.is_some() {
-            break;
-        }
-
-        sleep(Duration::from_millis(40)).await;
-    }
-
-    let result = match terminal_status.unwrap_or(RuntimeTurnStatus::Failed) {
-        RuntimeTurnStatus::Completed => TaskExecutionResult {
-            status: TaskStatus::Completed,
-            result_text: if final_text.trim().is_empty() {
-                None
-            } else {
-                Some(final_text)
-            },
-            error: None,
-        },
-        RuntimeTurnStatus::Interrupted | RuntimeTurnStatus::Canceled => TaskExecutionResult {
-            status: TaskStatus::Canceled,
-            result_text: if final_text.trim().is_empty() {
-                None
-            } else {
-                Some(final_text)
-            },
-            error: None,
-        },
-        RuntimeTurnStatus::Queued | RuntimeTurnStatus::InProgress | RuntimeTurnStatus::Failed => {
-            TaskExecutionResult {
-                status: TaskStatus::Failed,
-                result_text: if final_text.trim().is_empty() {
-                    None
-                } else {
-                    Some(final_text)
-                },
-                error: terminal_error.or_else(|| Some("Task ended unexpectedly".to_string())),
-            }
-        }
-    };
-    ActiveTurnExit::Terminal(result)
 }
 
 /// Engine-backed executor (DeepSeek-only).
@@ -1076,7 +428,7 @@ impl TaskExecutor for EngineTaskExecutor {
     async fn execute(
         &self,
         task: ExecutionTask,
-        reporter: TaskExecutionReporter,
+        events: mpsc::UnboundedSender<TaskExecutionEvent>,
         cancel: CancellationToken,
     ) -> TaskExecutionResult {
         let thread = match self
@@ -1105,15 +457,6 @@ impl TaskExecutor for EngineTaskExecutor {
             }
         };
 
-        if let Err(err) = reporter
-            .report(TaskExecutionEvent::ThreadCreated {
-                thread_id: thread.id.clone(),
-            })
-            .await
-        {
-            return TaskExecutionResult::reporting_failed(err, "");
-        }
-
         let turn = match self
             .runtime_threads
             .start_turn(
@@ -1141,15 +484,219 @@ impl TaskExecutor for EngineTaskExecutor {
             }
         };
 
-        drive_active_turn(
-            self.runtime_threads.as_ref(),
-            &task.id,
-            &thread.id,
-            &turn.id,
-            &reporter,
-            &cancel,
-        )
-        .await
+        let _ = events.send(TaskExecutionEvent::ThreadLinked {
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+        });
+        let _ = events.send(TaskExecutionEvent::Status {
+            message: format!("Task {} started", task.id),
+        });
+
+        let mut final_text = String::new();
+        let mut seen_seq = 0u64;
+        let mut cancel_requested = false;
+        let mut terminal_status: Option<RuntimeTurnStatus> = None;
+        let mut terminal_error: Option<String> = None;
+
+        loop {
+            if cancel.is_cancelled() && !cancel_requested {
+                cancel_requested = true;
+                let _ = self
+                    .runtime_threads
+                    .interrupt_turn(&thread.id, &turn.id)
+                    .await;
+                let _ = events.send(TaskExecutionEvent::Status {
+                    message: "Cancellation requested".to_string(),
+                });
+            }
+
+            let batch = match self
+                .runtime_threads
+                .events_since(&thread.id, Some(seen_seq))
+            {
+                Ok(batch) => batch,
+                Err(err) => {
+                    return TaskExecutionResult {
+                        status: TaskStatus::Failed,
+                        result_text: if final_text.trim().is_empty() {
+                            None
+                        } else {
+                            Some(final_text)
+                        },
+                        error: Some(format!("Failed to read runtime events: {err}")),
+                    };
+                }
+            };
+
+            for event in batch {
+                seen_seq = seen_seq.max(event.seq);
+                let _ = events.send(TaskExecutionEvent::RuntimeEvent {
+                    seq: event.seq,
+                    event: event.event.clone(),
+                    summary: summarize_text(&event.payload.to_string(), TIMELINE_SUMMARY_LIMIT),
+                });
+
+                match event.event.as_str() {
+                    "item.delta" => {
+                        let kind = event
+                            .payload
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if kind == "agent_message" {
+                            if let Some(content) =
+                                event.payload.get("delta").and_then(Value::as_str)
+                            {
+                                final_text.push_str(content);
+                                let _ = events.send(TaskExecutionEvent::MessageDelta {
+                                    content: content.to_string(),
+                                });
+                            }
+                        } else if kind == "tool_call" {
+                            let output = event
+                                .payload
+                                .get("delta")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let _ = events.send(TaskExecutionEvent::ToolProgress {
+                                id: event.item_id.clone().unwrap_or_default(),
+                                output,
+                            });
+                        }
+                    }
+                    "item.started" => {
+                        if let Some(tool) = event.payload.get("tool") {
+                            let id = tool
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let name = tool
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let input = tool.get("input").cloned().unwrap_or_else(|| json!({}));
+                            let _ =
+                                events.send(TaskExecutionEvent::ToolStarted { id, name, input });
+                        }
+                    }
+                    "item.completed" | "item.failed" => {
+                        if let Some(item) = event.payload.get("item") {
+                            let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
+                            if kind == "tool_call"
+                                || kind == "file_change"
+                                || kind == "command_execution"
+                            {
+                                let id = item
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let name = item
+                                    .get("summary")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("tool")
+                                    .split(':')
+                                    .next()
+                                    .unwrap_or("tool")
+                                    .trim()
+                                    .to_string();
+                                let output = item
+                                    .get("detail")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let metadata = item.get("metadata").cloned();
+                                let _ = events.send(TaskExecutionEvent::ToolCompleted {
+                                    id,
+                                    name,
+                                    success: event.event == "item.completed",
+                                    output,
+                                    metadata,
+                                });
+                            } else if kind == "status" {
+                                let message = item
+                                    .get("detail")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| item.get("summary").and_then(Value::as_str))
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let _ = events.send(TaskExecutionEvent::Status { message });
+                            } else if kind == "error" {
+                                let message = item
+                                    .get("detail")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| item.get("summary").and_then(Value::as_str))
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let _ = events.send(TaskExecutionEvent::Error { message });
+                            }
+                        }
+                    }
+                    "turn.completed" => {
+                        if let Some(turn_payload) = event.payload.get("turn") {
+                            let status = turn_payload
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .unwrap_or("failed");
+                            terminal_status = Some(match status {
+                                "completed" => RuntimeTurnStatus::Completed,
+                                "interrupted" => RuntimeTurnStatus::Interrupted,
+                                "canceled" => RuntimeTurnStatus::Canceled,
+                                _ => RuntimeTurnStatus::Failed,
+                            });
+                            terminal_error = turn_payload
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string);
+                        } else {
+                            terminal_status = Some(RuntimeTurnStatus::Completed);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if terminal_status.is_some() {
+                break;
+            }
+
+            sleep(Duration::from_millis(40)).await;
+        }
+
+        match terminal_status.unwrap_or(RuntimeTurnStatus::Failed) {
+            RuntimeTurnStatus::Completed => TaskExecutionResult {
+                status: TaskStatus::Completed,
+                result_text: if final_text.trim().is_empty() {
+                    None
+                } else {
+                    Some(final_text)
+                },
+                error: None,
+            },
+            RuntimeTurnStatus::Interrupted | RuntimeTurnStatus::Canceled => TaskExecutionResult {
+                status: TaskStatus::Canceled,
+                result_text: if final_text.trim().is_empty() {
+                    None
+                } else {
+                    Some(final_text)
+                },
+                error: None,
+            },
+            RuntimeTurnStatus::Queued
+            | RuntimeTurnStatus::InProgress
+            | RuntimeTurnStatus::Failed => TaskExecutionResult {
+                status: TaskStatus::Failed,
+                result_text: if final_text.trim().is_empty() {
+                    None
+                } else {
+                    Some(final_text)
+                },
+                error: terminal_error.or_else(|| Some("Task ended unexpectedly".to_string())),
+            },
+        }
     }
 }
 
@@ -1160,13 +707,10 @@ pub struct TaskManager {
     cfg: TaskManagerConfig,
     default_workspace: Mutex<PathBuf>,
     executor: Arc<dyn TaskExecutor>,
-    task_id_generator: TaskIdGenerator,
     tasks_dir: PathBuf,
     artifacts_dir: PathBuf,
     queue_path: PathBuf,
     state: Mutex<ManagerState>,
-    #[cfg(test)]
-    persistence_probe: std::sync::Mutex<Option<Arc<TestPersistenceProbe>>>,
     notify: Notify,
     cancel_token: CancellationToken,
 }
@@ -1174,14 +718,7 @@ pub struct TaskManager {
 struct ManagerState {
     tasks: HashMap<String, TaskRecord>,
     queue: VecDeque<String>,
-    idempotency_index: HashMap<String, String>,
     running_cancel: HashMap<String, CancellationToken>,
-}
-
-enum WorkerStep {
-    Wait,
-    Retry,
-    Execute(String, ExecutionTask, CancellationToken),
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -1218,28 +755,6 @@ impl TaskManager {
         cfg: TaskManagerConfig,
         executor: Arc<dyn TaskExecutor>,
     ) -> Result<SharedTaskManager> {
-        Self::start_with_executor_inner(
-            cfg,
-            executor,
-            Arc::new(|| format!("task_{}", Uuid::new_v4())),
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    async fn start_with_executor_and_id_generator(
-        cfg: TaskManagerConfig,
-        executor: Arc<dyn TaskExecutor>,
-        task_id_generator: TaskIdGenerator,
-    ) -> Result<SharedTaskManager> {
-        Self::start_with_executor_inner(cfg, executor, task_id_generator).await
-    }
-
-    async fn start_with_executor_inner(
-        cfg: TaskManagerConfig,
-        executor: Arc<dyn TaskExecutor>,
-        task_id_generator: TaskIdGenerator,
-    ) -> Result<SharedTaskManager> {
         let workers = cfg.worker_count.clamp(1, MAX_WORKERS);
         let tasks_dir = cfg.data_dir.join("tasks");
         let artifacts_dir = cfg.data_dir.join("artifacts");
@@ -1253,10 +768,7 @@ impl TaskManager {
             )
         })?;
 
-        recover_pending_task_prunes(&tasks_dir, &artifacts_dir)?;
-
         let (tasks, queue) = load_state(&tasks_dir, &queue_path)?;
-        let idempotency_index = build_idempotency_index(&tasks)?;
 
         let cancel_token = CancellationToken::new();
         let default_workspace = cfg.default_workspace.clone();
@@ -1264,27 +776,21 @@ impl TaskManager {
             cfg,
             default_workspace: Mutex::new(default_workspace),
             executor,
-            task_id_generator,
             tasks_dir,
             artifacts_dir,
             queue_path,
             state: Mutex::new(ManagerState {
                 tasks,
                 queue,
-                idempotency_index,
                 running_cancel: HashMap::new(),
             }),
-            #[cfg(test)]
-            persistence_probe: std::sync::Mutex::new(None),
             notify: Notify::new(),
             cancel_token: cancel_token.clone(),
         });
 
         {
             let state = manager.state.lock().await;
-            if let Err(err) = manager.persist_queue_locked(&state.queue) {
-                tracing::warn!("Failed to refresh task queue cache during startup: {err}");
-            }
+            manager.persist_all_locked(&state)?;
         }
 
         for _ in 0..workers {
@@ -1306,14 +812,6 @@ impl TaskManager {
         self.cancel_token.cancel();
     }
 
-    #[cfg(test)]
-    fn install_persistence_probe(&self, probe: Arc<TestPersistenceProbe>) {
-        *self
-            .persistence_probe
-            .lock()
-            .expect("test persistence probe lock") = Some(probe);
-    }
-
     #[allow(dead_code)] // Public API for external callers
     pub fn is_shutdown(&self) -> bool {
         self.cancel_token.is_cancelled()
@@ -1330,83 +828,28 @@ impl TaskManager {
 
     /// Enqueue a new task.
     pub async fn add_task(&self, req: NewTaskRequest) -> Result<TaskRecord> {
-        self.add_task_inner(req, None).await
-    }
-
-    /// Enqueue a task once for a caller-supplied durable idempotency key.
-    ///
-    /// A repeated key returns the existing durable task, including after the
-    /// manager has reopened its on-disk state.
-    pub async fn add_task_with_idempotency_key(
-        &self,
-        req: NewTaskRequest,
-        idempotency_key: impl Into<String>,
-    ) -> Result<TaskRecord> {
-        let idempotency_key = normalize_idempotency_key(idempotency_key.into())?;
-        self.add_task_inner(req, Some(idempotency_key)).await
-    }
-
-    async fn add_task_inner(
-        &self,
-        req: NewTaskRequest,
-        idempotency_key: Option<String>,
-    ) -> Result<TaskRecord> {
         let prompt = req.prompt.trim().to_string();
         if prompt.is_empty() {
             bail!("Task prompt cannot be empty");
         }
-        let mode = normalize_task_mode(req.mode.unwrap_or_else(|| self.cfg.default_mode.clone()))?;
-        let model = req.model.unwrap_or_else(|| self.cfg.default_model.clone());
-        let workspace = match req.workspace {
-            Some(workspace) => workspace,
-            None => self.default_workspace().await,
-        };
-        let allow_shell = req.allow_shell.unwrap_or(self.cfg.allow_shell);
-        let trust_mode = req.trust_mode.unwrap_or(self.cfg.trust_mode);
-        // Auto-approval must be opted into explicitly
-        // (GHSA-72w5-pf8h-xfp4).
-        let auto_approve = req.auto_approve.unwrap_or(false);
 
-        let mut state = self.state.lock().await;
-        if let Some(key) = idempotency_key.as_deref()
-            && let Some(existing_id) = state.idempotency_index.get(key)
-        {
-            let existing = state
-                .tasks
-                .get(existing_id)
-                .ok_or_else(|| {
-                    anyhow!("Task idempotency index points to missing task {existing_id}")
-                })?
-                .clone();
-            let should_notify = existing.status == TaskStatus::Queued;
-            drop(state);
-            if should_notify {
-                self.notify.notify_one();
-            }
-            return Ok(existing);
-        }
-
-        let id = (0..MAX_TASK_ID_GENERATION_ATTEMPTS)
-            .find_map(|_| {
-                let candidate = (self.task_id_generator)();
-                (!state.tasks.contains_key(&candidate)).then_some(candidate)
-            })
-            .ok_or_else(|| anyhow!("Failed to generate a unique task id"))?;
-        ensure_safe_storage_id("task id", &id)?;
-        let now = Utc::now();
         let task = TaskRecord {
             schema_version: CURRENT_TASK_SCHEMA_VERSION,
-            id,
+            id: format!("task_{}", &Uuid::new_v4().to_string()[..8]),
             prompt,
-            model,
-            workspace,
-            mode,
-            allow_shell,
-            trust_mode,
-            auto_approve,
-            idempotency_key: idempotency_key.clone(),
+            model: req.model.unwrap_or_else(|| self.cfg.default_model.clone()),
+            workspace: match req.workspace {
+                Some(workspace) => workspace,
+                None => self.default_workspace().await,
+            },
+            mode: req.mode.unwrap_or_else(|| self.cfg.default_mode.clone()),
+            allow_shell: req.allow_shell.unwrap_or(self.cfg.allow_shell),
+            trust_mode: req.trust_mode.unwrap_or(self.cfg.trust_mode),
+            // Auto-approval must be opted into explicitly
+            // (GHSA-72w5-pf8h-xfp4).
+            auto_approve: req.auto_approve.unwrap_or(false),
             status: TaskStatus::Queued,
-            created_at: now,
+            created_at: Utc::now(),
             started_at: None,
             ended_at: None,
             duration_ms: None,
@@ -1423,26 +866,19 @@ impl TaskManager {
             github_events: Vec::new(),
             tool_calls: Vec::new(),
             timeline: vec![TaskTimelineEntry {
-                timestamp: now,
+                timestamp: Utc::now(),
                 kind: "queued".to_string(),
                 summary: "Task queued".to_string(),
                 detail_path: None,
             }],
         };
 
-        self.persist_task_locked(&task)?;
-        state.tasks.insert(task.id.clone(), task.clone());
-        state.queue.push_back(task.id.clone());
-        if let Some(key) = idempotency_key {
-            state.idempotency_index.insert(key, task.id.clone());
+        {
+            let mut state = self.state.lock().await;
+            state.queue.push_back(task.id.clone());
+            state.tasks.insert(task.id.clone(), task.clone());
+            self.persist_all_locked(&state)?;
         }
-        if let Err(err) = self.persist_queue_locked(&state.queue) {
-            tracing::warn!(
-                "Failed to persist task queue cache after adding {}: {err}",
-                task.id
-            );
-        }
-        drop(state);
         self.notify.notify_one();
         Ok(task)
     }
@@ -1462,64 +898,6 @@ impl TaskManager {
         items
     }
 
-    /// Return the in-memory task count without cloning or sorting records.
-    pub async fn task_count(&self) -> usize {
-        self.state.lock().await.tasks.len()
-    }
-
-    /// Permanently remove unprotected terminal tasks and their artifacts.
-    ///
-    /// Queued and running tasks are never candidates. Callers must include
-    /// task ids referenced by any external durable journal (for example an
-    /// automation pending-enqueue record) in `protected_task_ids`.
-    pub async fn prune_terminal_tasks(
-        &self,
-        protected_task_ids: &HashSet<String>,
-    ) -> Result<Vec<String>> {
-        let mut state = self.state.lock().await;
-        let mut candidates = state
-            .tasks
-            .values()
-            .filter(|task| {
-                task.status.is_terminal() && !protected_task_ids.contains(task.id.as_str())
-            })
-            .map(|task| task.id.clone())
-            .collect::<Vec<_>>();
-        candidates.sort();
-
-        let mut pruned = Vec::with_capacity(candidates.len());
-        for task_id in candidates {
-            ensure_safe_storage_id("task id", &task_id)?;
-            let marker = persist_task_prune_marker(&self.tasks_dir, &task_id)?;
-            let artifact_dir = self.artifacts_dir.join(&task_id);
-            remove_dir_all_if_exists(&artifact_dir).with_context(|| {
-                format!("Failed to prune task artifacts {}", artifact_dir.display())
-            })?;
-            let task_path = self.tasks_dir.join(format!("{task_id}.json"));
-            remove_file_if_exists(&task_path)
-                .with_context(|| format!("Failed to prune task file {}", task_path.display()))?;
-
-            state.tasks.remove(&task_id);
-            state.queue.retain(|queued_id| queued_id != &task_id);
-            state.running_cancel.remove(&task_id);
-            state
-                .idempotency_index
-                .retain(|_, indexed_task_id| indexed_task_id != &task_id);
-            pruned.push(task_id);
-
-            if let Err(err) = remove_file_if_exists(&marker) {
-                tracing::warn!(path = %marker.display(), error = %err, "failed to clear completed task prune marker");
-            }
-        }
-
-        if !pruned.is_empty()
-            && let Err(err) = self.persist_queue_locked(&state.queue)
-        {
-            tracing::warn!(error = %err, "failed to refresh queue cache after task pruning");
-        }
-        Ok(pruned)
-    }
-
     /// Retrieve a task by full id or prefix.
     pub async fn get_task(&self, id_or_prefix: &str) -> Result<TaskRecord> {
         let state = self.state.lock().await;
@@ -1535,52 +913,50 @@ impl TaskManager {
     pub async fn cancel_task(&self, id_or_prefix: &str) -> Result<TaskRecord> {
         let mut state = self.state.lock().await;
         let id = resolve_task_id(&state.tasks, id_or_prefix)?;
-        let mut candidate = state
+        let now = Utc::now();
+
+        let mut cancel_running = false;
+        {
+            let task = state
+                .tasks
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("Task not found: {id}"))?;
+            match task.status {
+                TaskStatus::Queued => {
+                    task.status = TaskStatus::Canceled;
+                    task.ended_at = Some(now);
+                    task.duration_ms = Some(0);
+                    task.timeline.push(TaskTimelineEntry {
+                        timestamp: now,
+                        kind: "canceled".to_string(),
+                        summary: "Task canceled before execution".to_string(),
+                        detail_path: None,
+                    });
+                    state.queue.retain(|queued_id| queued_id != &id);
+                }
+                TaskStatus::Running => {
+                    cancel_running = true;
+                    task.timeline.push(TaskTimelineEntry {
+                        timestamp: now,
+                        kind: "cancel_requested".to_string(),
+                        summary: "Cancellation requested".to_string(),
+                        detail_path: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if cancel_running && let Some(token) = state.running_cancel.get(&id) {
+            token.cancel();
+        }
+
+        self.persist_all_locked(&state)?;
+        state
             .tasks
             .get(&id)
             .cloned()
-            .ok_or_else(|| anyhow!("Task not found: {id}"))?;
-        let now = Utc::now();
-
-        match candidate.status {
-            TaskStatus::Queued => {
-                candidate.status = TaskStatus::Canceled;
-                candidate.ended_at = Some(now);
-                candidate.duration_ms = Some(0);
-                candidate.timeline.push(TaskTimelineEntry {
-                    timestamp: now,
-                    kind: "canceled".to_string(),
-                    summary: "Task canceled before execution".to_string(),
-                    detail_path: None,
-                });
-                let mut next_queue = state.queue.clone();
-                next_queue.retain(|queued_id| queued_id != &id);
-                self.persist_task_locked(&candidate)?;
-                state.tasks.insert(id.clone(), candidate.clone());
-                state.queue = next_queue;
-                if let Err(err) = self.persist_queue_locked(&state.queue) {
-                    tracing::warn!(
-                        "Failed to persist task queue cache after canceling {id}: {err}"
-                    );
-                }
-            }
-            TaskStatus::Running => {
-                candidate.timeline.push(TaskTimelineEntry {
-                    timestamp: now,
-                    kind: "cancel_requested".to_string(),
-                    summary: "Cancellation requested".to_string(),
-                    detail_path: None,
-                });
-                self.persist_task_locked(&candidate)?;
-                state.tasks.insert(id.clone(), candidate.clone());
-                if let Some(token) = state.running_cancel.get(&id) {
-                    token.cancel();
-                }
-            }
-            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Canceled => {}
-        }
-
-        Ok(candidate)
+            .ok_or_else(|| anyhow!("Task not found: {id}"))
     }
 
     /// Return aggregate status counters.
@@ -1633,14 +1009,15 @@ impl TaskManager {
     ) -> Result<TaskRecord> {
         let mut state = self.state.lock().await;
         let id = resolve_task_id(&state.tasks, id_or_prefix)?;
-        let mut updated = state
-            .tasks
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| anyhow!("Task not found: {id}"))?;
-        self.apply_task_update_metadata(&mut updated, Some(metadata))?;
+        let updated = {
+            let task = state
+                .tasks
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("Task not found: {id}"))?;
+            self.apply_task_update_metadata(task, Some(metadata))?;
+            task.clone()
+        };
         self.persist_task_locked(&updated)?;
-        state.tasks.insert(id, updated.clone());
         Ok(updated)
     }
 
@@ -1650,107 +1027,86 @@ impl TaskManager {
                 tracing::debug!("Worker exiting due to shutdown");
                 break;
             }
-            let step = {
+            let next = {
                 let mut state = self.state.lock().await;
-                loop {
-                    let Some(task_id) = state.queue.front().cloned() else {
-                        break WorkerStep::Wait;
-                    };
-                    let Some(mut candidate) = state.tasks.get(&task_id).cloned() else {
-                        state.queue.pop_front();
-                        if let Err(err) = self.persist_queue_locked(&state.queue) {
-                            tracing::warn!("Failed to refresh task queue cache: {err}");
-                        }
-                        continue;
-                    };
-                    if candidate.status != TaskStatus::Queued {
-                        state.queue.pop_front();
-                        if let Err(err) = self.persist_queue_locked(&state.queue) {
-                            tracing::warn!("Failed to refresh task queue cache: {err}");
-                        }
-                        continue;
-                    }
+                match state.queue.pop_front() {
+                    None => None,
+                    Some(task_id) => {
+                        if let Some(task) = state.tasks.get_mut(&task_id) {
+                            if task.status != TaskStatus::Queued {
+                                let _ = self.persist_queue_locked(&state.queue);
+                                None
+                            } else {
+                                let now = Utc::now();
+                                task.status = TaskStatus::Running;
+                                task.started_at = Some(now);
+                                task.ended_at = None;
+                                task.duration_ms = None;
+                                task.error = None;
+                                task.timeline.push(TaskTimelineEntry {
+                                    timestamp: now,
+                                    kind: "running".to_string(),
+                                    summary: "Task started".to_string(),
+                                    detail_path: None,
+                                });
 
-                    let now = Utc::now();
-                    candidate.status = TaskStatus::Running;
-                    candidate.started_at = Some(now);
-                    candidate.ended_at = None;
-                    candidate.duration_ms = None;
-                    candidate.error = None;
-                    candidate.timeline.push(TaskTimelineEntry {
-                        timestamp: now,
-                        kind: "running".to_string(),
-                        summary: "Task started".to_string(),
-                        detail_path: None,
-                    });
-                    let request = ExecutionTask {
-                        id: candidate.id.clone(),
-                        prompt: candidate.prompt.clone(),
-                        model: candidate.model.clone(),
-                        workspace: candidate.workspace.clone(),
-                        mode_label: candidate.mode.clone(),
-                        allow_shell: candidate.allow_shell,
-                        trust_mode: candidate.trust_mode,
-                        auto_approve: candidate.auto_approve,
-                    };
-                    if let Err(err) = self.persist_task_locked(&candidate) {
-                        tracing::error!("Failed to persist task start for {task_id}: {err}");
-                        break WorkerStep::Retry;
-                    }
+                                let request = {
+                                    ExecutionTask {
+                                        id: task.id.clone(),
+                                        prompt: task.prompt.clone(),
+                                        model: task.model.clone(),
+                                        workspace: task.workspace.clone(),
+                                        mode_label: task.mode.clone(),
+                                        allow_shell: task.allow_shell,
+                                        trust_mode: task.trust_mode,
+                                        auto_approve: task.auto_approve,
+                                    }
+                                };
+                                let cancel = CancellationToken::new();
+                                state.running_cancel.insert(task_id.clone(), cancel.clone());
 
-                    let cancel = self.cancel_token.child_token();
-                    state.tasks.insert(task_id.clone(), candidate);
-                    let popped = state.queue.pop_front();
-                    debug_assert_eq!(popped.as_deref(), Some(task_id.as_str()));
-                    state.running_cancel.insert(task_id.clone(), cancel.clone());
-                    if let Err(err) = self.persist_queue_locked(&state.queue) {
-                        tracing::warn!(
-                            "Failed to persist task queue cache after starting {task_id}: {err}"
-                        );
+                                if let Err(err) = self.persist_all_locked(&state) {
+                                    tracing::error!("Failed to persist task start: {err}");
+                                }
+                                Some((task_id, request, cancel))
+                            }
+                        } else {
+                            let _ = self.persist_queue_locked(&state.queue);
+                            None
+                        }
                     }
-                    break WorkerStep::Execute(task_id, request, cancel);
                 }
             };
 
-            match step {
-                WorkerStep::Execute(task_id, request, cancel) => {
-                    self.run_task(task_id, request, cancel).await;
-                }
-                WorkerStep::Retry => {
-                    tokio::select! {
-                        _ = self.cancel_token.cancelled() => {
-                            tracing::debug!("Worker exiting during persistence backoff");
-                            break;
-                        }
-                        _ = sleep(TASK_PERSIST_RETRY_BACKOFF) => {}
+            let Some((task_id, request, cancel)) = next else {
+                tokio::select! {
+                    _ = self.cancel_token.cancelled() => {
+                        tracing::debug!("Worker exiting during wait");
+                        break;
                     }
+                    _ = self.notify.notified() => {}
                 }
-                WorkerStep::Wait => {
-                    tokio::select! {
-                        _ = self.cancel_token.cancelled() => {
-                            tracing::debug!("Worker exiting during wait");
-                            break;
-                        }
-                        _ = self.notify.notified() => {}
-                    }
-                }
-            }
+                continue;
+            };
+
+            self.run_task(task_id, request, cancel).await;
         }
     }
 
     async fn run_task(&self, task_id: String, request: ExecutionTask, cancel: CancellationToken) {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let reporter = TaskExecutionReporter::new(event_tx, cancel.clone());
         let exec_fut = self
             .executor
-            .execute(request.clone(), reporter, cancel.clone());
+            .execute(request.clone(), event_tx, cancel.clone());
         tokio::pin!(exec_fut);
 
         let result = loop {
             tokio::select! {
-                maybe_report = event_rx.recv() => {
-                    if let Some(report) = maybe_report {
-                        self.apply_reported_event(&task_id, report).await;
+                maybe_event = event_rx.recv() => {
+                    if let Some(event) = maybe_event
+                        && let Err(err) = self.apply_execution_event(&task_id, event).await
+                    {
+                        tracing::error!("Failed to apply task event for {task_id}: {err}");
                     }
                 }
                 exec_result = &mut exec_fut => {
@@ -1759,8 +1115,10 @@ impl TaskManager {
             }
         };
 
-        while let Ok(report) = event_rx.try_recv() {
-            self.apply_reported_event(&task_id, report).await;
+        while let Ok(event) = event_rx.try_recv() {
+            if let Err(err) = self.apply_execution_event(&task_id, event).await {
+                tracing::error!("Failed to apply trailing task event for {task_id}: {err}");
+            }
         }
 
         if let Err(err) = self
@@ -1771,35 +1129,13 @@ impl TaskManager {
         }
     }
 
-    async fn apply_reported_event(&self, task_id: &str, report: PendingTaskExecutionEvent) {
-        let outcome = self
-            .apply_execution_event(task_id, report.event)
-            .await
-            .map_err(|err| err.to_string());
-        if let Err(err) = &outcome {
-            tracing::error!("Failed to durably apply task event for {task_id}: {err}");
-        }
-        if report.ack.send(outcome).is_err() {
-            tracing::debug!("Task executor dropped event ack receiver for {task_id}");
-        }
-    }
-
     async fn apply_execution_event(&self, task_id: &str, event: TaskExecutionEvent) -> Result<()> {
         let mut state = self.state.lock().await;
-        let Some(mut task) = state.tasks.get(task_id).cloned() else {
-            bail!("Task not found while applying executor event: {task_id}");
+        let Some(task) = state.tasks.get_mut(task_id) else {
+            return Ok(());
         };
 
         match event {
-            TaskExecutionEvent::ThreadCreated { thread_id } => {
-                task.thread_id = Some(thread_id.clone());
-                task.timeline.push(TaskTimelineEntry {
-                    timestamp: Utc::now(),
-                    kind: "runtime_thread".to_string(),
-                    summary: format!("Linked runtime thread {thread_id}"),
-                    detail_path: None,
-                });
-            }
             TaskExecutionEvent::ThreadLinked { thread_id, turn_id } => {
                 task.thread_id = Some(thread_id.clone());
                 task.turn_id = Some(turn_id.clone());
@@ -1917,7 +1253,7 @@ impl TaskManager {
                     });
                 }
 
-                self.apply_task_update_metadata(&mut task, metadata.as_ref())?;
+                self.apply_task_update_metadata(task, metadata.as_ref())?;
             }
             TaskExecutionEvent::Error { message } => {
                 task.timeline.push(TaskTimelineEntry {
@@ -1942,8 +1278,7 @@ impl TaskManager {
             }
         }
 
-        self.persist_task_locked(&task)?;
-        state.tasks.insert(task_id.to_string(), task);
+        self.persist_task_locked(task)?;
         Ok(())
     }
 
@@ -1954,112 +1289,63 @@ impl TaskManager {
         cancel: CancellationToken,
         mode_label: &str,
     ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state.running_cancel.remove(task_id);
+        let Some(task) = state.tasks.get_mut(task_id) else {
+            return Ok(());
+        };
+
         let now = Utc::now();
         if cancel.is_cancelled() && result.status == TaskStatus::Completed {
             result.status = TaskStatus::Canceled;
             result.result_text = None;
             result.error = None;
         }
-        if matches!(result.status, TaskStatus::Queued | TaskStatus::Running) {
-            let returned_status = result.status;
-            result.status = TaskStatus::Failed;
-            result.error = Some(format!(
-                "Executor returned non-terminal task status: {returned_status:?}"
-            ));
-        }
 
-        let terminal_status = result.status;
-        let terminal_error = result.error;
-        let mode_label = mode_label.to_string();
-        let finished_summary = match terminal_status {
-            TaskStatus::Completed => "Task completed".to_string(),
-            TaskStatus::Failed => format!(
-                "Task failed: {}",
-                terminal_error
-                    .as_deref()
-                    .map(|error| summarize_text(error, TIMELINE_SUMMARY_LIMIT))
-                    .unwrap_or_else(|| "unknown error".to_string())
-            ),
-            TaskStatus::Canceled => "Task canceled".to_string(),
-            TaskStatus::Queued | TaskStatus::Running => unreachable!(
-                "executor non-terminal statuses are normalized to Failed before persistence"
-            ),
-        };
-        let result_summary = result
-            .result_text
-            .as_deref()
-            .map(|text| summarize_text(text, TIMELINE_SUMMARY_LIMIT))
-            .or_else(|| {
-                (terminal_status == TaskStatus::Completed)
-                    .then(|| "(no textual output)".to_string())
-            });
-        let result_detail_path = match result.result_text.as_deref() {
-            Some(text) => loop {
-                match self.artifact_if_large(task_id, "result", text) {
-                    Ok(detail_path) => break detail_path,
-                    Err(err) => {
-                        tracing::error!("Failed to persist terminal artifact for {task_id}: {err}");
-                        tokio::select! {
-                            _ = self.cancel_token.cancelled() => {
-                                bail!(
-                                    "Task manager shut down before terminal artifact for {task_id} was durable: {err}"
-                                );
-                            }
-                            _ = sleep(TASK_PERSIST_RETRY_BACKOFF) => {}
-                        }
-                    }
+        task.status = result.status;
+        task.mode = mode_label.to_string();
+        task.ended_at = Some(now);
+        task.duration_ms = task.started_at.map(|start| duration_ms(start, now));
+        task.error = result.error.clone();
+        task.timeline.push(TaskTimelineEntry {
+            timestamp: now,
+            kind: "finished".to_string(),
+            summary: match result.status {
+                TaskStatus::Completed => "Task completed".to_string(),
+                TaskStatus::Failed => format!(
+                    "Task failed: {}",
+                    result
+                        .error
+                        .as_deref()
+                        .map(|e| summarize_text(e, TIMELINE_SUMMARY_LIMIT))
+                        .unwrap_or_else(|| "unknown error".to_string())
+                ),
+                TaskStatus::Canceled => "Task canceled".to_string(),
+                TaskStatus::Queued | TaskStatus::Running => {
+                    format!("Task ended in unexpected state: {mode_label}")
                 }
             },
-            None => None,
-        };
+            detail_path: None,
+        });
 
-        loop {
-            let persistence_error = {
-                let mut state = self.state.lock().await;
-                let Some(mut candidate) = state.tasks.get(task_id).cloned() else {
-                    return Ok(());
-                };
-                candidate.status = terminal_status;
-                candidate.mode = mode_label.clone();
-                candidate.ended_at = Some(now);
-                candidate.duration_ms = candidate.started_at.map(|start| duration_ms(start, now));
-                candidate.error = terminal_error.clone();
-                candidate.timeline.push(TaskTimelineEntry {
+        if let Some(text) = result.result_text {
+            let detail_path = self.artifact_if_large(task_id, "result", &text)?;
+            task.result_summary = Some(summarize_text(&text, TIMELINE_SUMMARY_LIMIT));
+            task.result_detail_path = detail_path.clone();
+            if let Some(detail_path) = detail_path {
+                task.timeline.push(TaskTimelineEntry {
                     timestamp: now,
-                    kind: "finished".to_string(),
-                    summary: finished_summary.clone(),
-                    detail_path: None,
+                    kind: "result_ref".to_string(),
+                    summary: format!("Result artifact: {}", detail_path.display()),
+                    detail_path: Some(detail_path),
                 });
-                candidate.result_summary = result_summary.clone();
-                candidate.result_detail_path = result_detail_path.clone();
-                if let Some(detail_path) = result_detail_path.as_ref() {
-                    candidate.timeline.push(TaskTimelineEntry {
-                        timestamp: now,
-                        kind: "result_ref".to_string(),
-                        summary: format!("Result artifact: {}", detail_path.display()),
-                        detail_path: Some(detail_path.clone()),
-                    });
-                }
-
-                match self.persist_task_locked(&candidate) {
-                    Ok(()) => {
-                        state.tasks.insert(task_id.to_string(), candidate);
-                        state.running_cancel.remove(task_id);
-                        return Ok(());
-                    }
-                    Err(err) => err,
-                }
-            };
-            tracing::error!("Failed to persist terminal task {task_id}: {persistence_error}");
-            tokio::select! {
-                _ = self.cancel_token.cancelled() => {
-                    bail!(
-                        "Task manager shut down before terminal state for {task_id} was durable: {persistence_error}"
-                    );
-                }
-                _ = sleep(TASK_PERSIST_RETRY_BACKOFF) => {}
             }
+        } else if result.status == TaskStatus::Completed {
+            task.result_summary = Some("(no textual output)".to_string());
         }
+
+        self.persist_all_locked(&state)?;
+        Ok(())
     }
 
     fn artifact_if_large(
@@ -2076,15 +1362,6 @@ impl TaskManager {
 
     fn write_artifact(&self, task_id: &str, label: &str, content: &str) -> Result<PathBuf> {
         ensure_safe_storage_id("task id", task_id)?;
-        #[cfg(test)]
-        if let Some(probe) = self
-            .persistence_probe
-            .lock()
-            .expect("test persistence probe lock")
-            .clone()
-        {
-            probe.before_artifact_write(task_id)?;
-        }
         let artifact_dir = self.artifacts_dir.join(task_id);
         fs::create_dir_all(&artifact_dir)
             .with_context(|| format!("Failed to create artifact dir {}", artifact_dir.display()))?;
@@ -2191,16 +1468,15 @@ impl TaskManager {
         Ok(())
     }
 
-    fn persist_queue_locked(&self, queue: &VecDeque<String>) -> Result<()> {
-        #[cfg(test)]
-        if let Some(probe) = self
-            .persistence_probe
-            .lock()
-            .expect("test persistence probe lock")
-            .clone()
-        {
-            probe.before_queue_write()?;
+    fn persist_all_locked(&self, state: &ManagerState) -> Result<()> {
+        self.persist_queue_locked(&state.queue)?;
+        for task in state.tasks.values() {
+            self.persist_task_locked(task)?;
         }
+        Ok(())
+    }
+
+    fn persist_queue_locked(&self, queue: &VecDeque<String>) -> Result<()> {
         write_json_atomic(
             &self.queue_path,
             &QueueFile {
@@ -2210,15 +1486,6 @@ impl TaskManager {
     }
 
     fn persist_task_locked(&self, task: &TaskRecord) -> Result<()> {
-        #[cfg(test)]
-        if let Some(probe) = self
-            .persistence_probe
-            .lock()
-            .expect("test persistence probe lock")
-            .clone()
-        {
-            probe.before_task_write(task)?;
-        }
         let path = self.tasks_dir.join(format!("{}.json", task.id));
         write_json_atomic(&path, task)
     }
@@ -2242,70 +1509,12 @@ fn load_state(
                 .with_context(|| format!("Failed to read task file {}", path.display()))?;
             let mut task: TaskRecord = serde_json::from_str(&content)
                 .with_context(|| format!("Failed to parse task file {}", path.display()))?;
-            ensure_safe_storage_id("persisted task id", &task.id)
-                .with_context(|| format!("Invalid task identity in {}", path.display()))?;
-            let file_stem = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .with_context(|| {
-                    format!("Task filename must be valid UTF-8: {}", path.display())
-                })?;
-            if file_stem != task.id {
-                bail!(
-                    "Task filename stem '{}' does not match persisted task id '{}' in {}",
-                    file_stem,
-                    task.id,
-                    path.display()
-                );
-            }
             if task.schema_version > CURRENT_TASK_SCHEMA_VERSION {
                 bail!(
                     "Task schema v{} is newer than supported v{}",
                     task.schema_version,
                     CURRENT_TASK_SCHEMA_VERSION
                 );
-            }
-            let mut task_needs_persist = false;
-            let persisted_mode = task.mode.clone();
-            match normalize_persisted_task_mode(&persisted_mode) {
-                Ok(canonical) => {
-                    if task.mode != canonical {
-                        task.mode = canonical;
-                        task_needs_persist = true;
-                    }
-                }
-                Err(err) => {
-                    let now = Utc::now();
-                    let duration_ms = task.started_at.and_then(|started| {
-                        u64::try_from(now.signed_duration_since(started).num_milliseconds()).ok()
-                    });
-                    let error = err.to_string();
-                    task.mode = "agent".to_string();
-                    task.status = TaskStatus::Failed;
-                    task.ended_at = Some(now);
-                    task.duration_ms = duration_ms;
-                    task.error = Some(error.clone());
-                    for tool in &mut task.tool_calls {
-                        if tool.status == TaskToolStatus::Running {
-                            tool.status = TaskToolStatus::Failed;
-                            tool.ended_at = Some(now);
-                            tool.duration_ms = duration_ms.or_else(|| {
-                                u64::try_from(
-                                    now.signed_duration_since(tool.started_at)
-                                        .num_milliseconds(),
-                                )
-                                .ok()
-                            });
-                        }
-                    }
-                    task.timeline.push(TaskTimelineEntry {
-                        timestamp: now,
-                        kind: "recovered_invalid_mode".to_string(),
-                        summary: error,
-                        detail_path: None,
-                    });
-                    task_needs_persist = true;
-                }
             }
             if task.status == TaskStatus::Running {
                 let now = Utc::now();
@@ -2338,14 +1547,8 @@ fn load_state(
                         .to_string(),
                     detail_path: None,
                 });
-                task_needs_persist = true;
             }
-            if task_needs_persist {
-                write_json_atomic(&path, &task).with_context(|| {
-                    format!("Failed to persist recovered task file {}", path.display())
-                })?;
-            }
-            insert_loaded_task(&mut tasks, task, &path)?;
+            tasks.insert(task.id.clone(), task);
         }
     }
 
@@ -2379,117 +1582,6 @@ fn load_state(
     Ok((tasks, queue))
 }
 
-fn insert_loaded_task(
-    tasks: &mut HashMap<String, TaskRecord>,
-    task: TaskRecord,
-    path: &Path,
-) -> Result<()> {
-    if tasks.contains_key(&task.id) {
-        bail!(
-            "Duplicate persisted task id '{}' while loading {}",
-            task.id,
-            path.display()
-        );
-    }
-    tasks.insert(task.id.clone(), task);
-    Ok(())
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct TaskPruneMarker {
-    task_id: String,
-}
-
-fn task_prune_dir(tasks_dir: &Path) -> PathBuf {
-    tasks_dir.join(".pruning")
-}
-
-fn persist_task_prune_marker(tasks_dir: &Path, task_id: &str) -> Result<PathBuf> {
-    ensure_safe_storage_id("task id", task_id)?;
-    let path = task_prune_dir(tasks_dir).join(format!("{task_id}.json"));
-    write_json_atomic(
-        &path,
-        &TaskPruneMarker {
-            task_id: task_id.to_string(),
-        },
-    )?;
-    Ok(path)
-}
-
-fn recover_pending_task_prunes(tasks_dir: &Path, artifacts_dir: &Path) -> Result<()> {
-    let prune_dir = task_prune_dir(tasks_dir);
-    if !prune_dir.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(&prune_dir)
-        .with_context(|| format!("Failed to read task prune dir {}", prune_dir.display()))?
-    {
-        let path = entry?.path();
-        if path.extension().is_none_or(|extension| extension != "json") {
-            continue;
-        }
-        let file_stem = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .with_context(|| {
-                format!("Task prune marker must be valid UTF-8: {}", path.display())
-            })?;
-        let marker: TaskPruneMarker = serde_json::from_str(
-            &fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read task prune marker {}", path.display()))?,
-        )
-        .with_context(|| format!("Failed to parse task prune marker {}", path.display()))?;
-        ensure_safe_storage_id("pruned task id", &marker.task_id)
-            .with_context(|| format!("Invalid task prune marker {}", path.display()))?;
-        if file_stem != marker.task_id {
-            bail!(
-                "Task prune marker stem '{}' does not match task id '{}' in {}",
-                file_stem,
-                marker.task_id,
-                path.display()
-            );
-        }
-        remove_dir_all_if_exists(&artifacts_dir.join(&marker.task_id))?;
-        remove_file_if_exists(&tasks_dir.join(format!("{}.json", marker.task_id)))?;
-        remove_file_if_exists(&path)?;
-    }
-    Ok(())
-}
-
-fn remove_file_if_exists(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| format!("Failed to remove {}", path.display())),
-    }
-}
-
-fn remove_dir_all_if_exists(path: &Path) -> Result<()> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| format!("Failed to remove {}", path.display())),
-    }
-}
-
-fn build_idempotency_index(tasks: &HashMap<String, TaskRecord>) -> Result<HashMap<String, String>> {
-    let mut index = HashMap::new();
-    for task in tasks.values() {
-        let Some(key) = task.idempotency_key.as_ref() else {
-            continue;
-        };
-        if let Some(existing_id) = index.insert(key.clone(), task.id.clone()) {
-            bail!(
-                "Duplicate task idempotency key '{}' for tasks '{}' and '{}'",
-                key,
-                existing_id,
-                task.id
-            );
-        }
-    }
-    Ok(index)
-}
-
 fn resolve_task_id(tasks: &HashMap<String, TaskRecord>, id_or_prefix: &str) -> Result<String> {
     if tasks.contains_key(id_or_prefix) {
         return Ok(id_or_prefix.to_string());
@@ -2508,35 +1600,6 @@ fn resolve_task_id(tasks: &HashMap<String, TaskRecord>, id_or_prefix: &str) -> R
             matches.len()
         ),
     }
-}
-
-fn normalize_task_mode(mode: String) -> Result<String> {
-    let normalized = mode.trim().to_ascii_lowercase();
-    if matches!(normalized.as_str(), "agent" | "plan" | "yolo") {
-        Ok(normalized)
-    } else {
-        bail!("Invalid task mode '{mode}'. Expected one of: agent, plan, yolo")
-    }
-}
-
-fn normalize_persisted_task_mode(mode: &str) -> Result<String> {
-    match mode.trim().to_ascii_lowercase().as_str() {
-        "agent" | "1" => Ok("agent".to_string()),
-        "plan" | "2" => Ok("plan".to_string()),
-        "yolo" | "3" => Ok("yolo".to_string()),
-        _ => bail!("Invalid persisted task mode '{mode}'. Expected one of: agent, plan, yolo"),
-    }
-}
-
-fn normalize_idempotency_key(key: String) -> Result<String> {
-    let normalized = key.trim().to_string();
-    if normalized.is_empty() {
-        bail!("Task idempotency key cannot be empty");
-    }
-    if normalized.len() > 512 {
-        bail!("Task idempotency key cannot exceed 512 bytes");
-    }
-    Ok(normalized)
 }
 
 fn summarize_json(value: &Value) -> Option<String> {
@@ -2609,7 +1672,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 fn default_auto_approve() -> bool {
-    false
+    true
 }
 
 /// Default task manager data location (`~/.codewhale/tasks`, or legacy
@@ -2662,195 +1725,30 @@ pub async fn wait_for_terminal_state(
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::time::Duration;
 
     struct MockExecutor;
-
-    struct NonTerminalExecutor {
-        status: TaskStatus,
-    }
-
-    struct DurabilityCheckingExecutor {
-        root: PathBuf,
-        saw_durable_thread: Arc<AtomicBool>,
-    }
-
-    struct CountingExecutor {
-        calls: Arc<AtomicUsize>,
-        result_text: Option<String>,
-    }
-
-    struct ShutdownObservingExecutor {
-        started: Arc<AtomicBool>,
-        saw_cancel: Arc<AtomicBool>,
-    }
-
-    struct FakeTaskTurnRuntime {
-        batches: std::sync::Mutex<
-            VecDeque<std::result::Result<Vec<crate::runtime_threads::RuntimeEventRecord>, String>>,
-        >,
-        interrupt_calls: AtomicUsize,
-    }
-
-    impl FakeTaskTurnRuntime {
-        fn new(
-            batches: impl IntoIterator<
-                Item = std::result::Result<Vec<crate::runtime_threads::RuntimeEventRecord>, String>,
-            >,
-        ) -> Self {
-            Self {
-                batches: std::sync::Mutex::new(batches.into_iter().collect()),
-                interrupt_calls: AtomicUsize::new(0),
-            }
-        }
-
-        fn interrupt_calls(&self) -> usize {
-            self.interrupt_calls.load(Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait]
-    impl TaskTurnRuntime for FakeTaskTurnRuntime {
-        fn events_since(
-            &self,
-            _thread_id: &str,
-            _since_seq: Option<u64>,
-        ) -> Result<Vec<crate::runtime_threads::RuntimeEventRecord>> {
-            self.batches
-                .lock()
-                .expect("fake runtime batches lock")
-                .pop_front()
-                .unwrap_or_else(|| Ok(Vec::new()))
-                .map_err(anyhow::Error::msg)
-        }
-
-        async fn interrupt_turn(&self, _thread_id: &str, _turn_id: &str) -> Result<()> {
-            self.interrupt_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl TaskExecutor for NonTerminalExecutor {
-        async fn execute(
-            &self,
-            _task: ExecutionTask,
-            _reporter: TaskExecutionReporter,
-            _cancel: CancellationToken,
-        ) -> TaskExecutionResult {
-            TaskExecutionResult {
-                status: self.status,
-                result_text: None,
-                error: None,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl TaskExecutor for DurabilityCheckingExecutor {
-        async fn execute(
-            &self,
-            task: ExecutionTask,
-            reporter: TaskExecutionReporter,
-            _cancel: CancellationToken,
-        ) -> TaskExecutionResult {
-            reporter
-                .report(TaskExecutionEvent::ThreadCreated {
-                    thread_id: "thr_durable_ack".to_string(),
-                })
-                .await
-                .expect("ThreadCreated must be durably acknowledged");
-
-            let task_path = self.root.join("tasks").join(format!("{}.json", task.id()));
-            let persisted: TaskRecord = serde_json::from_str(
-                &fs::read_to_string(task_path).expect("ack must follow durable task write"),
-            )
-            .expect("persisted task record");
-            self.saw_durable_thread.store(
-                persisted.thread_id.as_deref() == Some("thr_durable_ack"),
-                Ordering::SeqCst,
-            );
-
-            TaskExecutionResult {
-                status: TaskStatus::Completed,
-                result_text: Some("done".to_string()),
-                error: None,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl TaskExecutor for CountingExecutor {
-        async fn execute(
-            &self,
-            _task: ExecutionTask,
-            _reporter: TaskExecutionReporter,
-            _cancel: CancellationToken,
-        ) -> TaskExecutionResult {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            TaskExecutionResult {
-                status: TaskStatus::Completed,
-                result_text: self.result_text.clone(),
-                error: None,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl TaskExecutor for ShutdownObservingExecutor {
-        async fn execute(
-            &self,
-            _task: ExecutionTask,
-            _reporter: TaskExecutionReporter,
-            cancel: CancellationToken,
-        ) -> TaskExecutionResult {
-            self.started.store(true, Ordering::SeqCst);
-            cancel.cancelled().await;
-            self.saw_cancel.store(true, Ordering::SeqCst);
-            TaskExecutionResult {
-                status: TaskStatus::Canceled,
-                result_text: None,
-                error: None,
-            }
-        }
-    }
 
     #[async_trait]
     impl TaskExecutor for MockExecutor {
         async fn execute(
             &self,
             task: ExecutionTask,
-            reporter: TaskExecutionReporter,
+            events: mpsc::UnboundedSender<TaskExecutionEvent>,
             cancel: CancellationToken,
         ) -> TaskExecutionResult {
-            reporter
-                .report(TaskExecutionEvent::Status {
-                    message: format!("running {}", task.id),
-                })
-                .await
-                .expect("persist status");
-            reporter
-                .report(TaskExecutionEvent::ThreadCreated {
-                    thread_id: "thr_test".to_string(),
-                })
-                .await
-                .expect("persist thread");
-            reporter
-                .report(TaskExecutionEvent::ThreadLinked {
-                    thread_id: "thr_test".to_string(),
-                    turn_id: "turn_test".to_string(),
-                })
-                .await
-                .expect("persist runtime link");
-            reporter
-                .report(TaskExecutionEvent::ToolStarted {
-                    id: "tool_1".to_string(),
-                    name: "read_file".to_string(),
-                    input: serde_json::json!({ "path": "README.md" }),
-                })
-                .await
-                .expect("persist tool start");
+            let _ = events.send(TaskExecutionEvent::Status {
+                message: format!("running {}", task.id),
+            });
+            let _ = events.send(TaskExecutionEvent::ThreadLinked {
+                thread_id: "thr_test".to_string(),
+                turn_id: "turn_test".to_string(),
+            });
+            let _ = events.send(TaskExecutionEvent::ToolStarted {
+                id: "tool_1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({ "path": "README.md" }),
+            });
             sleep(Duration::from_millis(50)).await;
             if cancel.is_cancelled() {
                 return TaskExecutionResult {
@@ -2859,28 +1757,25 @@ mod tests {
                     error: None,
                 };
             }
-            reporter
-                .report(TaskExecutionEvent::ToolCompleted {
-                    id: "tool_1".to_string(),
-                    name: "read_file".to_string(),
-                    success: true,
-                    output: "read ok".to_string(),
-                    metadata: Some(serde_json::json!({
-                        "duration_ms": 10,
-                        "task_updates": {
-                            "checklist": {
-                                "items": [
-                                    { "id": 1, "content": "read fixture", "status": "in_progress" }
-                                ],
-                                "completion_pct": 0,
-                                "in_progress_id": 1,
-                                "updated_at": null
-                            }
+            let _ = events.send(TaskExecutionEvent::ToolCompleted {
+                id: "tool_1".to_string(),
+                name: "read_file".to_string(),
+                success: true,
+                output: "read ok".to_string(),
+                metadata: Some(serde_json::json!({
+                    "duration_ms": 10,
+                    "task_updates": {
+                        "checklist": {
+                            "items": [
+                                { "id": 1, "content": "read fixture", "status": "in_progress" }
+                            ],
+                            "completion_pct": 0,
+                            "in_progress_id": 1,
+                            "updated_at": null
                         }
-                    })),
-                })
-                .await
-                .expect("persist tool completion");
+                    }
+                })),
+            });
             TaskExecutionResult {
                 status: TaskStatus::Completed,
                 result_text: Some("done".to_string()),
@@ -2902,996 +1797,6 @@ mod tests {
         }
     }
 
-    fn terminal_runtime_event(status: &str) -> crate::runtime_threads::RuntimeEventRecord {
-        crate::runtime_threads::RuntimeEventRecord {
-            schema_version: 2,
-            seq: 1,
-            timestamp: Utc::now(),
-            thread_id: "thr_active".to_string(),
-            turn_id: Some("turn_active".to_string()),
-            item_id: None,
-            event: "turn.completed".to_string(),
-            payload: json!({ "turn": { "status": status } }),
-        }
-    }
-
-    fn auto_ack_reporter(
-        cancel: CancellationToken,
-    ) -> (TaskExecutionReporter, tokio::task::JoinHandle<()>) {
-        let (tx, mut rx) = mpsc::unbounded_channel::<PendingTaskExecutionEvent>();
-        let reporter = TaskExecutionReporter::new(tx, cancel);
-        let ack_task = tokio::spawn(async move {
-            while let Some(pending) = rx.recv().await {
-                let _ = pending.ack.send(Ok(()));
-            }
-        });
-        (reporter, ack_task)
-    }
-
-    fn overwrite_persisted_task_mode(root: &Path, task_id: &str, mode: &str) -> Result<()> {
-        let path = root.join("tasks").join(format!("{task_id}.json"));
-        let mut value: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
-        value["mode"] = json!(mode);
-        fs::write(path, serde_json::to_string_pretty(&value)?)?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn task_ids_keep_full_uuid_entropy() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let manager = TaskManager::start_with_executor(
-            test_config(tempdir.path().to_path_buf()),
-            Arc::new(MockExecutor),
-        )
-        .await?;
-        manager.shutdown();
-
-        let task = manager
-            .add_task(NewTaskRequest::from_prompt("keep the full task UUID"))
-            .await?;
-        let uuid = task
-            .id
-            .strip_prefix("task_")
-            .expect("task id must keep the task_ prefix");
-
-        assert_eq!(uuid.len(), 36, "task id must retain the full UUID text");
-        assert!(
-            Uuid::parse_str(uuid).is_ok(),
-            "task id suffix must be a UUID"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn task_id_collision_does_not_overwrite_existing_task() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let colliding_id = format!("task_{}", Uuid::new_v4());
-        let fresh_id = format!("task_{}", Uuid::new_v4());
-        let generated_ids = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
-            colliding_id.clone(),
-            colliding_id,
-            fresh_id.clone(),
-        ])));
-        let ids_for_generator = Arc::clone(&generated_ids);
-        let manager = TaskManager::start_with_executor_and_id_generator(
-            test_config(tempdir.path().to_path_buf()),
-            Arc::new(MockExecutor),
-            Arc::new(move || {
-                ids_for_generator
-                    .lock()
-                    .expect("task id generator lock")
-                    .pop_front()
-                    .expect("test task id")
-            }),
-        )
-        .await?;
-        manager.shutdown();
-
-        let first = manager
-            .add_task(NewTaskRequest::from_prompt("keep the original task"))
-            .await?;
-        let second = manager
-            .add_task(NewTaskRequest::from_prompt("create a distinct task"))
-            .await?;
-
-        assert_ne!(first.id, second.id, "a collision must be retried");
-        assert_eq!(second.id, fresh_id);
-        assert_eq!(
-            manager.get_task(&first.id).await?.prompt,
-            "keep the original task"
-        );
-        assert_eq!(manager.list_tasks(None).await.len(), 2);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn executor_never_starts_before_running_record_is_durable() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let root = tempdir.path().to_path_buf();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let manager = TaskManager::start_with_executor(
-            test_config(root.clone()),
-            Arc::new(CountingExecutor {
-                calls: Arc::clone(&calls),
-                result_text: Some("done".to_string()),
-            }),
-        )
-        .await?;
-        let probe = Arc::new(TestPersistenceProbe::default());
-        probe.block_status(TaskStatus::Running);
-        manager.install_persistence_probe(Arc::clone(&probe));
-
-        let task = manager
-            .add_task(NewTaskRequest::from_prompt("wait for durable Running"))
-            .await?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while probe.task_status_write_count(&task.id, TaskStatus::Running) == 0 {
-            if std::time::Instant::now() >= deadline {
-                bail!("worker never attempted to persist Running");
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            0,
-            "executor must not start after a rejected Running write"
-        );
-        assert_eq!(manager.get_task(&task.id).await?.status, TaskStatus::Queued);
-        let persisted: TaskRecord = serde_json::from_str(&fs::read_to_string(
-            root.join("tasks").join(format!("{}.json", task.id)),
-        )?)?;
-        assert_eq!(persisted.status, TaskStatus::Queued);
-
-        probe.unblock_status();
-        let completed = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(5)).await?;
-        assert_eq!(completed.status, TaskStatus::Completed);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(probe.task_status_write_count(&task.id, TaskStatus::Running) >= 2);
-        manager.shutdown();
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rejected_execution_event_does_not_mutate_memory_or_later_leak_to_disk() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let root = tempdir.path().to_path_buf();
-        let manager = TaskManager::start_with_executor(
-            test_config(root.clone()),
-            Arc::new(CountingExecutor {
-                calls: Arc::new(AtomicUsize::new(0)),
-                result_text: None,
-            }),
-        )
-        .await?;
-        manager.shutdown();
-        let task = manager
-            .add_task(NewTaskRequest::from_prompt("reject one event"))
-            .await?;
-        let probe = Arc::new(TestPersistenceProbe::default());
-        let rejected_summary = "event must remain rejected";
-        probe.block_timeline_summary(rejected_summary);
-        manager.install_persistence_probe(Arc::clone(&probe));
-
-        let outcome = manager
-            .apply_execution_event(
-                &task.id,
-                TaskExecutionEvent::Status {
-                    message: rejected_summary.to_string(),
-                },
-            )
-            .await;
-        let leaked_to_memory = manager
-            .get_task(&task.id)
-            .await?
-            .timeline
-            .iter()
-            .any(|entry| entry.summary == rejected_summary);
-
-        probe.unblock_timeline_summary();
-        manager
-            .finish_task(
-                &task.id,
-                TaskExecutionResult {
-                    status: TaskStatus::Completed,
-                    result_text: Some("done".to_string()),
-                    error: None,
-                },
-                CancellationToken::new(),
-                "agent",
-            )
-            .await?;
-        let persisted: TaskRecord = serde_json::from_str(&fs::read_to_string(
-            root.join("tasks").join(format!("{}.json", task.id)),
-        )?)?;
-        let leaked_to_disk = persisted
-            .timeline
-            .iter()
-            .any(|entry| entry.summary == rejected_summary);
-
-        assert!(outcome.is_err(), "the event gate must reject the write");
-        assert!(!leaked_to_memory, "a rejected event mutated memory");
-        assert!(!leaked_to_disk, "a rejected event leaked during finish");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn terminal_state_is_not_visible_until_terminal_write_succeeds() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let root = tempdir.path().to_path_buf();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let manager = TaskManager::start_with_executor(
-            test_config(root.clone()),
-            Arc::new(CountingExecutor {
-                calls: Arc::clone(&calls),
-                result_text: Some("x".repeat(ARTIFACT_THRESHOLD + 100)),
-            }),
-        )
-        .await?;
-        let probe = Arc::new(TestPersistenceProbe::default());
-        probe.block_status(TaskStatus::Completed);
-        manager.install_persistence_probe(Arc::clone(&probe));
-
-        let task = manager
-            .add_task(NewTaskRequest::from_prompt("hold terminal persistence"))
-            .await?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while probe.task_status_write_count(&task.id, TaskStatus::Completed) == 0 {
-            if std::time::Instant::now() >= deadline {
-                manager.shutdown();
-                bail!("worker never attempted to persist Completed");
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-
-        let visible_before_release = manager.get_task(&task.id).await?.status;
-        let persisted_before_release: TaskRecord = serde_json::from_str(&fs::read_to_string(
-            root.join("tasks").join(format!("{}.json", task.id)),
-        )?)?;
-        let artifact_dir = root.join("artifacts").join(&task.id);
-        let artifacts_before_release = fs::read_dir(&artifact_dir)?.count();
-        probe.unblock_status();
-
-        if visible_before_release != TaskStatus::Running
-            || persisted_before_release.status != TaskStatus::Running
-        {
-            manager.shutdown();
-            bail!(
-                "terminal state became visible before persistence: memory={:?}, disk={:?}",
-                visible_before_release,
-                persisted_before_release.status
-            );
-        }
-        assert_eq!(
-            artifacts_before_release, 1,
-            "the large result artifact must be prepared once"
-        );
-
-        let completed = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(5)).await?;
-        assert_eq!(completed.status, TaskStatus::Completed);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(probe.task_status_write_count(&task.id, TaskStatus::Completed) >= 2);
-        assert_eq!(
-            fs::read_dir(&artifact_dir)?.count(),
-            1,
-            "terminal retries must reuse the same large-result artifact"
-        );
-        manager.shutdown();
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn terminal_artifact_write_failure_retries_without_publishing_terminal_state()
-    -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let root = tempdir.path().to_path_buf();
-        let manager = TaskManager::start_with_executor(
-            test_config(root.clone()),
-            Arc::new(CountingExecutor {
-                calls: Arc::new(AtomicUsize::new(0)),
-                result_text: Some("x".repeat(ARTIFACT_THRESHOLD + 100)),
-            }),
-        )
-        .await?;
-        let probe = Arc::new(TestPersistenceProbe::default());
-        probe.block_artifact_writes.store(true, Ordering::SeqCst);
-        manager.install_persistence_probe(Arc::clone(&probe));
-
-        let task = manager
-            .add_task(NewTaskRequest::from_prompt("retry artifact persistence"))
-            .await?;
-        let attempt_deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while probe.artifact_write_count(&task.id) == 0 {
-            if std::time::Instant::now() >= attempt_deadline {
-                manager.shutdown();
-                bail!("worker never attempted to persist the result artifact");
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-        sleep(Duration::from_millis(130)).await;
-        let attempts_while_blocked = probe.artifact_write_count(&task.id);
-        let visible_while_blocked = manager.get_task(&task.id).await?;
-        let cancel_handle_retained_while_blocked = manager
-            .state
-            .lock()
-            .await
-            .running_cancel
-            .contains_key(&task.id);
-        let persisted_while_blocked: TaskRecord = serde_json::from_str(&fs::read_to_string(
-            root.join("tasks").join(format!("{}.json", task.id)),
-        )?)?;
-        probe.block_artifact_writes.store(false, Ordering::SeqCst);
-
-        assert_eq!(visible_while_blocked.status, TaskStatus::Running);
-        assert_eq!(persisted_while_blocked.status, TaskStatus::Running);
-        assert!(
-            cancel_handle_retained_while_blocked,
-            "the running cancel handle must remain until terminal state is durable"
-        );
-        assert!(
-            attempts_while_blocked < 10,
-            "artifact retry loop is hot: {attempts_while_blocked} attempts"
-        );
-        let completed = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(2)).await;
-        let completed = match completed {
-            Ok(completed) => completed,
-            Err(err) => {
-                manager.shutdown();
-                return Err(err);
-            }
-        };
-        assert_eq!(completed.status, TaskStatus::Completed);
-        assert!(
-            !manager
-                .state
-                .lock()
-                .await
-                .running_cancel
-                .contains_key(&task.id),
-            "the running cancel handle must be removed after terminal state is durable"
-        );
-        assert!(probe.artifact_write_count(&task.id) >= 2);
-        assert_eq!(
-            fs::read_dir(root.join("artifacts").join(&task.id))?.count(),
-            1,
-            "a successful artifact must be generated exactly once"
-        );
-        manager.shutdown();
-
-        let shutdown_tempdir = tempfile::tempdir()?;
-        let shutdown_root = shutdown_tempdir.path().to_path_buf();
-        let shutdown_manager = TaskManager::start_with_executor(
-            test_config(shutdown_root.clone()),
-            Arc::new(CountingExecutor {
-                calls: Arc::new(AtomicUsize::new(0)),
-                result_text: Some("y".repeat(ARTIFACT_THRESHOLD + 100)),
-            }),
-        )
-        .await?;
-        let shutdown_probe = Arc::new(TestPersistenceProbe::default());
-        shutdown_probe
-            .block_artifact_writes
-            .store(true, Ordering::SeqCst);
-        shutdown_manager.install_persistence_probe(Arc::clone(&shutdown_probe));
-        let shutdown_task = shutdown_manager
-            .add_task(NewTaskRequest::from_prompt("cancel artifact retries"))
-            .await?;
-        let shutdown_attempt_deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while shutdown_probe.artifact_write_count(&shutdown_task.id) == 0 {
-            if std::time::Instant::now() >= shutdown_attempt_deadline {
-                shutdown_manager.shutdown();
-                bail!("shutdown case never attempted artifact persistence");
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-        shutdown_manager.shutdown();
-        let attempts_at_shutdown = shutdown_probe.artifact_write_count(&shutdown_task.id);
-        sleep(Duration::from_millis(150)).await;
-
-        assert_eq!(
-            shutdown_probe.artifact_write_count(&shutdown_task.id),
-            attempts_at_shutdown,
-            "artifact retries continued after manager shutdown"
-        );
-        assert_eq!(
-            shutdown_manager.get_task(&shutdown_task.id).await?.status,
-            TaskStatus::Running
-        );
-        let shutdown_persisted: TaskRecord = serde_json::from_str(&fs::read_to_string(
-            shutdown_root
-                .join("tasks")
-                .join(format!("{}.json", shutdown_task.id)),
-        )?)?;
-        assert_eq!(shutdown_persisted.status, TaskStatus::Running);
-        assert!(
-            shutdown_manager
-                .state
-                .lock()
-                .await
-                .running_cancel
-                .contains_key(&shutdown_task.id),
-            "shutdown must not remove the running cancel handle without a durable terminal state"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cancel_persistence_failure_rolls_back_memory_and_queue() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let root = tempdir.path().to_path_buf();
-        let manager = TaskManager::start_with_executor(
-            test_config(root.clone()),
-            Arc::new(CountingExecutor {
-                calls: Arc::new(AtomicUsize::new(0)),
-                result_text: None,
-            }),
-        )
-        .await?;
-        manager.shutdown();
-        let task = manager
-            .add_task(NewTaskRequest::from_prompt("cancel durably"))
-            .await?;
-        let probe = Arc::new(TestPersistenceProbe::default());
-        manager.install_persistence_probe(Arc::clone(&probe));
-        probe.fail_next_task_write.store(true, Ordering::SeqCst);
-
-        let outcome = manager.cancel_task(&task.id).await;
-        let memory = manager.get_task(&task.id).await?;
-        let queue_contains_task = manager.state.lock().await.queue.contains(&task.id);
-        let persisted: TaskRecord = serde_json::from_str(&fs::read_to_string(
-            root.join("tasks").join(format!("{}.json", task.id)),
-        )?)?;
-
-        assert!(outcome.is_err(), "the injected cancel write must fail");
-        assert_eq!(memory.status, TaskStatus::Queued);
-        assert_eq!(persisted.status, TaskStatus::Queued);
-        assert!(queue_contains_task, "failed cancel removed the queued task");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn metadata_persistence_failure_rolls_back_memory() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let root = tempdir.path().to_path_buf();
-        let manager = TaskManager::start_with_executor(
-            test_config(root.clone()),
-            Arc::new(CountingExecutor {
-                calls: Arc::new(AtomicUsize::new(0)),
-                result_text: None,
-            }),
-        )
-        .await?;
-        manager.shutdown();
-        let task = manager
-            .add_task(NewTaskRequest::from_prompt("metadata durably"))
-            .await?;
-        let probe = Arc::new(TestPersistenceProbe::default());
-        manager.install_persistence_probe(Arc::clone(&probe));
-        probe.fail_next_task_write.store(true, Ordering::SeqCst);
-
-        let outcome = manager
-            .record_tool_metadata(
-                &task.id,
-                &serde_json::json!({
-                    "task_updates": {
-                        "gate": {
-                            "id": "gate_rejected",
-                            "gate": "test",
-                            "command": "cargo test",
-                            "cwd": ".",
-                            "exit_code": 0,
-                            "status": "passed",
-                            "classification": "passed",
-                            "duration_ms": 1,
-                            "summary": "must roll back",
-                            "log_path": null,
-                            "recorded_at": Utc::now()
-                        }
-                    }
-                }),
-            )
-            .await;
-        let memory = manager.get_task(&task.id).await?;
-        let persisted: TaskRecord = serde_json::from_str(&fs::read_to_string(
-            root.join("tasks").join(format!("{}.json", task.id)),
-        )?)?;
-
-        assert!(outcome.is_err(), "the injected metadata write must fail");
-        assert!(memory.gates.is_empty(), "failed metadata mutated memory");
-        assert!(persisted.gates.is_empty(), "failed metadata mutated disk");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn unrelated_tasks_are_not_rewritten_by_start_or_finish() -> Result<()> {
-        let startup_tempdir = tempfile::tempdir()?;
-        let startup_root = startup_tempdir.path().to_path_buf();
-        let seed = TaskManager::start_with_executor(
-            test_config(startup_root.clone()),
-            Arc::new(CountingExecutor {
-                calls: Arc::new(AtomicUsize::new(0)),
-                result_text: None,
-            }),
-        )
-        .await?;
-        seed.shutdown();
-        let unrelated = seed
-            .add_task(NewTaskRequest::from_prompt("leave startup bytes alone"))
-            .await?;
-        let recovered = seed
-            .add_task(NewTaskRequest::from_prompt("recover only this task"))
-            .await?;
-        drop(seed);
-
-        let now = Utc::now();
-        let mut unrelated_terminal = unrelated.clone();
-        unrelated_terminal.status = TaskStatus::Completed;
-        unrelated_terminal.ended_at = Some(now);
-        unrelated_terminal.duration_ms = Some(0);
-        let unrelated_path = startup_root
-            .join("tasks")
-            .join(format!("{}.json", unrelated.id));
-        fs::write(&unrelated_path, serde_json::to_string(&unrelated_terminal)?)?;
-        let unrelated_before_start = fs::read(&unrelated_path)?;
-
-        let mut recovered_running = recovered.clone();
-        recovered_running.status = TaskStatus::Running;
-        recovered_running.started_at = Some(now);
-        recovered_running.timeline.push(TaskTimelineEntry {
-            timestamp: now,
-            kind: "running".to_string(),
-            summary: "Task started".to_string(),
-            detail_path: None,
-        });
-        let recovered_path = startup_root
-            .join("tasks")
-            .join(format!("{}.json", recovered.id));
-        fs::write(&recovered_path, serde_json::to_string(&recovered_running)?)?;
-
-        let reopened = TaskManager::start_with_executor(
-            test_config(startup_root),
-            Arc::new(CountingExecutor {
-                calls: Arc::new(AtomicUsize::new(0)),
-                result_text: None,
-            }),
-        )
-        .await?;
-        reopened.shutdown();
-        let unrelated_unchanged = fs::read(&unrelated_path)? == unrelated_before_start;
-        let recovered_persisted: TaskRecord =
-            serde_json::from_str(&fs::read_to_string(&recovered_path)?)?;
-        drop(reopened);
-
-        let finish_tempdir = tempfile::tempdir()?;
-        let finish_root = finish_tempdir.path().to_path_buf();
-        let manager = TaskManager::start_with_executor(
-            test_config(finish_root.clone()),
-            Arc::new(CountingExecutor {
-                calls: Arc::new(AtomicUsize::new(0)),
-                result_text: None,
-            }),
-        )
-        .await?;
-        manager.shutdown();
-        let target = manager
-            .add_task(NewTaskRequest::from_prompt("finish only this task"))
-            .await?;
-        let finish_unrelated = manager
-            .add_task(NewTaskRequest::from_prompt("do not rewrite this task"))
-            .await?;
-        let mut running = target.clone();
-        running.status = TaskStatus::Running;
-        running.started_at = Some(Utc::now());
-        write_json_atomic(
-            &finish_root
-                .join("tasks")
-                .join(format!("{}.json", target.id)),
-            &running,
-        )?;
-        {
-            let mut state = manager.state.lock().await;
-            state.tasks.insert(target.id.clone(), running);
-            state.queue.retain(|queued_id| queued_id != &target.id);
-            state
-                .running_cancel
-                .insert(target.id.clone(), CancellationToken::new());
-        }
-        let probe = Arc::new(TestPersistenceProbe::default());
-        manager.install_persistence_probe(Arc::clone(&probe));
-        probe.reset_write_counts();
-
-        manager
-            .finish_task(
-                &target.id,
-                TaskExecutionResult {
-                    status: TaskStatus::Completed,
-                    result_text: Some("done".to_string()),
-                    error: None,
-                },
-                CancellationToken::new(),
-                "agent",
-            )
-            .await?;
-
-        assert!(
-            unrelated_unchanged,
-            "startup rewrote an unrelated terminal task"
-        );
-        assert_eq!(recovered_persisted.status, TaskStatus::Failed);
-        assert_eq!(probe.task_write_count(&target.id), 1);
-        assert_eq!(
-            probe.task_write_count(&finish_unrelated.id),
-            0,
-            "finish rewrote an unrelated task"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn shutdown_cancels_running_executor() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let started = Arc::new(AtomicBool::new(false));
-        let saw_cancel = Arc::new(AtomicBool::new(false));
-        let manager = TaskManager::start_with_executor(
-            test_config(tempdir.path().to_path_buf()),
-            Arc::new(ShutdownObservingExecutor {
-                started: Arc::clone(&started),
-                saw_cancel: Arc::clone(&saw_cancel),
-            }),
-        )
-        .await?;
-        let task = manager
-            .add_task(NewTaskRequest::from_prompt("observe manager shutdown"))
-            .await?;
-        let start_deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !started.load(Ordering::SeqCst) {
-            if std::time::Instant::now() >= start_deadline {
-                manager.shutdown();
-                bail!("executor never started");
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-
-        manager.shutdown();
-        let cancel_deadline = std::time::Instant::now() + Duration::from_millis(500);
-        while !saw_cancel.load(Ordering::SeqCst) && std::time::Instant::now() < cancel_deadline {
-            sleep(Duration::from_millis(10)).await;
-        }
-        let shutdown_propagated = saw_cancel.load(Ordering::SeqCst);
-        if !shutdown_propagated {
-            let running_cancel = manager
-                .state
-                .lock()
-                .await
-                .running_cancel
-                .get(&task.id)
-                .cloned();
-            if let Some(cancel) = running_cancel {
-                cancel.cancel();
-            }
-        }
-
-        assert!(
-            shutdown_propagated,
-            "manager shutdown did not cancel the running executor"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reporter_waits_for_manager_ack() -> Result<()> {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let reporter = TaskExecutionReporter::new(tx, CancellationToken::new());
-        let continued = Arc::new(AtomicBool::new(false));
-        let continued_after_report = Arc::clone(&continued);
-
-        let reporting = tokio::spawn(async move {
-            reporter
-                .report(TaskExecutionEvent::Status {
-                    message: "wait for persistence".to_string(),
-                })
-                .await
-                .expect("acknowledged report");
-            continued_after_report.store(true, Ordering::SeqCst);
-        });
-
-        let pending = rx.recv().await.expect("pending event");
-        tokio::task::yield_now().await;
-        assert!(
-            !continued.load(Ordering::SeqCst),
-            "executor must not continue before TaskManager acknowledges the event"
-        );
-
-        pending.ack.send(Ok(())).expect("send durable ack");
-        reporting.await?;
-        assert!(continued.load(Ordering::SeqCst));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn thread_created_ack_is_durable_and_survives_reopen() -> Result<()> {
-        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
-        let saw_durable_thread = Arc::new(AtomicBool::new(false));
-        let manager = TaskManager::start_with_executor(
-            test_config(root.clone()),
-            Arc::new(DurabilityCheckingExecutor {
-                root: root.clone(),
-                saw_durable_thread: Arc::clone(&saw_durable_thread),
-            }),
-        )
-        .await?;
-
-        let task = manager
-            .add_task(NewTaskRequest::from_prompt(
-                "persist thread before continuing",
-            ))
-            .await?;
-        let _ = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
-        assert!(
-            saw_durable_thread.load(Ordering::SeqCst),
-            "executor continued only after the task file contained thread_id"
-        );
-        manager.shutdown();
-        drop(manager);
-
-        let reopened =
-            TaskManager::start_with_executor(test_config(root), Arc::new(MockExecutor)).await?;
-        let recovered = reopened.get_task(&task.id).await?;
-        assert_eq!(recovered.thread_id.as_deref(), Some("thr_durable_ack"));
-        reopened.shutdown();
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn idempotency_key_returns_one_durable_task() -> Result<()> {
-        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
-        let manager =
-            TaskManager::start_with_executor(test_config(root), Arc::new(MockExecutor)).await?;
-
-        let first = manager
-            .add_task_with_idempotency_key(
-                NewTaskRequest::from_prompt("scheduled work"),
-                "automation:abc:2026-07-10T00:00:00Z",
-            )
-            .await?;
-        let second = manager
-            .add_task_with_idempotency_key(
-                NewTaskRequest::from_prompt("scheduled work"),
-                "automation:abc:2026-07-10T00:00:00Z",
-            )
-            .await?;
-
-        assert_eq!(first.id, second.id);
-        assert_eq!(manager.list_tasks(None).await.len(), 1);
-        manager.shutdown();
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn idempotency_index_is_updated_and_rebuilt_on_reopen() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let root = tempdir.path().to_path_buf();
-        let key = "automation:indexed:2026-07-10T00:00:00Z";
-        let manager =
-            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
-                .await?;
-        manager.shutdown();
-
-        let first = manager
-            .add_task_with_idempotency_key(NewTaskRequest::from_prompt("indexed work"), key)
-            .await?;
-        {
-            let state = manager.state.lock().await;
-            assert_eq!(state.idempotency_index.get(key), Some(&first.id));
-        }
-        drop(manager);
-
-        let reopened =
-            TaskManager::start_with_executor(test_config(root), Arc::new(MockExecutor)).await?;
-        reopened.shutdown();
-        {
-            let state = reopened.state.lock().await;
-            assert_eq!(state.idempotency_index.get(key), Some(&first.id));
-        }
-        let repeated = reopened
-            .add_task_with_idempotency_key(NewTaskRequest::from_prompt("ignored retry"), key)
-            .await?;
-
-        assert_eq!(repeated.id, first.id);
-        assert_eq!(reopened.list_tasks(None).await.len(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn failed_enqueue_persistence_leaves_no_in_memory_task() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let root = tempdir.path().to_path_buf();
-        let key = "automation:retry-after-write-failure";
-        let manager =
-            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
-                .await?;
-        manager.shutdown();
-        let probe = Arc::new(TestPersistenceProbe::default());
-        manager.install_persistence_probe(Arc::clone(&probe));
-        probe.fail_next_task_write.store(true, Ordering::SeqCst);
-
-        let failed = manager
-            .add_task_with_idempotency_key(NewTaskRequest::from_prompt("retry me"), key)
-            .await;
-
-        assert!(failed.is_err(), "the injected task write must fail the add");
-        assert!(
-            manager.list_tasks(None).await.is_empty(),
-            "a failed durable write must not publish a task in memory"
-        );
-        {
-            let state = manager.state.lock().await;
-            assert!(state.queue.is_empty());
-            assert!(!state.idempotency_index.contains_key(key));
-        }
-
-        let retried = manager
-            .add_task_with_idempotency_key(NewTaskRequest::from_prompt("retry me"), key)
-            .await?;
-        assert!(
-            root.join("tasks")
-                .join(format!("{}.json", retried.id))
-                .is_file()
-        );
-        drop(manager);
-
-        let reopened =
-            TaskManager::start_with_executor(test_config(root), Arc::new(MockExecutor)).await?;
-        reopened.shutdown();
-        let recovered = reopened
-            .add_task_with_idempotency_key(NewTaskRequest::from_prompt("ignored"), key)
-            .await?;
-        assert_eq!(recovered.id, retried.id);
-        assert_eq!(reopened.list_tasks(None).await.len(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn queue_cache_failure_returns_durable_task_and_reopens_once() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let root = tempdir.path().to_path_buf();
-        let key = "automation:queue-cache-failure";
-        let manager =
-            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
-                .await?;
-        manager.shutdown();
-        let probe = Arc::new(TestPersistenceProbe::default());
-        manager.install_persistence_probe(Arc::clone(&probe));
-        probe.fail_next_queue_write.store(true, Ordering::SeqCst);
-
-        let task = manager
-            .add_task_with_idempotency_key(NewTaskRequest::from_prompt("durable work"), key)
-            .await
-            .expect("queue cache failure must not fail a durable task add");
-        assert!(
-            root.join("tasks")
-                .join(format!("{}.json", task.id))
-                .is_file()
-        );
-        assert_eq!(
-            probe.queue_writes.load(Ordering::SeqCst),
-            1,
-            "add must attempt to refresh the queue ordering cache"
-        );
-        assert!(
-            !probe.fail_next_queue_write.load(Ordering::SeqCst),
-            "the injected queue failure must be consumed"
-        );
-        drop(manager);
-
-        let (loaded_tasks, recovered_queue) =
-            load_state(&root.join("tasks"), &root.join("queue.json"))?;
-        assert!(loaded_tasks.contains_key(&task.id));
-        assert_eq!(
-            recovered_queue
-                .iter()
-                .filter(|queued_id| *queued_id == &task.id)
-                .count(),
-            1,
-            "load_state must rebuild the missing queued task exactly once"
-        );
-
-        let reopened =
-            TaskManager::start_with_executor(test_config(root), Arc::new(MockExecutor)).await?;
-        reopened.shutdown();
-        let repeated = reopened
-            .add_task_with_idempotency_key(NewTaskRequest::from_prompt("ignored retry"), key)
-            .await?;
-        assert_eq!(repeated.id, task.id);
-        assert_eq!(reopened.list_tasks(None).await.len(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn ten_adds_write_exactly_ten_task_records() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let manager = TaskManager::start_with_executor(
-            test_config(tempdir.path().to_path_buf()),
-            Arc::new(MockExecutor),
-        )
-        .await?;
-        manager.shutdown();
-        let probe = Arc::new(TestPersistenceProbe::default());
-        manager.install_persistence_probe(Arc::clone(&probe));
-
-        for index in 0..10 {
-            manager
-                .add_task(NewTaskRequest::from_prompt(format!("task {index}")))
-                .await?;
-        }
-
-        assert_eq!(
-            probe.task_writes.load(Ordering::SeqCst),
-            10,
-            "each add must persist only its new task record"
-        );
-        assert_eq!(manager.list_tasks(None).await.len(), 10);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn executor_non_terminal_results_fail_closed() -> Result<()> {
-        for returned_status in [TaskStatus::Queued, TaskStatus::Running] {
-            let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
-            let manager = TaskManager::start_with_executor(
-                test_config(root),
-                Arc::new(NonTerminalExecutor {
-                    status: returned_status,
-                }),
-            )
-            .await?;
-            let task = manager
-                .add_task(NewTaskRequest::from_prompt("return a terminal result"))
-                .await?;
-
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            let finished = loop {
-                let current = manager.get_task(&task.id).await?;
-                if current.ended_at.is_some() {
-                    break current;
-                }
-                if std::time::Instant::now() >= deadline {
-                    bail!("executor result was not finalized");
-                }
-                sleep(Duration::from_millis(10)).await;
-            };
-
-            assert_eq!(finished.status, TaskStatus::Failed);
-            assert!(
-                finished
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("non-terminal"))
-            );
-            manager.shutdown();
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn add_task_rejects_mode_outside_persisted_mode_set() -> Result<()> {
-        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
-        let manager =
-            TaskManager::start_with_executor(test_config(root), Arc::new(MockExecutor)).await?;
-        let mut request = NewTaskRequest::from_prompt("invalid persisted mode");
-        request.mode = Some("observer".to_string());
-
-        let error = manager
-            .add_task(request)
-            .await
-            .expect_err("unknown modes must not cross the persistence boundary");
-
-        assert!(error.to_string().contains("agent, plan, yolo"));
-        assert!(manager.list_tasks(None).await.is_empty());
-        manager.shutdown();
-        Ok(())
-    }
-
     #[tokio::test]
     async fn persists_and_recovers_task_records() -> Result<()> {
         let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
@@ -3906,9 +1811,6 @@ mod tests {
         assert_eq!(finished.status, TaskStatus::Completed);
         assert_eq!(finished.thread_id.as_deref(), Some("thr_test"));
         assert_eq!(finished.turn_id.as_deref(), Some("turn_test"));
-        assert!(finished.timeline.iter().any(|entry| {
-            entry.kind == "runtime_thread" && entry.summary == "Linked runtime thread thr_test"
-        }));
         assert_eq!(finished.checklist.items.len(), 1);
         assert_eq!(finished.checklist.in_progress_id, Some(1));
 
@@ -3942,7 +1844,6 @@ mod tests {
             allow_shell: true,
             trust_mode: false,
             auto_approve: false,
-            idempotency_key: None,
             status: TaskStatus::Running,
             created_at: started_at,
             started_at: Some(started_at),
@@ -4143,50 +2044,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn legacy_task_without_auto_approve_deserializes_fail_closed() -> Result<()> {
-        let started_at = Utc::now();
-        let task = TaskRecord {
-            schema_version: CURRENT_TASK_SCHEMA_VERSION,
-            id: "task_legacy_policy".to_string(),
-            prompt: "legacy task".to_string(),
-            model: "legacy-model".to_string(),
-            workspace: PathBuf::from("."),
-            mode: "agent".to_string(),
-            allow_shell: false,
-            trust_mode: false,
-            auto_approve: false,
-            idempotency_key: None,
-            status: TaskStatus::Completed,
-            created_at: started_at,
-            started_at: Some(started_at),
-            ended_at: Some(started_at),
-            duration_ms: Some(0),
-            result_summary: None,
-            result_detail_path: None,
-            error: None,
-            thread_id: None,
-            turn_id: None,
-            runtime_event_count: 0,
-            checklist: TaskChecklistState::default(),
-            gates: Vec::new(),
-            attempts: Vec::new(),
-            artifacts: Vec::new(),
-            github_events: Vec::new(),
-            tool_calls: Vec::new(),
-            timeline: Vec::new(),
-        };
-        let mut value = serde_json::to_value(task)?;
-        value
-            .as_object_mut()
-            .expect("task is an object")
-            .remove("auto_approve");
-
-        let recovered: TaskRecord = serde_json::from_value(value)?;
-        assert!(!recovered.auto_approve);
-        Ok(())
-    }
-
     #[tokio::test]
     async fn rejects_newer_task_schema_on_recovery() -> Result<()> {
         let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
@@ -4209,464 +2066,6 @@ mod tests {
             Ok(_) => panic!("manager should reject newer task schema"),
             Err(err) => assert!(err.to_string().contains("newer than supported")),
         }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reporter_failure_cancels_token() -> Result<()> {
-        let closed_cancel = CancellationToken::new();
-        let (closed_tx, closed_rx) = mpsc::unbounded_channel();
-        drop(closed_rx);
-        let closed_reporter = TaskExecutionReporter::new(closed_tx, closed_cancel.clone());
-        let closed = closed_reporter
-            .report(TaskExecutionEvent::Status {
-                message: "closed".to_string(),
-            })
-            .await;
-        assert_eq!(closed, Err(TaskExecutionReportError::Closed));
-        assert!(closed_cancel.is_cancelled());
-
-        let rejected_cancel = CancellationToken::new();
-        let (rejected_tx, mut rejected_rx) = mpsc::unbounded_channel();
-        let rejected_reporter = TaskExecutionReporter::new(rejected_tx, rejected_cancel.clone());
-        let rejected_task = tokio::spawn(async move {
-            rejected_reporter
-                .report(TaskExecutionEvent::Status {
-                    message: "rejected".to_string(),
-                })
-                .await
-        });
-        rejected_rx
-            .recv()
-            .await
-            .expect("pending rejected report")
-            .ack
-            .send(Err("disk full".to_string()))
-            .expect("send rejected ack");
-        assert_eq!(
-            rejected_task.await?,
-            Err(TaskExecutionReportError::Rejected("disk full".to_string()))
-        );
-        assert!(rejected_cancel.is_cancelled());
-
-        let dropped_cancel = CancellationToken::new();
-        let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
-        let dropped_reporter = TaskExecutionReporter::new(dropped_tx, dropped_cancel.clone());
-        let dropped_task = tokio::spawn(async move {
-            dropped_reporter
-                .report(TaskExecutionEvent::Status {
-                    message: "drop ack".to_string(),
-                })
-                .await
-        });
-        drop(dropped_rx.recv().await.expect("pending dropped report"));
-        assert_eq!(
-            dropped_task.await?,
-            Err(TaskExecutionReportError::AcknowledgementDropped)
-        );
-        assert!(dropped_cancel.is_cancelled());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn thread_link_rejection_interrupts_once() -> Result<()> {
-        let runtime = Arc::new(FakeTaskTurnRuntime::new([]));
-        let cancel = CancellationToken::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let reporter = TaskExecutionReporter::new(tx, cancel.clone());
-        let runtime_for_task = Arc::clone(&runtime);
-        let cancel_for_task = cancel.clone();
-        let execution = tokio::spawn(async move {
-            drive_active_turn(
-                runtime_for_task.as_ref(),
-                "task_active",
-                "thr_active",
-                "turn_active",
-                &reporter,
-                &cancel_for_task,
-            )
-            .await
-        });
-
-        let pending = rx.recv().await.expect("ThreadLinked report");
-        assert!(matches!(
-            pending.event,
-            TaskExecutionEvent::ThreadLinked { .. }
-        ));
-        pending
-            .ack
-            .send(Err("persist link failed".to_string()))
-            .expect("send rejected link ack");
-
-        let result = execution.await?;
-        assert_eq!(result.status, TaskStatus::Failed);
-        assert!(cancel.is_cancelled());
-        assert_eq!(runtime.interrupt_calls(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn closed_report_channel_interrupts_once() -> Result<()> {
-        let runtime = FakeTaskTurnRuntime::new([]);
-        let cancel = CancellationToken::new();
-        let (tx, rx) = mpsc::unbounded_channel();
-        drop(rx);
-        let reporter = TaskExecutionReporter::new(tx, cancel.clone());
-
-        let result = drive_active_turn(
-            &runtime,
-            "task_active",
-            "thr_active",
-            "turn_active",
-            &reporter,
-            &cancel,
-        )
-        .await;
-
-        assert_eq!(result.status, TaskStatus::Failed);
-        assert!(cancel.is_cancelled());
-        assert_eq!(runtime.interrupt_calls(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn runtime_event_read_failure_interrupts_once() -> Result<()> {
-        let runtime = FakeTaskTurnRuntime::new([Err("corrupt event json".to_string())]);
-        let cancel = CancellationToken::new();
-        let (reporter, ack_task) = auto_ack_reporter(cancel.clone());
-
-        let result = drive_active_turn(
-            &runtime,
-            "task_active",
-            "thr_active",
-            "turn_active",
-            &reporter,
-            &cancel,
-        )
-        .await;
-        drop(reporter);
-        ack_task.await?;
-
-        assert_eq!(result.status, TaskStatus::Failed);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("Failed to read runtime events"))
-        );
-        assert_eq!(runtime.interrupt_calls(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn successful_terminal_turn_is_not_interrupted() -> Result<()> {
-        let runtime = FakeTaskTurnRuntime::new([Ok(vec![terminal_runtime_event("completed")])]);
-        let cancel = CancellationToken::new();
-        let (reporter, ack_task) = auto_ack_reporter(cancel.clone());
-
-        let result = drive_active_turn(
-            &runtime,
-            "task_active",
-            "thr_active",
-            "turn_active",
-            &reporter,
-            &cancel,
-        )
-        .await;
-        drop(reporter);
-        ack_task.await?;
-
-        assert_eq!(result.status, TaskStatus::Completed);
-        assert_eq!(runtime.interrupt_calls(), 0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn user_cancellation_interrupts_active_turn_once() -> Result<()> {
-        let runtime = FakeTaskTurnRuntime::new([Ok(vec![terminal_runtime_event("canceled")])]);
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let (reporter, ack_task) = auto_ack_reporter(cancel.clone());
-
-        let result = drive_active_turn(
-            &runtime,
-            "task_active",
-            "thr_active",
-            "turn_active",
-            &reporter,
-            &cancel,
-        )
-        .await;
-        drop(reporter);
-        ack_task.await?;
-
-        assert_eq!(result.status, TaskStatus::Canceled);
-        assert_eq!(runtime.interrupt_calls(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn persisted_task_mode_aliases_are_canonicalized() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let root = tempdir.path().to_path_buf();
-        let seed = TaskManager::start_with_executor(
-            test_config(root.clone()),
-            Arc::new(CountingExecutor {
-                calls: Arc::new(AtomicUsize::new(0)),
-                result_text: None,
-            }),
-        )
-        .await?;
-        seed.shutdown();
-
-        let aliases = [
-            ("agent", " 1 "),
-            ("agent", " AgEnT "),
-            ("plan", "2"),
-            ("plan", " PlAn "),
-            ("yolo", " 3 "),
-            ("yolo", "YoLo"),
-        ];
-        let mut task_ids = Vec::new();
-        for (canonical, alias) in aliases {
-            let mut request = NewTaskRequest::from_prompt(format!("load {alias}"));
-            request.mode = Some(canonical.to_string());
-            let task = seed.add_task(request).await?;
-            overwrite_persisted_task_mode(&root, &task.id, alias)?;
-            task_ids.push((task.id, canonical));
-        }
-        drop(seed);
-
-        let (loaded, _) = load_state(&root.join("tasks"), &root.join("queue.json"))?;
-        for (task_id, canonical) in task_ids {
-            assert_eq!(
-                loaded.get(&task_id).expect("loaded alias task").mode,
-                canonical
-            );
-            let persisted: TaskRecord = serde_json::from_str(&fs::read_to_string(
-                root.join("tasks").join(format!("{task_id}.json")),
-            )?)?;
-            assert_eq!(persisted.mode, canonical);
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn invalid_mode_isolated_retaining_idempotency() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let root = tempdir.path().to_path_buf();
-        let seed = TaskManager::start_with_executor(
-            test_config(root.clone()),
-            Arc::new(CountingExecutor {
-                calls: Arc::new(AtomicUsize::new(0)),
-                result_text: None,
-            }),
-        )
-        .await?;
-        seed.shutdown();
-        let healthy = seed
-            .add_task(NewTaskRequest::from_prompt("healthy task"))
-            .await?;
-        let invalid = seed
-            .add_task_with_idempotency_key(
-                NewTaskRequest::from_prompt("invalid mode task"),
-                "invalid-mode-key",
-            )
-            .await?;
-        overwrite_persisted_task_mode(&root, &invalid.id, "observer")?;
-        drop(seed);
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let manager = TaskManager::start_with_executor(
-            test_config(root.clone()),
-            Arc::new(CountingExecutor {
-                calls: Arc::clone(&calls),
-                result_text: Some("done".to_string()),
-            }),
-        )
-        .await?;
-        let completed =
-            wait_for_terminal_state(&manager, &healthy.id, Duration::from_secs(5)).await?;
-        assert_eq!(completed.status, TaskStatus::Completed);
-
-        let isolated = manager.get_task(&invalid.id).await?;
-        assert_eq!(isolated.status, TaskStatus::Failed);
-        assert_eq!(isolated.mode, "agent");
-        assert_eq!(
-            isolated.idempotency_key.as_deref(),
-            Some("invalid-mode-key")
-        );
-        assert!(
-            isolated
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("Invalid persisted task mode 'observer'"))
-        );
-        let repeated = manager
-            .add_task_with_idempotency_key(
-                NewTaskRequest::from_prompt("must reuse isolated task"),
-                "invalid-mode-key",
-            )
-            .await?;
-        assert_eq!(repeated.id, invalid.id);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        let persisted: TaskRecord = serde_json::from_str(&fs::read_to_string(
-            root.join("tasks").join(format!("{}.json", invalid.id)),
-        )?)?;
-        assert_eq!(persisted.status, TaskStatus::Failed);
-        assert_eq!(persisted.mode, "agent");
-        assert_eq!(
-            persisted.idempotency_key.as_deref(),
-            Some("invalid-mode-key")
-        );
-        manager.shutdown();
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn prune_terminal_tasks_preserves_protected_and_active_tasks() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let root = tempdir.path().to_path_buf();
-        let manager =
-            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
-                .await?;
-        manager.shutdown();
-
-        let prunable = manager
-            .add_task_with_idempotency_key(
-                NewTaskRequest::from_prompt("prunable terminal"),
-                "prunable-key",
-            )
-            .await?;
-        manager.write_task_artifact(&prunable.id, "result", "old artifact")?;
-        manager.cancel_task(&prunable.id).await?;
-
-        let protected = manager
-            .add_task(NewTaskRequest::from_prompt("protected terminal"))
-            .await?;
-        manager.write_task_artifact(&protected.id, "result", "keep artifact")?;
-        manager.cancel_task(&protected.id).await?;
-        let queued = manager
-            .add_task(NewTaskRequest::from_prompt("queued task"))
-            .await?;
-
-        let protected_ids = HashSet::from([protected.id.clone()]);
-        let pruned = manager.prune_terminal_tasks(&protected_ids).await?;
-
-        assert_eq!(pruned, vec![prunable.id.clone()]);
-        assert_eq!(manager.task_count().await, 2);
-        assert!(manager.get_task(&prunable.id).await.is_err());
-        assert!(manager.get_task(&protected.id).await.is_ok());
-        assert!(manager.get_task(&queued.id).await.is_ok());
-        assert!(
-            !root
-                .join("tasks")
-                .join(format!("{}.json", prunable.id))
-                .exists()
-        );
-        assert!(!root.join("artifacts").join(&prunable.id).exists());
-        assert!(root.join("artifacts").join(&protected.id).exists());
-        {
-            let state = manager.state.lock().await;
-            assert!(!state.idempotency_index.contains_key("prunable-key"));
-        }
-        let replacement = manager
-            .add_task_with_idempotency_key(
-                NewTaskRequest::from_prompt("replacement"),
-                "prunable-key",
-            )
-            .await?;
-        assert_ne!(replacement.id, prunable.id);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn startup_finishes_journaled_task_prune() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let root = tempdir.path().to_path_buf();
-        let manager =
-            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
-                .await?;
-        manager.shutdown();
-        let task = manager
-            .add_task(NewTaskRequest::from_prompt("crash during prune"))
-            .await?;
-        manager.write_task_artifact(&task.id, "result", "artifact")?;
-        manager.cancel_task(&task.id).await?;
-        let marker = persist_task_prune_marker(&root.join("tasks"), &task.id)?;
-        drop(manager);
-
-        let reopened =
-            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
-                .await?;
-        reopened.shutdown();
-
-        assert!(reopened.get_task(&task.id).await.is_err());
-        assert!(
-            !root
-                .join("tasks")
-                .join(format!("{}.json", task.id))
-                .exists()
-        );
-        assert!(!root.join("artifacts").join(&task.id).exists());
-        assert!(!marker.exists());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn load_state_rejects_unsafe_mismatched_and_duplicate_task_ids() -> Result<()> {
-        async fn seeded_record(root: &Path) -> Result<(TaskRecord, PathBuf)> {
-            let manager = TaskManager::start_with_executor(
-                test_config(root.to_path_buf()),
-                Arc::new(MockExecutor),
-            )
-            .await?;
-            manager.shutdown();
-            let task = manager
-                .add_task(NewTaskRequest::from_prompt("identity seed"))
-                .await?;
-            let path = root.join("tasks").join(format!("{}.json", task.id));
-            Ok((task, path))
-        }
-
-        let unsafe_root = tempfile::tempdir()?;
-        let (mut unsafe_task, unsafe_path) = seeded_record(unsafe_root.path()).await?;
-        unsafe_task.id = "../escape".to_string();
-        write_json_atomic(&unsafe_path, &unsafe_task)?;
-        let unsafe_error = load_state(
-            &unsafe_root.path().join("tasks"),
-            &unsafe_root.path().join("queue.json"),
-        )
-        .expect_err("unsafe persisted id must fail closed");
-        assert!(unsafe_error.to_string().contains("Invalid task identity"));
-
-        let mismatch_root = tempfile::tempdir()?;
-        let (mut mismatch_task, mismatch_path) = seeded_record(mismatch_root.path()).await?;
-        mismatch_task.id = "different-safe-id".to_string();
-        write_json_atomic(&mismatch_path, &mismatch_task)?;
-        let mismatch_error = load_state(
-            &mismatch_root.path().join("tasks"),
-            &mismatch_root.path().join("queue.json"),
-        )
-        .expect_err("filename mismatch must fail closed");
-        assert!(
-            mismatch_error
-                .to_string()
-                .contains("does not match persisted task id")
-        );
-
-        let duplicate_root = tempfile::tempdir()?;
-        let (duplicate_task, duplicate_path) = seeded_record(duplicate_root.path()).await?;
-        let mut loaded = HashMap::new();
-        insert_loaded_task(&mut loaded, duplicate_task.clone(), &duplicate_path)?;
-        let duplicate_error = insert_loaded_task(&mut loaded, duplicate_task, &duplicate_path)
-            .expect_err("duplicate task id must be rejected");
-        assert!(
-            duplicate_error
-                .to_string()
-                .contains("Duplicate persisted task id")
-        );
         Ok(())
     }
 
