@@ -2267,7 +2267,6 @@ async fn yolo_mode_does_not_prompt_for_typed_ask_rule() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-#[ignore = "pinvou3-fork: session 首请求 cache-warmup 多发一个预热请求(turn_loop #1),该 wiremock 请求计数断言需按 warmup 重写"]
 async fn yolo_mode_does_not_prompt_for_model_driven_typed_ask_rule() {
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2396,7 +2395,6 @@ async fn yolo_mode_does_not_prompt_for_model_driven_typed_ask_rule() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-#[ignore = "pinvou3-fork: session 首请求 cache-warmup 多发一个预热请求(turn_loop #1),该 wiremock 请求计数断言需按 warmup 重写"]
 async fn yolo_mode_does_not_prompt_for_background_shell_safety_floor() {
     // Regression: every shell command is classified RiskLevel::Destructive, and
     // a background shell (input `background: true`) gets RunOrigin::Background.
