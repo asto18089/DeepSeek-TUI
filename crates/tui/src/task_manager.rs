@@ -978,6 +978,43 @@ impl TaskManager {
             .ok_or_else(|| anyhow!("Task not found: {id_or_prefix}"))
     }
 
+    /// Delete a terminal task and its task-owned artifacts. Automation
+    /// retention uses this together with the matching Run and Session cleanup.
+    pub async fn delete_terminal_task(&self, task_id: &str) -> Result<bool> {
+        ensure_safe_task_storage_id(task_id)?;
+        let mut state = self.state.lock().await;
+        let Some(task) = state.tasks.get(task_id) else {
+            return Ok(false);
+        };
+        if matches!(task.status, TaskStatus::Queued | TaskStatus::Running) {
+            bail!("Refusing to delete active task {task_id}");
+        }
+
+        let task_path = self.tasks_dir.join(format!("{task_id}.json"));
+        let artifacts_path = self.artifacts_dir.join(task_id);
+        if artifacts_path.exists() {
+            fs::remove_dir_all(&artifacts_path).with_context(|| {
+                format!(
+                    "Failed to delete task artifacts {}",
+                    artifacts_path.display()
+                )
+            })?;
+        }
+        match fs::remove_file(&task_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to delete task {}", task_path.display()));
+            }
+        }
+
+        state.tasks.remove(task_id);
+        state.queue.retain(|queued_id| queued_id != task_id);
+        self.persist_queue_locked(&state.queue)?;
+        Ok(true)
+    }
+
     /// Cancel a queued or running task by id/prefix.
     pub async fn cancel_task(&self, id_or_prefix: &str) -> Result<TaskRecord> {
         let mut state = self.state.lock().await;
@@ -1661,6 +1698,17 @@ fn load_state(
     Ok((tasks, queue))
 }
 
+fn ensure_safe_task_storage_id(value: &str) -> Result<()> {
+    let mut components = Path::new(value).components();
+    let Some(std::path::Component::Normal(component)) = components.next() else {
+        bail!("Task id must be a non-empty storage name");
+    };
+    if components.next().is_some() || component != value {
+        bail!("Task id must not contain path separators: {value}");
+    }
+    Ok(())
+}
+
 fn resolve_task_id(tasks: &HashMap<String, TaskRecord>, id_or_prefix: &str) -> Result<String> {
     if tasks.contains_key(id_or_prefix) {
         return Ok(id_or_prefix.to_string());
@@ -1959,6 +2007,31 @@ mod tests {
         assert_eq!(loaded.status, TaskStatus::Completed);
         assert!(!loaded.timeline.is_empty());
         assert_eq!(loaded.checklist.items[0].content, "read fixture");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forkguard_deletes_only_terminal_task_records_and_artifacts() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
+        let manager =
+            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
+                .await?;
+        let task = manager
+            .add_task(NewTaskRequest::from_prompt("retention cleanup"))
+            .await?;
+        wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
+
+        let artifact_dir = root.join("artifacts").join(&task.id);
+        fs::create_dir_all(&artifact_dir)?;
+        fs::write(artifact_dir.join("result.txt"), "retained by session")?;
+        assert!(root.join("tasks").join(format!("{}.json", task.id)).exists());
+
+        assert!(manager.delete_terminal_task(&task.id).await?);
+        assert!(manager.get_task(&task.id).await.is_err());
+        assert!(!root.join("tasks").join(format!("{}.json", task.id)).exists());
+        assert!(!artifact_dir.exists());
+        assert!(!manager.delete_terminal_task(&task.id).await?);
+        manager.shutdown();
         Ok(())
     }
 

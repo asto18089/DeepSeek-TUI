@@ -606,6 +606,68 @@ impl AutomationManager {
         Ok(out)
     }
 
+    /// Return terminal runs that exceed the history budget. Active runs never
+    /// consume the budget and are never candidates for retention cleanup.
+    pub fn terminal_run_prune_candidates(
+        &self,
+        retain_terminal: usize,
+    ) -> Result<Vec<AutomationRunRecord>> {
+        let mut candidates = Vec::new();
+        for automation in self.list_automations()? {
+            let mut terminal = self
+                .list_runs(&automation.id, None)?
+                .into_iter()
+                .filter(|run| {
+                    matches!(
+                        run.status,
+                        AutomationRunStatus::Completed
+                            | AutomationRunStatus::Failed
+                            | AutomationRunStatus::Canceled
+                    )
+                })
+                .collect::<Vec<_>>();
+            terminal.sort_by_key(|run| std::cmp::Reverse(run.ended_at.unwrap_or(run.created_at)));
+            candidates.extend(terminal.into_iter().skip(retain_terminal));
+        }
+        candidates.sort_by_key(|run| run.ended_at.unwrap_or(run.created_at));
+        Ok(candidates)
+    }
+
+    /// Delete one terminal run and its execution task. The embedding
+    /// application deletes the matching conversation before calling this.
+    pub async fn delete_terminal_run(
+        &self,
+        expected: &AutomationRunRecord,
+        task_manager: &SharedTaskManager,
+    ) -> Result<bool> {
+        let active_path = self.run_path(&expected.automation_id, &expected.id)?;
+        if !active_path.exists() {
+            return Ok(false);
+        }
+
+        let raw = fs::read_to_string(&active_path)
+            .with_context(|| format!("Failed to read {}", active_path.display()))?;
+        let current: AutomationRunRecord = serde_json::from_str(&raw)
+            .with_context(|| format!("Failed to parse {}", active_path.display()))?;
+        if current.automation_id != expected.automation_id || current.id != expected.id {
+            bail!("Automation run changed identity before retention cleanup");
+        }
+        if matches!(
+            current.status,
+            AutomationRunStatus::Queued | AutomationRunStatus::Running
+        ) {
+            bail!("Refusing to delete active automation run {}", current.id);
+        }
+
+        if let Some(task_id) = current.task_id.as_deref() {
+            task_manager.delete_terminal_task(task_id).await?;
+        }
+        fs::remove_file(&active_path).with_context(|| {
+            format!("Failed to delete automation run {}", active_path.display())
+        })?;
+        Ok(true)
+    }
+
     fn save_run(&self, run: &AutomationRunRecord) -> Result<()> {
         let dir = self.runs_dir_for(&run.automation_id)?;
         fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
@@ -1176,6 +1238,74 @@ mod tests {
                 .expect("runs dir")
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn forkguard_retention_keeps_latest_terminal_runs_and_all_active_runs() -> Result<()> {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager =
+            AutomationManager::open(tempdir.path().join("automations")).expect("manager");
+        let task_manager = TaskManager::start_with_executor(
+            automation_task_config(tempdir.path().join("tasks")),
+            std::sync::Arc::new(AutomationNoopExecutor),
+        )
+        .await?;
+        let automation = manager.create_automation(CreateAutomationRequest {
+            name: "Retention task".to_string(),
+            prompt: "prompt".to_string(),
+            rrule: "FREQ=HOURLY;INTERVAL=1".to_string(),
+            cwds: Vec::new(),
+            model: None,
+            mode: None,
+            allow_shell: None,
+            trust_mode: None,
+            auto_approve: None,
+            status: Some(AutomationStatus::Paused),
+        })?;
+        let base = Utc::now() - chrono::Duration::hours(60);
+        for index in 0..52 {
+            let timestamp = base + chrono::Duration::minutes(index);
+            manager.save_run(&AutomationRunRecord {
+                schema_version: CURRENT_RUN_SCHEMA_VERSION,
+                id: format!("terminal-{index:02}"),
+                automation_id: automation.id.clone(),
+                scheduled_for: timestamp,
+                status: AutomationRunStatus::Completed,
+                created_at: timestamp,
+                started_at: Some(timestamp),
+                ended_at: Some(timestamp),
+                task_id: None,
+                thread_id: Some(format!("sched-terminal-{index:02}")),
+                turn_id: None,
+                error: None,
+            })?;
+        }
+        let active = AutomationRunRecord {
+            status: AutomationRunStatus::Running,
+            id: "active-run".to_string(),
+            automation_id: automation.id.clone(),
+            created_at: base - chrono::Duration::minutes(1),
+            scheduled_for: base - chrono::Duration::minutes(1),
+            ..queued_run_for(&automation)
+        };
+        manager.save_run(&active)?;
+
+        let candidates = manager.terminal_run_prune_candidates(50)?;
+        assert_eq!(
+            candidates.iter().map(|run| run.id.as_str()).collect::<Vec<_>>(),
+            vec!["terminal-00", "terminal-01"]
+        );
+        assert!(!candidates.iter().any(|run| run.id == active.id));
+
+        assert!(manager
+            .delete_terminal_run(&candidates[0], &task_manager)
+            .await?);
+        let remaining = manager.list_runs(&automation.id, None)?;
+        assert_eq!(remaining.len(), 52);
+        assert!(remaining.iter().any(|run| run.id == active.id));
+        assert!(!remaining.iter().any(|run| run.id == "terminal-00"));
+        task_manager.shutdown();
+        Ok(())
     }
 
     #[test]
