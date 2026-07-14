@@ -1,7 +1,7 @@
 use super::*;
 
 use super::context::{COMPACTION_SUMMARY_MARKER, TURN_MAX_OUTPUT_TOKENS};
-use super::turn_loop::registered_tool_approval_required;
+use super::turn_loop::{registered_tool_approval_force_prompt, registered_tool_approval_required};
 use crate::config::ApiProvider;
 use crate::models::SystemBlock;
 use crate::test_support::lock_test_env;
@@ -529,6 +529,10 @@ fn rlm_eval_required_approval_ignores_generic_auto_approve() {
         ApprovalRequirement::Required,
         true
     ));
+    assert!(registered_tool_approval_force_prompt(
+        "rlm_eval",
+        ApprovalRequirement::Required
+    ));
 }
 
 #[test]
@@ -542,6 +546,10 @@ fn generic_required_tools_keep_auto_approve_behavior() {
         "exec_shell",
         ApprovalRequirement::Required,
         false
+    ));
+    assert!(!registered_tool_approval_force_prompt(
+        "exec_shell",
+        ApprovalRequirement::Required
     ));
 }
 

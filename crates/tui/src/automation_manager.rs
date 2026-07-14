@@ -63,6 +63,8 @@ pub struct AutomationRecord {
     #[serde(default)]
     pub cwds: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_shell: Option<bool>,
@@ -133,6 +135,8 @@ pub struct CreateAutomationRequest {
     #[serde(default)]
     pub cwds: Vec<PathBuf>,
     #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
     pub allow_shell: Option<bool>,
@@ -150,6 +154,7 @@ pub struct UpdateAutomationRequest {
     pub prompt: Option<String>,
     pub rrule: Option<String>,
     pub cwds: Option<Vec<PathBuf>>,
+    pub model: Option<String>,
     pub mode: Option<String>,
     pub allow_shell: Option<bool>,
     pub trust_mode: Option<bool>,
@@ -401,6 +406,7 @@ impl AutomationManager {
             prompt: req.prompt.trim().to_string(),
             rrule: req.rrule.trim().to_ascii_uppercase(),
             cwds: req.cwds,
+            model: normalize_optional_string(req.model),
             mode: normalize_optional_string(req.mode),
             allow_shell: req.allow_shell,
             trust_mode: req.trust_mode,
@@ -493,6 +499,9 @@ impl AutomationManager {
         }
         if let Some(cwds) = req.cwds {
             existing.cwds = cwds;
+        }
+        if let Some(model) = req.model {
+            existing.model = normalize_optional_string(Some(model));
         }
         if let Some(mode) = req.mode {
             existing.mode = normalize_optional_string(Some(mode));
@@ -613,7 +622,7 @@ impl AutomationManager {
 
         let new_task = NewTaskRequest {
             prompt: automation.prompt.clone(),
-            model: None,
+            model: automation.model.clone(),
             workspace,
             mode: Some(automation.task_mode()),
             allow_shell: Some(automation.task_allow_shell()),
@@ -621,7 +630,10 @@ impl AutomationManager {
             auto_approve: Some(automation.task_auto_approve()),
         };
 
-        match task_manager.add_task(new_task).await {
+        match task_manager
+            .add_task_with_conversation_key(new_task, Some(automation.id.clone()))
+            .await
+        {
             Ok(task) => {
                 run.status = AutomationRunStatus::Running;
                 run.started_at = Some(Utc::now());
@@ -762,10 +774,12 @@ impl AutomationManager {
                     Err(_) => continue,
                 };
 
+                // A link discovered while the task is still running must be
+                // persisted on its own, or the conversation cannot be opened
+                // from run history until a status change happens to save it.
+                let mut changed = run.thread_id != task.thread_id || run.turn_id != task.turn_id;
                 run.thread_id = task.thread_id.clone();
                 run.turn_id = task.turn_id.clone();
-
-                let mut changed = false;
                 match task.status {
                     TaskStatus::Queued => {
                         if !matches!(run.status, AutomationRunStatus::Queued) {
@@ -978,6 +992,36 @@ mod tests {
         }
     }
 
+    /// Holds the ThreadLinked event until the test releases it, so a link can
+    /// arrive while the run is already persisted as Running.
+    struct DeferredLinkExecutor {
+        started: std::sync::Arc<tokio::sync::Notify>,
+        release_link: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl TaskExecutor for DeferredLinkExecutor {
+        async fn execute(
+            &self,
+            _task: ExecutionTask,
+            events: mpsc::UnboundedSender<TaskExecutionEvent>,
+            cancel: CancellationToken,
+        ) -> TaskExecutionResult {
+            self.started.notify_one();
+            self.release_link.notified().await;
+            let _ = events.send(TaskExecutionEvent::ThreadLinked {
+                thread_id: "sched-link-1".to_string(),
+                turn_id: "turn-link-1".to_string(),
+            });
+            cancel.cancelled().await;
+            TaskExecutionResult {
+                status: TaskStatus::Canceled,
+                result_text: None,
+                error: None,
+            }
+        }
+    }
+
     fn automation_task_config(root: PathBuf) -> TaskManagerConfig {
         TaskManagerConfig {
             data_dir: root,
@@ -992,6 +1036,7 @@ mod tests {
     }
 
     fn automation_record_with_settings(
+        model: Option<&str>,
         mode: Option<&str>,
         allow_shell: Option<bool>,
         trust_mode: Option<bool>,
@@ -1005,6 +1050,7 @@ mod tests {
             prompt: "Run the automation".to_string(),
             rrule: "FREQ=HOURLY;INTERVAL=1".to_string(),
             cwds: Vec::new(),
+            model: model.map(ToString::to_string),
             mode: mode.map(ToString::to_string),
             allow_shell,
             trust_mode,
@@ -1088,6 +1134,7 @@ mod tests {
                 prompt: "prompt".to_string(),
                 rrule: "FREQ=HOURLY;INTERVAL=1".to_string(),
                 cwds: Vec::new(),
+                model: None,
                 mode: None,
                 allow_shell: None,
                 trust_mode: None,
@@ -1187,6 +1234,7 @@ mod tests {
         }))
         .expect("legacy automation record should deserialize");
 
+        assert_eq!(record.model, None);
         assert_eq!(record.mode, None);
         assert_eq!(record.task_mode(), "agent");
         assert!(!record.task_allow_shell());
@@ -1205,7 +1253,8 @@ mod tests {
         )
         .await?;
 
-        let default_automation = automation_record_with_settings(None, None, None, None);
+        let default_automation =
+            automation_record_with_settings(Some("scheduled-model"), None, None, None, None);
         let mut default_run = queued_run_for(&default_automation);
         automation_manager
             .enqueue_run_task(&default_automation, &mut default_run, &task_manager)
@@ -1213,13 +1262,23 @@ mod tests {
         let default_task = task_manager
             .get_task(default_run.task_id.as_deref().expect("task id"))
             .await?;
+        assert_eq!(default_task.model, "scheduled-model");
+        assert_eq!(
+            default_task.conversation_key.as_deref(),
+            Some(default_automation.id.as_str())
+        );
         assert_eq!(default_task.mode, "agent");
         assert!(!default_task.allow_shell);
         assert!(!default_task.trust_mode);
         assert!(default_task.auto_approve);
 
-        let explicit_automation =
-            automation_record_with_settings(Some("plan"), Some(true), Some(true), Some(false));
+        let explicit_automation = automation_record_with_settings(
+            None,
+            Some("plan"),
+            Some(true),
+            Some(true),
+            Some(false),
+        );
         let mut explicit_run = queued_run_for(&explicit_automation);
         automation_manager
             .enqueue_run_task(&explicit_automation, &mut explicit_run, &task_manager)
@@ -1228,10 +1287,88 @@ mod tests {
             .get_task(explicit_run.task_id.as_deref().expect("task id"))
             .await?;
         assert_eq!(explicit_task.mode, "plan");
+        assert_eq!(
+            explicit_task.conversation_key.as_deref(),
+            Some(explicit_automation.id.as_str())
+        );
         assert!(explicit_task.allow_shell);
         assert!(explicit_task.trust_mode);
         assert!(!explicit_task.auto_approve);
 
+        task_manager.shutdown();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forkguard_running_run_link_persists_before_terminal_state() -> Result<()> {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let automation_manager =
+            AutomationManager::open(tempdir.path().join("automations")).expect("manager");
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_link = std::sync::Arc::new(tokio::sync::Notify::new());
+        let task_manager = TaskManager::start_with_executor(
+            automation_task_config(tempdir.path().join("tasks")),
+            std::sync::Arc::new(DeferredLinkExecutor {
+                started: started.clone(),
+                release_link: release_link.clone(),
+            }),
+        )
+        .await?;
+
+        let automation = automation_manager.create_automation(CreateAutomationRequest {
+            name: "link automation".to_string(),
+            prompt: "Run the automation".to_string(),
+            rrule: "FREQ=HOURLY;INTERVAL=1".to_string(),
+            cwds: Vec::new(),
+            model: None,
+            mode: None,
+            allow_shell: None,
+            trust_mode: None,
+            auto_approve: None,
+            status: Some(AutomationStatus::Paused),
+        })?;
+        let mut run = queued_run_for(&automation);
+        automation_manager
+            .enqueue_run_task(&automation, &mut run, &task_manager)
+            .await?;
+        automation_manager.save_run(&run)?;
+        let task_id = run.task_id.clone().expect("task id");
+
+        started.notified().await;
+        // First reconcile persists Running while no link exists yet.
+        automation_manager
+            .reconcile_run_statuses(&task_manager)
+            .await?;
+
+        // The link arrives while the run is already saved as Running.
+        release_link.notify_one();
+        for _ in 0..200 {
+            if task_manager.get_task(&task_id).await?.thread_id.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        automation_manager
+            .reconcile_run_statuses(&task_manager)
+            .await?;
+
+        let persisted = automation_manager
+            .list_runs(&automation.id, Some(10))?
+            .into_iter()
+            .find(|item| item.id == run.id)
+            .expect("run persisted");
+        assert!(
+            matches!(persisted.status, AutomationRunStatus::Running),
+            "run should still be running"
+        );
+        assert_eq!(
+            persisted.thread_id.as_deref(),
+            Some("sched-link-1"),
+            "a link discovered while the task is still running must be saved on its own"
+        );
+        assert_eq!(persisted.turn_id.as_deref(), Some("turn-link-1"));
+
+        let _ = task_manager.cancel_task(&task_id).await;
         task_manager.shutdown();
         Ok(())
     }
