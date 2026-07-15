@@ -1231,6 +1231,7 @@ impl Engine {
                             Some(&registry),
                             None,
                             None,
+                            Some(tool_id.clone()),
                         )
                         .await
                     }
@@ -1270,6 +1271,7 @@ impl Engine {
                             Some(&registry),
                             None,
                             Some(elevated_context),
+                            Some(tool_id.clone()),
                         )
                         .await
                     }
@@ -1287,6 +1289,7 @@ impl Engine {
                     Some(&registry),
                     None,
                     None,
+                    Some(tool_id.clone()),
                 )
                 .await
             }

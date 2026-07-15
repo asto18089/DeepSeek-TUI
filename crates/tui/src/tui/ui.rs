@@ -2040,6 +2040,13 @@ async fn run_event_loop(
                         }
                         handle_tool_call_started(app, &id, &name, &input);
                     }
+                    EngineEvent::ToolCallOutput { .. } => {
+                        // Reserved for embedders such as the Tauri frontend.
+                        // The terminal UI continues to render the authoritative
+                        // result on ToolCallComplete without redrawing for each
+                        // redirected output chunk.
+                        received_engine_event = redraw_requested_before_event;
+                    }
                     EngineEvent::ToolCallComplete { id, name, result } => {
                         if name == "update_plan" {
                             app.plan_tool_used_in_turn = true;
@@ -9360,6 +9367,7 @@ fn suppress_engine_event_after_local_cancel(event: &EngineEvent) -> bool {
             | EngineEvent::ThinkingDelta { .. }
             | EngineEvent::ThinkingComplete { .. }
             | EngineEvent::ToolCallStarted { .. }
+            | EngineEvent::ToolCallOutput { .. }
             | EngineEvent::ToolCallComplete { .. }
             | EngineEvent::ApprovalRequired { .. }
             | EngineEvent::UserInputRequired { .. }
@@ -9378,6 +9386,7 @@ fn ignore_stale_stream_event_while_idle(event: &EngineEvent) -> bool {
             | EngineEvent::ThinkingDelta { .. }
             | EngineEvent::ThinkingComplete { .. }
             | EngineEvent::ToolCallStarted { .. }
+            | EngineEvent::ToolCallOutput { .. }
             | EngineEvent::ToolCallComplete { .. }
             | EngineEvent::ApprovalRequired { .. }
             | EngineEvent::UserInputRequired { .. }

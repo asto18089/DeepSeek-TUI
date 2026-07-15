@@ -248,6 +248,7 @@ impl Engine {
                     Some(registry_ref),
                     mcp_pool,
                     None,
+                    None,
                 )
                 .await;
                 (index, tool_name, result)
@@ -300,6 +301,7 @@ impl Engine {
         registry: Option<&crate::tools::ToolRegistry>,
         mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
         context_override: Option<crate::tools::ToolContext>,
+        tool_call_id: Option<String>,
     ) -> Result<ToolResult, ToolError> {
         let started_at = std::time::Instant::now();
         let dispatch = if McpPool::is_mcp_tool(&tool_name) {
@@ -326,6 +328,30 @@ impl Engine {
             input_bytes,
             "tool.exec.start",
         );
+
+        let mut context_override = context_override;
+        if matches!(
+            tool_name.as_str(),
+            "exec_shell" | "exec_shell_wait" | "exec_wait" | "task_shell_wait"
+        )
+            && let (Some(registry), Some(tool_call_id)) = (registry, tool_call_id)
+        {
+            let mut context = context_override
+                .take()
+                .unwrap_or_else(|| registry.context().clone());
+            let output_tx = tx_event.clone();
+            context.tool_output_sink = Some(Arc::new(move |stream, content| {
+                // Reader threads must never wait for the UI. If the bounded
+                // event channel is temporarily full, the final tool result
+                // still contains the complete output.
+                let _ = output_tx.try_send(Event::ToolCallOutput {
+                    id: tool_call_id.clone(),
+                    stream,
+                    content,
+                });
+            }));
+            context_override = Some(context);
+        }
 
         let _guard = if supports_parallel {
             ToolExecGuard::Read(lock.read().await)

@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::error_taxonomy::ErrorEnvelope;
 use crate::models::{Message, SystemPrompt, Tool, Usage};
 use crate::tools::goal::GoalSnapshot;
-use crate::tools::spec::{ToolError, ToolResult};
+use crate::tools::spec::{ToolError, ToolOutputStream, ToolResult};
 use crate::tools::subagent::SubAgentResult;
 use crate::tools::user_input::UserInputRequest;
 
@@ -70,6 +70,13 @@ pub enum Event {
         id: String,
         name: String,
         input: Value,
+    },
+
+    /// Incremental redirected stdout/stderr emitted while a tool is running.
+    ToolCallOutput {
+        id: String,
+        stream: ToolOutputStream,
+        content: String,
     },
 
     /// Tool call completed
