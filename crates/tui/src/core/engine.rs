@@ -1377,6 +1377,7 @@ impl Engine {
                             Some(&registry),
                             None,
                             None,
+                            Some(tool_id.clone()),
                         )
                         .await;
                         if let Ok(tool_result) = result.as_mut() {
@@ -1423,6 +1424,7 @@ impl Engine {
                             Some(&registry),
                             None,
                             Some(elevated_context),
+                            Some(tool_id.clone()),
                         )
                         .await;
                         if let Ok(tool_result) = result.as_mut() {
@@ -1447,6 +1449,7 @@ impl Engine {
                     Some(&registry),
                     None,
                     None,
+                    Some(tool_id.clone()),
                 )
                 .await
             }

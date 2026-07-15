@@ -31,6 +31,16 @@ pub use codewhale_tools::{
     optional_u64, required_str, required_u64,
 };
 
+/// Identifies which redirected process stream produced a live tool-output chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// Non-blocking live-output callback installed by the engine for the active tool call.
+pub type ToolOutputSink = Arc<dyn Fn(ToolOutputStream, String) + Send + Sync>;
+
 #[async_trait]
 pub trait DynamicToolExecutor: Send + Sync {
     async fn execute_dynamic_tool(
@@ -147,6 +157,9 @@ pub struct ToolContext {
     pub workspace: PathBuf,
     /// Shared shell manager for background tasks and streaming IO.
     pub shell_manager: SharedShellManager,
+    /// Optional callback for forwarding redirected stdout/stderr while a tool
+    /// is still running. Shell readers must never block on this callback.
+    pub tool_output_sink: Option<ToolOutputSink>,
     /// Per-session snapshots for files successfully observed by `read_file`.
     /// Mutation tools use this to reject narrow edits against unread or stale
     /// content.
@@ -265,6 +278,7 @@ impl ToolContext {
         Self {
             workspace,
             shell_manager,
+            tool_output_sink: None,
             file_read_tracker: new_shared_file_read_tracker(),
             owner_agent_id: None,
             owner_agent_name: None,
@@ -310,6 +324,7 @@ impl ToolContext {
         Self {
             workspace,
             shell_manager,
+            tool_output_sink: None,
             file_read_tracker: new_shared_file_read_tracker(),
             owner_agent_id: None,
             owner_agent_name: None,
@@ -355,6 +370,7 @@ impl ToolContext {
         Self {
             workspace,
             shell_manager,
+            tool_output_sink: None,
             file_read_tracker: new_shared_file_read_tracker(),
             owner_agent_id: None,
             owner_agent_name: None,
