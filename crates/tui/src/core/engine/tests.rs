@@ -4918,12 +4918,211 @@ async fn code_execution_runs_through_common_executor_after_approval_gate() {
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("code_execution should run through common executor");
 
     assert!(result.content.contains("common executor code exec"));
     assert!(result.content.contains("return_code"));
+}
+
+#[tokio::test]
+async fn forkguard_engine_emits_shell_output_before_tool_completion() {
+    let tmp = tempdir().expect("tempdir");
+    let context = crate::tools::ToolContext::new(tmp.path());
+    let registry = crate::tools::ToolRegistryBuilder::new()
+        .with_shell_tools()
+        .build(context);
+    let dispatcher = crate::shell_dispatcher::global_dispatcher();
+    let command = if dispatcher.kind().is_powershell() {
+        "Write-Output 'engine-stream-first'; Start-Sleep -Seconds 2; Write-Output 'engine-stream-last'".to_string()
+    } else if cfg!(windows) {
+        "echo engine-stream-first & ping 127.0.0.1 -n 3 > NUL & echo engine-stream-last".to_string()
+    } else {
+        "echo engine-stream-first; sleep 2; echo engine-stream-last".to_string()
+    };
+    let (tx_event, mut rx_event) = mpsc::channel(32);
+    let execution = Engine::execute_tool_with_lock(
+        Arc::new(RwLock::new(())),
+        false,
+        false,
+        tx_event,
+        "exec_shell".to_string(),
+        json!({"command": command, "timeout_ms": 10_000}),
+        tmp.path().to_path_buf(),
+        Some(&registry),
+        None,
+        None,
+        Some("stream-test-tool".to_string()),
+    );
+    tokio::pin!(execution);
+
+    let first_chunk = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                result = &mut execution => {
+                    panic!("shell completed before an output event arrived: {result:?}");
+                }
+                event = rx_event.recv() => {
+                    if let Some(Event::ToolCallOutput { id, stream, content }) = event
+                        && content.contains("engine-stream-first")
+                    {
+                        break (id, stream, content);
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("engine should emit stdout while the shell is still running");
+
+    assert_eq!(first_chunk.0, "stream-test-tool");
+    assert_eq!(first_chunk.1, crate::tools::spec::ToolOutputStream::Stdout);
+    let result = execution.await.expect("shell execution");
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("engine-stream-last"));
+}
+
+#[tokio::test]
+async fn forkguard_engine_keeps_background_shell_output_after_tool_completion() {
+    let tmp = tempdir().expect("tempdir");
+    let context = crate::tools::ToolContext::new(tmp.path());
+    let registry = crate::tools::ToolRegistryBuilder::new()
+        .with_shell_tools()
+        .build(context);
+    let dispatcher = crate::shell_dispatcher::global_dispatcher();
+    let command = if dispatcher.kind().is_powershell() {
+        "Start-Sleep -Seconds 1; Write-Output 'engine-background-after-start'".to_string()
+    } else if cfg!(windows) {
+        "ping 127.0.0.1 -n 2 > NUL & echo engine-background-after-start".to_string()
+    } else {
+        "sleep 1; echo engine-background-after-start".to_string()
+    };
+    let (tx_event, mut rx_event) = mpsc::channel(32);
+
+    let start_result = Engine::execute_tool_with_lock(
+        Arc::new(RwLock::new(())),
+        false,
+        false,
+        tx_event,
+        "exec_shell".to_string(),
+        json!({"command": command, "background": true}),
+        tmp.path().to_path_buf(),
+        Some(&registry),
+        None,
+        None,
+        Some("background-stream-test-tool".to_string()),
+    )
+    .await
+    .expect("start background shell");
+    let task_id = start_result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("task_id"))
+        .and_then(serde_json::Value::as_str)
+        .expect("background task id")
+        .to_string();
+
+    let output = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(Event::ToolCallOutput {
+                id,
+                stream,
+                content,
+            }) = rx_event.recv().await
+                && content.contains("engine-background-after-start")
+            {
+                break (id, stream, content);
+            }
+        }
+    })
+    .await
+    .expect("engine should keep emitting after background exec_shell returns");
+    assert_eq!(output.0, "background-stream-test-tool");
+    assert_eq!(output.1, crate::tools::spec::ToolOutputStream::Stdout);
+
+    let result = registry
+        .execute_full(
+            "exec_shell_wait",
+            json!({"task_id": task_id, "wait": true, "timeout_ms": 10_000}),
+        )
+        .await
+        .expect("wait for background shell");
+    assert!(result.success, "{}", result.content);
+}
+
+#[tokio::test]
+async fn forkguard_engine_emits_background_wait_output_before_tool_completion() {
+    let tmp = tempdir().expect("tempdir");
+    let context = crate::tools::ToolContext::new(tmp.path());
+    let registry = crate::tools::ToolRegistryBuilder::new()
+        .with_shell_tools()
+        .build(context);
+    let dispatcher = crate::shell_dispatcher::global_dispatcher();
+    let command = if dispatcher.kind().is_powershell() {
+        "Write-Output 'engine-wait-first'; Start-Sleep -Seconds 2; Write-Output 'engine-wait-last'"
+            .to_string()
+    } else if cfg!(windows) {
+        "echo engine-wait-first & ping 127.0.0.1 -n 3 > NUL & echo engine-wait-last".to_string()
+    } else {
+        "echo engine-wait-first; sleep 2; echo engine-wait-last".to_string()
+    };
+    let start_result = registry
+        .execute_full(
+            "exec_shell",
+            json!({"command": command, "background": true}),
+        )
+        .await
+        .expect("start background shell");
+    let task_id = start_result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("task_id"))
+        .and_then(serde_json::Value::as_str)
+        .expect("background task id")
+        .to_string();
+
+    let (tx_event, mut rx_event) = mpsc::channel(32);
+    let execution = Engine::execute_tool_with_lock(
+        Arc::new(RwLock::new(())),
+        false,
+        true,
+        tx_event,
+        "exec_shell_wait".to_string(),
+        json!({"task_id": task_id, "wait": true, "timeout_ms": 10_000}),
+        tmp.path().to_path_buf(),
+        Some(&registry),
+        None,
+        None,
+        Some("wait-stream-test-tool".to_string()),
+    );
+    tokio::pin!(execution);
+
+    let first_chunk = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                result = &mut execution => {
+                    panic!("wait completed before an output event arrived: {result:?}");
+                }
+                event = rx_event.recv() => {
+                    if let Some(Event::ToolCallOutput { id, stream, content }) = event
+                        && content.contains("engine-wait-first")
+                    {
+                        break (id, stream, content);
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("engine should emit background stdout while exec_shell_wait is waiting");
+
+    assert_eq!(first_chunk.0, "wait-stream-test-tool");
+    assert_eq!(first_chunk.1, crate::tools::spec::ToolOutputStream::Stdout);
+    let result = execution.await.expect("wait execution");
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("engine-wait-last"));
 }
 
 #[test]
