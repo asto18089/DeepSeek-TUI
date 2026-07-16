@@ -464,6 +464,61 @@ impl StdinWriter {
     }
 }
 
+#[derive(Default)]
+struct StreamingUtf8Decoder {
+    pending: Vec<u8>,
+}
+
+impl StreamingUtf8Decoder {
+    fn push(&mut self, bytes: &[u8]) -> Option<String> {
+        self.pending.extend_from_slice(bytes);
+        let mut decoded = String::new();
+        let mut consumed = 0;
+
+        while consumed < self.pending.len() {
+            match std::str::from_utf8(&self.pending[consumed..]) {
+                Ok(valid) => {
+                    decoded.push_str(valid);
+                    consumed = self.pending.len();
+                }
+                Err(error) => {
+                    let valid_end = consumed + error.valid_up_to();
+                    if valid_end > consumed {
+                        decoded.push_str(
+                            std::str::from_utf8(&self.pending[consumed..valid_end])
+                                .expect("validated UTF-8 prefix"),
+                        );
+                    }
+                    match error.error_len() {
+                        Some(invalid_len) => {
+                            decoded.push('\u{FFFD}');
+                            consumed = valid_end + invalid_len;
+                        }
+                        None => {
+                            consumed = valid_end;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if consumed > 0 {
+            self.pending.drain(..consumed);
+        }
+        (!decoded.is_empty()).then_some(decoded)
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let decoded = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        Some(decoded)
+    }
+}
+
 fn spawn_reader_thread<R: Read + Send + 'static>(
     mut reader: R,
     buffer: Arc<Mutex<Vec<u8>>>,
@@ -472,6 +527,7 @@ fn spawn_reader_thread<R: Read + Send + 'static>(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut chunk = [0u8; 4096];
+        let mut decoder = StreamingUtf8Decoder::default();
         loop {
             match reader.read(&mut chunk) {
                 Ok(0) => break,
@@ -480,11 +536,16 @@ fn spawn_reader_thread<R: Read + Send + 'static>(
                         guard.extend_from_slice(&chunk[..n]);
                     }
                     if let Some(sink) = output_sink.as_ref() {
-                        sink(stream, String::from_utf8_lossy(&chunk[..n]).into_owned());
+                        if let Some(decoded) = decoder.push(&chunk[..n]) {
+                            sink(stream, decoded);
+                        }
                     }
                 }
                 Err(_) => break,
             }
+        }
+        if let (Some(sink), Some(decoded)) = (output_sink.as_ref(), decoder.finish()) {
+            sink(stream, decoded);
         }
     })
 }
