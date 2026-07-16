@@ -1291,14 +1291,15 @@ async fn forkguard_exec_shell_background_streams_after_start_returns() {
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let saw_output = chunks
-                .lock()
-                .expect("output chunks lock")
-                .iter()
-                .any(|(stream, text)| {
-                    *stream == ToolOutputStream::Stdout
-                        && text.contains("background-stream-after-start")
-                });
+            let saw_output =
+                chunks
+                    .lock()
+                    .expect("output chunks lock")
+                    .iter()
+                    .any(|(stream, text)| {
+                        *stream == ToolOutputStream::Stdout
+                            && text.contains("background-stream-after-start")
+                    });
             if saw_output {
                 break;
             }
@@ -1359,13 +1360,14 @@ async fn forkguard_exec_shell_wait_streams_background_output_before_completion()
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let saw_first = chunks
-                .lock()
-                .expect("output chunks lock")
-                .iter()
-                .any(|(stream, text)| {
-                    *stream == ToolOutputStream::Stdout && text.contains("wait-stream-first")
-                });
+            let saw_first =
+                chunks
+                    .lock()
+                    .expect("output chunks lock")
+                    .iter()
+                    .any(|(stream, text)| {
+                        *stream == ToolOutputStream::Stdout && text.contains("wait-stream-first")
+                    });
             if saw_first {
                 break;
             }
@@ -1384,7 +1386,11 @@ async fn forkguard_exec_shell_wait_streams_background_output_before_completion()
         .expect("wait task join")
         .expect("wait execution");
     assert!(result.success, "{}", result.content);
-    assert!(result.content.contains("wait-stream-last"), "{}", result.content);
+    assert!(
+        result.content.contains("wait-stream-last"),
+        "{}",
+        result.content
+    );
 }
 
 #[cfg(not(windows))]
