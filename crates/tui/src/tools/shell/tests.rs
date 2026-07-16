@@ -20,6 +20,7 @@ fn env_lock() -> &'static Mutex<()> {
 }
 
 const BACKGROUND_COMPLETION_WAIT_MS: u64 = 30_000;
+const STREAMING_CHILD_RELEASE_ENV: &str = "CODEWHALE_SHELL_STREAMING_CHILD_RELEASE";
 
 #[cfg(windows)]
 const JOB_OBJECT_QUERY_ACCESS: u32 = 0x0004;
@@ -102,6 +103,36 @@ fn echo_sleep_echo_command(first: &str, seconds: u64, last: &str) -> String {
     }
 }
 
+fn controlled_streaming_child_command(release_path: &std::path::Path) -> String {
+    let dispatcher = crate::shell_dispatcher::global_dispatcher();
+    let executable = std::env::current_exe().expect("current test executable");
+    let executable = executable.to_string_lossy();
+    let release_path = release_path.to_string_lossy();
+    let test_name = "tools::shell::tests::controlled_shell_streaming_child";
+
+    if dispatcher.kind().is_powershell() {
+        let executable = executable.replace('\'', "''");
+        let release_path = release_path.replace('\'', "''");
+        return format!(
+            "$env:{STREAMING_CHILD_RELEASE_ENV}='{release_path}'; & '{executable}' --exact '{test_name}' --nocapture"
+        );
+    }
+    #[cfg(windows)]
+    {
+        format!(
+            "set \"{STREAMING_CHILD_RELEASE_ENV}={release_path}\" && \"{executable}\" --exact {test_name} --nocapture"
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let executable = executable.replace('\'', "'\\''");
+        let release_path = release_path.replace('\'', "'\\''");
+        format!(
+            "{STREAMING_CHILD_RELEASE_ENV}='{release_path}' '{executable}' --exact '{test_name}' --nocapture"
+        )
+    }
+}
+
 fn echo_stdin_command() -> String {
     let dispatcher = crate::shell_dispatcher::global_dispatcher();
     if dispatcher.kind().is_powershell() {
@@ -115,6 +146,25 @@ fn echo_stdin_command() -> String {
     {
         "cat".to_string()
     }
+}
+
+#[test]
+fn controlled_shell_streaming_child() {
+    let Some(release_path) = std::env::var_os(STREAMING_CHILD_RELEASE_ENV) else {
+        return;
+    };
+
+    println!("stream-first");
+    std::io::Write::flush(&mut std::io::stdout()).expect("flush child stdout");
+    let deadline = Instant::now() + Duration::from_millis(BACKGROUND_COMPLETION_WAIT_MS);
+    while !std::path::Path::new(&release_path).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "parent did not release controlled streaming child"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    println!("stream-last");
 }
 
 fn network_restricted_context(tmp: &std::path::Path) -> ToolContext {
@@ -1124,7 +1174,8 @@ async fn forkguard_exec_shell_streams_output_before_completion() {
             .expect("output chunks lock")
             .push((stream, content));
     }));
-    let command = echo_sleep_echo_command("stream-first", 2, "stream-last");
+    let release_path = tmp.path().join("release-streaming-child");
+    let command = controlled_streaming_child_command(&release_path);
 
     let handle = tokio::spawn(async move {
         ExecShellTool
@@ -1132,22 +1183,25 @@ async fn forkguard_exec_shell_streams_output_before_completion() {
             .await
     });
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let saw_first =
-                chunks
-                    .lock()
-                    .expect("output chunks lock")
-                    .iter()
-                    .any(|(stream, text)| {
-                        *stream == ToolOutputStream::Stdout && text.contains("stream-first")
-                    });
-            if saw_first {
-                break;
+    tokio::time::timeout(
+        Duration::from_millis(BACKGROUND_COMPLETION_WAIT_MS),
+        async {
+            loop {
+                let saw_first =
+                    chunks
+                        .lock()
+                        .expect("output chunks lock")
+                        .iter()
+                        .any(|(stream, text)| {
+                            *stream == ToolOutputStream::Stdout && text.contains("stream-first")
+                        });
+                if saw_first {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("first stdout chunk should arrive while the process is running");
 
@@ -1155,8 +1209,10 @@ async fn forkguard_exec_shell_streams_output_before_completion() {
         !handle.is_finished(),
         "stdout was only delivered after the process completed"
     );
-    let result = handle
+    std::fs::write(&release_path, b"release").expect("release controlled streaming child");
+    let result = tokio::time::timeout(Duration::from_millis(BACKGROUND_COMPLETION_WAIT_MS), handle)
         .await
+        .expect("controlled streaming child should finish after release")
         .expect("shell task join")
         .expect("shell execution");
     assert!(result.success, "{}", result.content);
