@@ -4,9 +4,10 @@
 //! parallel-tool fanout out of `engine.rs`; the turn loop still owns planning,
 //! approval, and how tool results are written back into session state.
 
-use std::{fs::OpenOptions, io::Write, sync::Arc, time::Duration};
+use std::{collections::VecDeque, fs::OpenOptions, io::Write, sync::Arc, time::Duration};
 
 use super::*;
+use crate::tools::spec::{ToolOutputSink, ToolOutputStream};
 
 /// RAII guard that pauses the TUI's terminal-state ownership for the duration
 /// of an interactive tool, then restores it on drop.
@@ -74,6 +75,125 @@ impl InteractiveTerminalGuard {
             }
         }
         Self { tx: Some(tx) }
+    }
+}
+
+const TOOL_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
+
+enum ToolOutputForwarderMessage {
+    Chunk {
+        stream: ToolOutputStream,
+        content: String,
+    },
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+struct ToolOutputEventForwarder {
+    tx: mpsc::UnboundedSender<ToolOutputForwarderMessage>,
+}
+
+impl ToolOutputEventForwarder {
+    fn spawn(event_tx: mpsc::Sender<Event>, tool_call_id: String) -> (Self, ToolOutputSink) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_tool_output_forwarder(rx, event_tx, tool_call_id));
+
+        let sink_tx = tx.clone();
+        let sink: ToolOutputSink = Arc::new(move |stream, content| {
+            // Reader threads only enqueue into an unbounded in-process channel;
+            // the async worker owns event-channel backpressure and batching.
+            let _ = sink_tx.send(ToolOutputForwarderMessage::Chunk { stream, content });
+        });
+        (Self { tx }, sink)
+    }
+
+    async fn flush(&self) {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if self
+            .tx
+            .send(ToolOutputForwarderMessage::Flush(ack_tx))
+            .is_ok()
+        {
+            let _ = ack_rx.await;
+        }
+    }
+}
+
+fn append_tool_output_batch(
+    batches: &mut VecDeque<(ToolOutputStream, String)>,
+    stream: ToolOutputStream,
+    content: String,
+) {
+    if content.is_empty() {
+        return;
+    }
+    if let Some((last_stream, last_content)) = batches.back_mut()
+        && *last_stream == stream
+    {
+        last_content.push_str(&content);
+    } else {
+        batches.push_back((stream, content));
+    }
+}
+
+async fn flush_tool_output_batches(
+    batches: &mut VecDeque<(ToolOutputStream, String)>,
+    event_tx: &mpsc::Sender<Event>,
+    tool_call_id: &str,
+) -> bool {
+    while let Some((stream, content)) = batches.pop_front() {
+        if event_tx
+            .send(Event::ToolCallOutput {
+                id: tool_call_id.to_string(),
+                stream,
+                content,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+async fn run_tool_output_forwarder(
+    mut rx: mpsc::UnboundedReceiver<ToolOutputForwarderMessage>,
+    event_tx: mpsc::Sender<Event>,
+    tool_call_id: String,
+) {
+    let mut batches = VecDeque::new();
+    let first_tick = tokio::time::Instant::now() + TOOL_OUTPUT_FLUSH_INTERVAL;
+    let mut ticker = tokio::time::interval_at(first_tick, TOOL_OUTPUT_FLUSH_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            message = rx.recv() => {
+                match message {
+                    Some(ToolOutputForwarderMessage::Chunk { stream, content }) => {
+                        append_tool_output_batch(&mut batches, stream, content);
+                    }
+                    Some(ToolOutputForwarderMessage::Flush(ack)) => {
+                        let delivered =
+                            flush_tool_output_batches(&mut batches, &event_tx, &tool_call_id).await;
+                        let _ = ack.send(());
+                        if !delivered {
+                            return;
+                        }
+                    }
+                    None => {
+                        let _ =
+                            flush_tool_output_batches(&mut batches, &event_tx, &tool_call_id).await;
+                        return;
+                    }
+                }
+            }
+            _ = ticker.tick(), if !batches.is_empty() => {
+                if !flush_tool_output_batches(&mut batches, &event_tx, &tool_call_id).await {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -330,6 +450,7 @@ impl Engine {
         );
 
         let mut context_override = context_override;
+        let mut output_forwarder = None;
         if matches!(
             tool_name.as_str(),
             "exec_shell" | "exec_shell_wait" | "exec_wait" | "task_shell_wait"
@@ -339,17 +460,9 @@ impl Engine {
             let mut context = context_override
                 .take()
                 .unwrap_or_else(|| registry.context().clone());
-            let output_tx = tx_event.clone();
-            context.tool_output_sink = Some(Arc::new(move |stream, content| {
-                // Reader threads must never wait for the UI. If the bounded
-                // event channel is temporarily full, the final tool result
-                // still contains the complete output.
-                let _ = output_tx.try_send(Event::ToolCallOutput {
-                    id: tool_call_id.clone(),
-                    stream,
-                    content,
-                });
-            }));
+            let (forwarder, sink) = ToolOutputEventForwarder::spawn(tx_event.clone(), tool_call_id);
+            context.tool_output_sink = Some(sink);
+            output_forwarder = Some(forwarder);
             context_override = Some(context);
         }
 
@@ -387,6 +500,12 @@ impl Engine {
                 "tool '{tool_name}' is not registered"
             )))
         };
+        if let Some(forwarder) = output_forwarder.as_ref() {
+            // Preserve ordering with the subsequent ToolCallComplete event.
+            // Detached readers keep their own sink clone and continue using
+            // the same worker after this initial flush.
+            forwarder.flush().await;
+        }
 
         let duration_ms = started_at.elapsed().as_millis() as u64;
         match &outcome {
@@ -522,6 +641,73 @@ mod tests {
             .expect("resume event")
             .expect("event channel still open");
         assert!(matches!(resumed, Event::ResumeEvents));
+    }
+
+    #[tokio::test]
+    async fn forkguard_tool_output_forwarder_coalesces_without_dropping_on_backpressure() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Event::status("filler"))
+            .await
+            .expect("fill channel");
+        let expected_stdout = (0..100).map(|i| format!("out-{i};")).collect::<String>();
+        let expected_stderr = (0..50).map(|i| format!("err-{i};")).collect::<String>();
+        let mut batches = VecDeque::new();
+        for i in 0..100 {
+            append_tool_output_batch(
+                &mut batches,
+                ToolOutputStream::Stdout,
+                format!("out-{i};"),
+            );
+        }
+        for i in 0..50 {
+            append_tool_output_batch(
+                &mut batches,
+                ToolOutputStream::Stderr,
+                format!("err-{i};"),
+            );
+        }
+        assert_eq!(batches.len(), 2, "adjacent chunks should be coalesced");
+
+        let mut flush = Box::pin(flush_tool_output_batches(
+            &mut batches,
+            &tx,
+            "congested-tool",
+        ));
+        assert!(
+            matches!(
+                futures_util::poll!(&mut flush),
+                std::task::Poll::Pending
+            ),
+            "a full event channel must apply backpressure to the async worker"
+        );
+        assert!(matches!(rx.recv().await, Some(Event::Status { .. })));
+
+        let collect = async {
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            for _ in 0..2 {
+                match rx.recv().await.expect("forwarded tool output") {
+                    Event::ToolCallOutput {
+                        id,
+                        stream,
+                        content,
+                    } => {
+                        assert_eq!(id, "congested-tool");
+                        match stream {
+                            ToolOutputStream::Stdout => stdout.push_str(&content),
+                            ToolOutputStream::Stderr => stderr.push_str(&content),
+                        }
+                    }
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+            (stdout, stderr)
+        };
+        let (delivered, (stdout, stderr)) = tokio::join!(flush, collect);
+
+        assert!(delivered);
+        assert_eq!(stdout, expected_stdout);
+        assert_eq!(stderr, expected_stderr);
     }
 
     #[test]
