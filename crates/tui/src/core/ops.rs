@@ -162,6 +162,13 @@ pub enum Op {
         expects_file_output: bool,
     },
 
+    /// Cancel every running background sub-agent owned by this engine.
+    ///
+    /// Unlike [`Op::CancelRequest`], this is an explicit background-worker
+    /// cancellation boundary: background sub-agents intentionally use a
+    /// detached cancellation token and therefore survive parent-turn cancel.
+    CancelSubAgents,
+
     /// List current sub-agents and their status
     ListSubAgents,
 

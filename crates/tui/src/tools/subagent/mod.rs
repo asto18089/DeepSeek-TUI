@@ -2331,6 +2331,27 @@ impl SubAgentManager {
         Ok(snapshot)
     }
 
+    /// Cancel all currently running background sub-agents.
+    ///
+    /// This is the engine-level counterpart to the model-facing
+    /// `agent_cancel` tool. Host applications use it when the user stops a
+    /// whole workflow rather than cancelling workers one at a time.
+    pub fn cancel_all_running(&mut self) -> usize {
+        let running: Vec<String> = self
+            .agents
+            .iter()
+            .filter(|(_, agent)| agent.status == SubAgentStatus::Running)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut cancelled = 0;
+        for id in running {
+            if self.cancel(&id).is_ok() {
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
     /// Resume a non-running sub-agent by restarting it with the original assignment.
     #[allow(dead_code)] // Legacy agent_resume path; retained until registry migration.
     pub fn resume(
