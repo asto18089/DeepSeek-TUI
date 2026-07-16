@@ -6,7 +6,9 @@ use crate::config::ApiProvider;
 use crate::models::SystemBlock;
 use crate::test_support::lock_test_env;
 use crate::tools::plan::{PlanItemArg, PlanSnapshot, StepStatus};
-use crate::tools::spec::ToolCapability;
+use crate::tools::spec::{
+    ToolCapability, ToolContext, ToolError, ToolOutputStream, ToolResult, ToolSpec,
+};
 use crate::tools::todo::{TodoItem, TodoListSnapshot, TodoStatus};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -4773,21 +4775,79 @@ async fn code_execution_runs_through_common_executor_after_approval_gate() {
     assert!(result.content.contains("return_code"));
 }
 
+struct ControlledStreamingTool {
+    name: &'static str,
+    first: Option<&'static str>,
+    last: &'static str,
+    release: Arc<tokio::sync::Notify>,
+    detached: bool,
+}
+
+#[async_trait::async_trait]
+impl ToolSpec for ControlledStreamingTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        "Deterministic live-output test tool"
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type": "object", "properties": {}, "required": []})
+    }
+
+    fn capabilities(&self) -> Vec<ToolCapability> {
+        vec![ToolCapability::ReadOnly]
+    }
+
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let sink = context
+            .tool_output_sink
+            .clone()
+            .expect("engine installs a live-output sink for shell tools");
+        if let Some(first) = self.first {
+            sink(ToolOutputStream::Stdout, first.to_string());
+        }
+
+        let release = Arc::clone(&self.release);
+        let last = self.last.to_string();
+        if self.detached {
+            tokio::spawn(async move {
+                release.notified().await;
+                sink(ToolOutputStream::Stdout, last);
+            });
+            Ok(ToolResult {
+                content: "background started".to_string(),
+                success: true,
+                metadata: Some(json!({"task_id": "controlled-background-task"})),
+            })
+        } else {
+            release.notified().await;
+            sink(ToolOutputStream::Stdout, last.clone());
+            Ok(ToolResult::success(last))
+        }
+    }
+}
+
 #[tokio::test]
 async fn forkguard_engine_emits_shell_output_before_tool_completion() {
     let tmp = tempdir().expect("tempdir");
+    let release = Arc::new(tokio::sync::Notify::new());
     let context = crate::tools::ToolContext::new(tmp.path());
     let registry = crate::tools::ToolRegistryBuilder::new()
-        .with_shell_tools()
+        .with_tool(Arc::new(ControlledStreamingTool {
+            name: "exec_shell",
+            first: Some("engine-stream-first"),
+            last: "engine-stream-last",
+            release: Arc::clone(&release),
+            detached: false,
+        }))
         .build(context);
-    let dispatcher = crate::shell_dispatcher::global_dispatcher();
-    let command = if dispatcher.kind().is_powershell() {
-        "Write-Output 'engine-stream-first'; Start-Sleep -Seconds 2; Write-Output 'engine-stream-last'".to_string()
-    } else if cfg!(windows) {
-        "echo engine-stream-first & ping 127.0.0.1 -n 3 > NUL & echo engine-stream-last".to_string()
-    } else {
-        "echo engine-stream-first; sleep 2; echo engine-stream-last".to_string()
-    };
     let (tx_event, mut rx_event) = mpsc::channel(32);
     let execution = Engine::execute_tool_with_lock(
         Arc::new(RwLock::new(())),
@@ -4795,7 +4855,7 @@ async fn forkguard_engine_emits_shell_output_before_tool_completion() {
         false,
         tx_event,
         "exec_shell".to_string(),
-        json!({"command": command, "timeout_ms": 10_000}),
+        json!({}),
         tmp.path().to_path_buf(),
         Some(&registry),
         None,
@@ -4825,6 +4885,7 @@ async fn forkguard_engine_emits_shell_output_before_tool_completion() {
 
     assert_eq!(first_chunk.0, "stream-test-tool");
     assert_eq!(first_chunk.1, crate::tools::spec::ToolOutputStream::Stdout);
+    release.notify_one();
     let result = execution.await.expect("shell execution");
     assert!(result.success, "{}", result.content);
     assert!(result.content.contains("engine-stream-last"));
@@ -4833,18 +4894,17 @@ async fn forkguard_engine_emits_shell_output_before_tool_completion() {
 #[tokio::test]
 async fn forkguard_engine_keeps_background_shell_output_after_tool_completion() {
     let tmp = tempdir().expect("tempdir");
+    let release = Arc::new(tokio::sync::Notify::new());
     let context = crate::tools::ToolContext::new(tmp.path());
     let registry = crate::tools::ToolRegistryBuilder::new()
-        .with_shell_tools()
+        .with_tool(Arc::new(ControlledStreamingTool {
+            name: "exec_shell",
+            first: None,
+            last: "engine-background-after-start",
+            release: Arc::clone(&release),
+            detached: true,
+        }))
         .build(context);
-    let dispatcher = crate::shell_dispatcher::global_dispatcher();
-    let command = if dispatcher.kind().is_powershell() {
-        "Start-Sleep -Seconds 1; Write-Output 'engine-background-after-start'".to_string()
-    } else if cfg!(windows) {
-        "ping 127.0.0.1 -n 2 > NUL & echo engine-background-after-start".to_string()
-    } else {
-        "sleep 1; echo engine-background-after-start".to_string()
-    };
     let (tx_event, mut rx_event) = mpsc::channel(32);
 
     let start_result = Engine::execute_tool_with_lock(
@@ -4853,7 +4913,7 @@ async fn forkguard_engine_keeps_background_shell_output_after_tool_completion() 
         false,
         tx_event,
         "exec_shell".to_string(),
-        json!({"command": command, "background": true}),
+        json!({}),
         tmp.path().to_path_buf(),
         Some(&registry),
         None,
@@ -4862,13 +4922,15 @@ async fn forkguard_engine_keeps_background_shell_output_after_tool_completion() 
     )
     .await
     .expect("start background shell");
-    let task_id = start_result
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("task_id"))
-        .and_then(serde_json::Value::as_str)
-        .expect("background task id")
-        .to_string();
+    assert_eq!(
+        start_result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("task_id"))
+            .and_then(serde_json::Value::as_str),
+        Some("controlled-background-task")
+    );
+    release.notify_one();
 
     let output = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -4887,47 +4949,22 @@ async fn forkguard_engine_keeps_background_shell_output_after_tool_completion() 
     .expect("engine should keep emitting after background exec_shell returns");
     assert_eq!(output.0, "background-stream-test-tool");
     assert_eq!(output.1, crate::tools::spec::ToolOutputStream::Stdout);
-
-    let result = registry
-        .execute_full(
-            "exec_shell_wait",
-            json!({"task_id": task_id, "wait": true, "timeout_ms": 10_000}),
-        )
-        .await
-        .expect("wait for background shell");
-    assert!(result.success, "{}", result.content);
 }
 
 #[tokio::test]
 async fn forkguard_engine_emits_background_wait_output_before_tool_completion() {
     let tmp = tempdir().expect("tempdir");
+    let release = Arc::new(tokio::sync::Notify::new());
     let context = crate::tools::ToolContext::new(tmp.path());
     let registry = crate::tools::ToolRegistryBuilder::new()
-        .with_shell_tools()
+        .with_tool(Arc::new(ControlledStreamingTool {
+            name: "exec_shell_wait",
+            first: Some("engine-wait-first"),
+            last: "engine-wait-last",
+            release: Arc::clone(&release),
+            detached: false,
+        }))
         .build(context);
-    let dispatcher = crate::shell_dispatcher::global_dispatcher();
-    let command = if dispatcher.kind().is_powershell() {
-        "Write-Output 'engine-wait-first'; Start-Sleep -Seconds 2; Write-Output 'engine-wait-last'"
-            .to_string()
-    } else if cfg!(windows) {
-        "echo engine-wait-first & ping 127.0.0.1 -n 3 > NUL & echo engine-wait-last".to_string()
-    } else {
-        "echo engine-wait-first; sleep 2; echo engine-wait-last".to_string()
-    };
-    let start_result = registry
-        .execute_full(
-            "exec_shell",
-            json!({"command": command, "background": true}),
-        )
-        .await
-        .expect("start background shell");
-    let task_id = start_result
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("task_id"))
-        .and_then(serde_json::Value::as_str)
-        .expect("background task id")
-        .to_string();
 
     let (tx_event, mut rx_event) = mpsc::channel(32);
     let execution = Engine::execute_tool_with_lock(
@@ -4936,7 +4973,7 @@ async fn forkguard_engine_emits_background_wait_output_before_tool_completion() 
         true,
         tx_event,
         "exec_shell_wait".to_string(),
-        json!({"task_id": task_id, "wait": true, "timeout_ms": 10_000}),
+        json!({}),
         tmp.path().to_path_buf(),
         Some(&registry),
         None,
@@ -4966,6 +5003,7 @@ async fn forkguard_engine_emits_background_wait_output_before_tool_completion() 
 
     assert_eq!(first_chunk.0, "wait-stream-test-tool");
     assert_eq!(first_chunk.1, crate::tools::spec::ToolOutputStream::Stdout);
+    release.notify_one();
     let result = execution.await.expect("wait execution");
     assert!(result.success, "{}", result.content);
     assert!(result.content.contains("engine-wait-last"));
