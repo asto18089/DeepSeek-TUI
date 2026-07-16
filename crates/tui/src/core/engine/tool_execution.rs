@@ -454,8 +454,7 @@ impl Engine {
         if matches!(
             tool_name.as_str(),
             "exec_shell" | "exec_shell_wait" | "exec_wait" | "task_shell_wait"
-        )
-            && let (Some(registry), Some(tool_call_id)) = (registry, tool_call_id)
+        ) && let (Some(registry), Some(tool_call_id)) = (registry, tool_call_id)
         {
             let mut context = context_override
                 .take()
@@ -653,18 +652,10 @@ mod tests {
         let expected_stderr = (0..50).map(|i| format!("err-{i};")).collect::<String>();
         let mut batches = VecDeque::new();
         for i in 0..100 {
-            append_tool_output_batch(
-                &mut batches,
-                ToolOutputStream::Stdout,
-                format!("out-{i};"),
-            );
+            append_tool_output_batch(&mut batches, ToolOutputStream::Stdout, format!("out-{i};"));
         }
         for i in 0..50 {
-            append_tool_output_batch(
-                &mut batches,
-                ToolOutputStream::Stderr,
-                format!("err-{i};"),
-            );
+            append_tool_output_batch(&mut batches, ToolOutputStream::Stderr, format!("err-{i};"));
         }
         assert_eq!(batches.len(), 2, "adjacent chunks should be coalesced");
 
@@ -674,10 +665,7 @@ mod tests {
             "congested-tool",
         ));
         assert!(
-            matches!(
-                futures_util::poll!(&mut flush),
-                std::task::Poll::Pending
-            ),
+            matches!(futures_util::poll!(&mut flush), std::task::Poll::Pending),
             "a full event channel must apply backpressure to the async worker"
         );
         assert!(matches!(rx.recv().await, Some(Event::Status { .. })));
