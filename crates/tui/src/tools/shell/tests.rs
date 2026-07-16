@@ -164,6 +164,96 @@ fn wait_for_completed_shell(manager: &mut ShellManager, task_id: &str) -> ShellR
     }
 }
 
+struct FragmentedReader {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+}
+
+impl FragmentedReader {
+    fn new(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        Self {
+            chunks: chunks.into_iter().collect(),
+        }
+    }
+}
+
+impl Read for FragmentedReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let Some(chunk) = self.chunks.pop_front() else {
+            return Ok(0);
+        };
+        assert!(chunk.len() <= buffer.len());
+        buffer[..chunk.len()].copy_from_slice(&chunk);
+        Ok(chunk.len())
+    }
+}
+
+#[test]
+fn forkguard_shell_live_output_preserves_utf8_across_read_boundaries() {
+    let stdout_text = "中文输出🙂";
+    let stderr_text = "错误信息🚫";
+    let stdout_bytes = stdout_text.as_bytes();
+    let stderr_bytes = stderr_text.as_bytes();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink_events = Arc::clone(&events);
+    let sink: ToolOutputSink = Arc::new(move |stream, chunk| {
+        sink_events
+            .lock()
+            .expect("live output events")
+            .push((stream, chunk));
+    });
+
+    let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
+    let stdout_thread = spawn_reader_thread(
+        FragmentedReader::new([
+            stdout_bytes[..1].to_vec(),
+            stdout_bytes[1..4].to_vec(),
+            stdout_bytes[4..stdout_bytes.len() - 2].to_vec(),
+            stdout_bytes[stdout_bytes.len() - 2..].to_vec(),
+        ]),
+        Arc::clone(&stdout_buffer),
+        ToolOutputStream::Stdout,
+        Some(Arc::clone(&sink)),
+    );
+    let stderr_thread = spawn_reader_thread(
+        FragmentedReader::new([
+            stderr_bytes[..2].to_vec(),
+            stderr_bytes[2..stderr_bytes.len() - 1].to_vec(),
+            stderr_bytes[stderr_bytes.len() - 1..].to_vec(),
+        ]),
+        Arc::clone(&stderr_buffer),
+        ToolOutputStream::Stderr,
+        Some(sink),
+    );
+
+    stdout_thread.join().expect("stdout reader");
+    stderr_thread.join().expect("stderr reader");
+
+    let events = events.lock().expect("live output events");
+    let stdout_live = events
+        .iter()
+        .filter(|(stream, _)| *stream == ToolOutputStream::Stdout)
+        .map(|(_, chunk)| chunk.as_str())
+        .collect::<String>();
+    let stderr_live = events
+        .iter()
+        .filter(|(stream, _)| *stream == ToolOutputStream::Stderr)
+        .map(|(_, chunk)| chunk.as_str())
+        .collect::<String>();
+    assert_eq!(stdout_live, stdout_text);
+    assert_eq!(stderr_live, stderr_text);
+    assert!(!stdout_live.contains('\u{FFFD}'));
+    assert!(!stderr_live.contains('\u{FFFD}'));
+    assert_eq!(
+        stdout_buffer.lock().expect("stdout buffer").as_slice(),
+        stdout_bytes
+    );
+    assert_eq!(
+        stderr_buffer.lock().expect("stderr buffer").as_slice(),
+        stderr_bytes
+    );
+}
+
 #[test]
 fn exec_shell_parallel_flags_are_input_aware() {
     let tool = ExecShellTool;
