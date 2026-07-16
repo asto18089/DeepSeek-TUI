@@ -2275,6 +2275,104 @@ async fn yolo_mode_does_not_prompt_for_typed_ask_rule() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn forkguard_prefix_cache_warmup_uses_real_tools_without_mutating_history_and_dedupes() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = lock_test_env();
+    let workspace = tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-warmup",
+            "model": crate::config::DEFAULT_TEXT_MODEL,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 123, "completion_tokens": 1, "total_tokens": 124}
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let api_config = Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(server.uri()),
+        ..Config::default()
+    };
+    let (engine, handle) = Engine::new(
+        EngineConfig {
+            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            workspace: workspace.path().to_path_buf(),
+            mcp_config_path: workspace.path().join("missing-mcp.json"),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            ..EngineConfig::default()
+        },
+        &api_config,
+    );
+    let run_task = tokio::spawn(engine.run());
+
+    let before = handle
+        .get_session_snapshot()
+        .await
+        .expect("snapshot before");
+    let first = handle
+        .warm_prefix_cache(AppMode::Yolo)
+        .await
+        .expect("first warmup");
+    let second = handle
+        .warm_prefix_cache(AppMode::Yolo)
+        .await
+        .expect("deduped warmup");
+    handle
+        .send(Op::SetDisallowedTools {
+            tools: vec!["read_file".to_string()],
+        })
+        .await
+        .expect("change visible tool set");
+    let changed = handle
+        .warm_prefix_cache(AppMode::Yolo)
+        .await
+        .expect("warmup after tool-set change");
+    let after = handle.get_session_snapshot().await.expect("snapshot after");
+
+    assert!(!first.skipped);
+    assert!(first.tool_count > 0, "warmup must include native tools");
+    assert!(second.skipped);
+    assert_eq!(first.cache_key, second.cache_key);
+    assert!(!changed.skipped);
+    assert_ne!(first.cache_key, changed.cache_key);
+    assert_eq!(changed.tool_count + 1, first.tool_count);
+    assert_eq!(before.messages.len(), after.messages.len());
+    assert_eq!(before.total_tokens, after.total_tokens);
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("recorded warmup request");
+    assert_eq!(
+        requests.len(),
+        2,
+        "identical warmup is deduped, changed tool set is re-warmed"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("warmup JSON");
+    assert_eq!(body["max_tokens"], json!(8));
+    assert_eq!(body["tool_choice"], json!("none"));
+    assert_eq!(
+        body["tools"].as_array().map(Vec::len),
+        Some(first.tool_count)
+    );
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn yolo_mode_does_not_prompt_for_model_driven_typed_ask_rule() {
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

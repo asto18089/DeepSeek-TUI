@@ -5,7 +5,7 @@
 
 use crate::compaction::CompactionConfig;
 use crate::config::ApiProvider;
-use crate::models::{Message, SystemPrompt};
+use crate::models::{Message, SystemPrompt, Usage};
 use crate::tools::goal::GoalStatus;
 use crate::tui::app::AppMode;
 use crate::tui::approval::ApprovalMode;
@@ -25,6 +25,20 @@ pub struct SessionSnapshot {
     pub workspace: PathBuf,
     pub system_prompt: Option<SystemPrompt>,
     pub mode: String,
+}
+
+/// Result of priming the provider prefix cache for the current session.
+///
+/// The warmup uses the same stable system prompt and model-visible tool
+/// catalog as the next real turn, but never appends its synthetic tail to the
+/// conversation history.
+#[derive(Debug, Clone)]
+pub struct PrefixCacheWarmupResult {
+    pub skipped: bool,
+    pub tool_count: usize,
+    pub cache_key: String,
+    pub elapsed_ms: u64,
+    pub usage: Usage,
 }
 
 /// Origin of text being introduced as a user-role turn.
@@ -68,6 +82,22 @@ impl UserInputProvenance {
 /// Operations that can be submitted to the engine.
 #[derive(Debug, Clone)]
 pub enum Op {
+    /// Connect enabled MCP servers, build the current model-visible tool
+    /// catalog, and prime the provider prefix cache without creating a user
+    /// turn or mutating session history.
+    WarmPrefixCache {
+        mode: AppMode,
+        tx: std::sync::Arc<
+            std::sync::Mutex<
+                Option<
+                    tokio::sync::oneshot::Sender<
+                        std::result::Result<PrefixCacheWarmupResult, String>,
+                    >,
+                >,
+            >,
+        >,
+    },
+
     /// Send a message to the AI
     SendMessage {
         content: String,

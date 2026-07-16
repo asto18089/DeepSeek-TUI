@@ -139,4 +139,18 @@ impl EngineHandle {
         rx.await
             .map_err(|_| anyhow::anyhow!("Engine dropped session snapshot oneshot"))
     }
+
+    /// Prime enabled MCP connections and the provider's stable prompt/tool
+    /// prefix for this engine without adding a synthetic conversation turn.
+    pub async fn warm_prefix_cache(
+        &self,
+        mode: crate::tui::app::AppMode,
+    ) -> Result<crate::core::ops::PrefixCacheWarmupResult> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        self.send(Op::WarmPrefixCache { mode, tx }).await?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Engine dropped prefix-cache warmup oneshot"))?
+            .map_err(anyhow::Error::msg)
+    }
 }

@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::client::DeepSeekClient;
+use crate::client::{DeepSeekClient, build_cache_warmup_request};
 use crate::compaction::{
     CompactionConfig, compact_messages_safe, merge_system_prompts, should_compact,
 };
@@ -60,7 +60,9 @@ use crate::utils::spawn_supervised;
 use crate::working_set::WorkingSet;
 
 use super::events::{Event, TurnOutcomeStatus};
-use super::ops::{Op, SessionSnapshot, USER_SHELL_TOOL_ID_PREFIX, UserInputProvenance};
+use super::ops::{
+    Op, PrefixCacheWarmupResult, SessionSnapshot, USER_SHELL_TOOL_ID_PREFIX, UserInputProvenance,
+};
 use super::session::Session;
 use super::tool_parser;
 use super::turn::{TurnContext, post_turn_snapshot, pre_turn_snapshot};
@@ -587,6 +589,9 @@ pub struct Engine {
     subagent_manager: SharedSubAgentManager,
     shell_manager: SharedShellManager,
     mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
+    /// Last stable system/tool prefix primed by `WarmPrefixCache`. Repeated
+    /// session-open events with the same catalog become cheap no-ops.
+    last_prefix_warmup_key: Option<u64>,
     api_provider: ApiProvider,
     active_route_limits: Option<codewhale_config::route::RouteLimits>,
     rx_op: mpsc::Receiver<Op>,
@@ -1043,6 +1048,7 @@ impl Engine {
             subagent_manager,
             shell_manager,
             mcp_pool: None,
+            last_prefix_warmup_key: None,
             api_provider,
             active_route_limits,
             rx_op,
@@ -1375,6 +1381,15 @@ impl Engine {
                     self.handle_idle_subagent_completion(completion).await;
                 }
                 EngineRunInput::Operation(op) => match op {
+                    Op::WarmPrefixCache { mode, tx } => {
+                        let result = self
+                            .handle_prefix_cache_warmup(mode)
+                            .await
+                            .map_err(|error| format!("{error:#}"));
+                        if let Some(tx) = tx.lock().ok().and_then(|mut guard| guard.take()) {
+                            let _ = tx.send(result);
+                        }
+                    }
                     Op::SendMessage {
                         content,
                         mode,
@@ -3133,6 +3148,169 @@ impl Engine {
         }
 
         pool.to_api_tools()
+    }
+
+    /// Build the exact stable tool catalog used by an ordinary first turn,
+    /// while retaining the newly connected MCP pool on this engine for the
+    /// real user turn that follows.
+    async fn build_prefix_cache_warmup_tools(&mut self, mode: AppMode) -> Vec<Tool> {
+        let todo_list = self.config.todos.clone();
+        let plan_state = self.config.plan_state.clone();
+        let tool_context = self.build_tool_context(mode, mode == AppMode::Yolo);
+        let builder = self.build_turn_tool_registry_builder(mode, todo_list, plan_state);
+        let subagents_available =
+            self.config.subagents_enabled && self.config.features.enabled(Feature::Subagents);
+        let mcp_pool = if self.config.features.enabled(Feature::Mcp) {
+            self.ensure_mcp_pool().await.ok()
+        } else {
+            None
+        };
+
+        let mut tool_registry = match mode {
+            AppMode::Agent | AppMode::Yolo if subagents_available => {
+                if let Some(client) = self.deepseek_client.clone() {
+                    let runtime = SubAgentRuntime::new(
+                        client,
+                        self.session.model.clone(),
+                        tool_context.clone(),
+                        self.session.allow_shell,
+                        Some(self.tx_event.clone()),
+                        Arc::clone(&self.subagent_manager),
+                    )
+                    .with_role_models(self.config.subagent_model_overrides.clone())
+                    .with_auto_model(self.session.auto_model)
+                    .with_reasoning_effort(
+                        self.session.reasoning_effort.clone(),
+                        self.session.reasoning_effort_auto,
+                    )
+                    .with_max_spawn_depth(self.config.max_spawn_depth)
+                    .with_step_api_timeout(self.config.subagent_api_timeout)
+                    .with_speech_output_dir(self.config.speech_output_dir.clone())
+                    .with_mcp_pool(mcp_pool)
+                    .with_parent_completion_tx(self.tx_subagent_completion.clone());
+                    Some(
+                        builder
+                            .with_subagent_tools(self.subagent_manager.clone(), runtime)
+                            .build(tool_context),
+                    )
+                } else {
+                    Some(builder.build(tool_context))
+                }
+            }
+            _ => Some(builder.build(tool_context)),
+        };
+
+        let mut plugin_tool_names = HashSet::new();
+        if let Some(ref mut registry) = tool_registry {
+            plugin_tool_names = configure_plugin_tools(registry, self.config.tools.as_ref());
+        }
+
+        let mcp_tools = if self.config.features.enabled(Feature::Mcp) {
+            self.mcp_tools().await
+        } else {
+            Vec::new()
+        };
+        let Some(registry) = tool_registry else {
+            return Vec::new();
+        };
+        let capability = crate::model_profile::resolved_capability_profile(
+            self.api_config.api_provider(),
+            &self.config.model,
+        );
+        let mut catalog = build_model_tool_catalog_with_surface(
+            registry.to_api_tools_with_cache(true),
+            mcp_tools,
+            mode,
+            &self.config.tools_always_load,
+            capability.tool_surface_budget,
+        );
+        for tool in &mut catalog {
+            if plugin_tool_names.contains(&tool.name) {
+                tool.defer_loading = Some(false);
+            }
+        }
+        filter_tool_catalog_for_gates(
+            &mut catalog,
+            self.config.allowed_tools.as_deref(),
+            self.config.disallowed_tools.as_deref(),
+        );
+        // `handle_deepseek_turn` applies the same final stages before the
+        // first wire request. Warming the full deferred catalog is both
+        // wasteful and byte-incompatible with that request.
+        ensure_advanced_tooling(&mut catalog, mode, &self.config.tools_always_load);
+        apply_tool_whitelist(&mut catalog, self.config.tool_whitelist.as_ref());
+        let active = initial_active_tools(&catalog);
+        active_tools_for_step(&catalog, &active, false)
+    }
+
+    /// Connect enabled MCP servers and prime the provider cache with the
+    /// stable system + tool prefix. The synthetic user tail is sent directly
+    /// through the client and therefore never enters session history or UI
+    /// events.
+    async fn handle_prefix_cache_warmup(
+        &mut self,
+        mode: AppMode,
+    ) -> Result<PrefixCacheWarmupResult> {
+        let started = Instant::now();
+        let client = self
+            .deepseek_client
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("API client not configured for prefix-cache warmup"))?;
+
+        self.current_mode = mode;
+        self.refresh_system_prompt();
+        let tools = self.build_prefix_cache_warmup_tools(mode).await;
+        let tool_count = tools.len();
+        let request = MessageRequest {
+            model: self.session.model.clone(),
+            messages: Vec::new(),
+            max_tokens: 8,
+            system: self.session.system_prompt.clone(),
+            tools: (!tools.is_empty()).then_some(tools),
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: self.session.reasoning_effort.clone(),
+            stream: None,
+            temperature: Some(0.0),
+            top_p: None,
+        };
+        let exact_system = request.system.clone();
+        let mut warmup = build_cache_warmup_request(&request);
+        // The generic TUI debugger intentionally keeps only layers classified
+        // as static. An embedder-owned session knows its complete first-turn
+        // system prompt and needs byte identity, so restore that exact prompt.
+        warmup.system = exact_system;
+        let mut hasher = DefaultHasher::new();
+        self.api_provider.as_str().hash(&mut hasher);
+        client.base_url().hash(&mut hasher);
+        serde_json::to_vec(&warmup)
+            .map_err(|error| anyhow::anyhow!("serialize prefix-cache warmup: {error}"))?
+            .hash(&mut hasher);
+        let key = hasher.finish();
+        let cache_key = format!("{key:012x}");
+        if self.last_prefix_warmup_key == Some(key) {
+            return Ok(PrefixCacheWarmupResult {
+                skipped: true,
+                tool_count,
+                cache_key,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                usage: Usage::default(),
+            });
+        }
+
+        let response =
+            tokio::time::timeout(Duration::from_secs(120), client.create_message(warmup))
+                .await
+                .map_err(|_| anyhow::anyhow!("prefix-cache warmup timed out after 120s"))??;
+        self.last_prefix_warmup_key = Some(key);
+        Ok(PrefixCacheWarmupResult {
+            skipped: false,
+            tool_count,
+            cache_key,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            usage: response.usage,
+        })
     }
 
     /// Handle a turn using the DeepSeek API.
