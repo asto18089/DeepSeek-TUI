@@ -1630,6 +1630,18 @@ impl Engine {
                             }
                         }
                     }
+                    Op::CancelSubAgents => {
+                        let cancelled = {
+                            let mut manager = self.subagent_manager.write().await;
+                            manager.cancel_all_running()
+                        };
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!(
+                                "Cancelled {cancelled} running sub-agent(s)"
+                            )))
+                            .await;
+                    }
                     Op::ListSubAgents => {
                         let agents = {
                             let mut manager = self.subagent_manager.write().await;

@@ -1919,6 +1919,41 @@ async fn test_running_count_counts_only_agents_with_live_task_handles() {
         .abort();
 }
 
+#[tokio::test]
+async fn forkguard_cancel_all_running_aborts_every_live_agent() {
+    let mut manager = SubAgentManager::new(PathBuf::from("."), 4);
+    for suffix in ["a", "b"] {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let mut agent = SubAgent::new(
+            format!("test_agent_{suffix}"),
+            SubAgentType::Explore,
+            "prompt".to_string(),
+            make_assignment(),
+            "deepseek-v4-flash".to_string(),
+            Some(format!("Worker {suffix}")),
+            Some(vec!["read_file".to_string()]),
+            input_tx,
+            PathBuf::from("."),
+            "boot_test".to_string(),
+        );
+        agent.status = SubAgentStatus::Running;
+        agent.task_handle = Some(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }));
+        manager.agents.insert(agent.id.clone(), agent);
+    }
+
+    assert_eq!(manager.cancel_all_running(), 2);
+    assert_eq!(manager.running_count(), 0);
+    assert!(
+        manager
+            .agents
+            .values()
+            .all(|agent| agent.status == SubAgentStatus::Cancelled)
+    );
+    assert_eq!(manager.cancel_all_running(), 0);
+}
+
 #[test]
 fn test_running_count_ignores_running_status_without_task_handle() {
     let mut manager = SubAgentManager::new(PathBuf::from("."), 1);
