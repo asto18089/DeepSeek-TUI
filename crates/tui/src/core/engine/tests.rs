@@ -9,7 +9,9 @@ use crate::config::ApiProvider;
 use crate::models::{SystemBlock, Usage};
 use crate::test_support::{EnvVarGuard, lock_test_env};
 use crate::tools::plan::{PlanItemArg, PlanSnapshot, StepStatus};
-use crate::tools::spec::ToolCapability;
+use crate::tools::spec::{
+    ToolCapability, ToolContext, ToolError, ToolOutputStream, ToolResult, ToolSpec,
+};
 use crate::tools::todo::{TodoItem, TodoListSnapshot, TodoStatus};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -7553,12 +7555,247 @@ async fn code_execution_runs_through_common_executor_after_approval_gate() {
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("code_execution should run through common executor");
 
     assert!(result.content.contains("common executor code exec"));
     assert!(result.content.contains("return_code"));
+}
+
+struct ControlledStreamingTool {
+    name: &'static str,
+    first: Option<&'static str>,
+    last: &'static str,
+    release: Arc<tokio::sync::Notify>,
+    detached: bool,
+}
+
+#[async_trait::async_trait]
+impl ToolSpec for ControlledStreamingTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        "Deterministic live-output test tool"
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type": "object", "properties": {}, "required": []})
+    }
+
+    fn capabilities(&self) -> Vec<ToolCapability> {
+        vec![ToolCapability::ReadOnly]
+    }
+
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let sink = context
+            .tool_output_sink
+            .clone()
+            .expect("engine installs a live-output sink for shell tools");
+        if let Some(first) = self.first {
+            sink(ToolOutputStream::Stdout, first.to_string());
+        }
+
+        let release = Arc::clone(&self.release);
+        let last = self.last.to_string();
+        if self.detached {
+            tokio::spawn(async move {
+                release.notified().await;
+                sink(ToolOutputStream::Stdout, last);
+            });
+            Ok(ToolResult {
+                content: "background started".to_string(),
+                success: true,
+                metadata: Some(json!({"task_id": "controlled-background-task"})),
+            })
+        } else {
+            release.notified().await;
+            sink(ToolOutputStream::Stdout, last.clone());
+            Ok(ToolResult::success(last))
+        }
+    }
+}
+
+#[tokio::test]
+async fn forkguard_engine_emits_shell_output_before_tool_completion() {
+    let tmp = tempdir().expect("tempdir");
+    let release = Arc::new(tokio::sync::Notify::new());
+    let context = crate::tools::ToolContext::new(tmp.path());
+    let registry = crate::tools::ToolRegistryBuilder::new()
+        .with_tool(Arc::new(ControlledStreamingTool {
+            name: "exec_shell",
+            first: Some("engine-stream-first"),
+            last: "engine-stream-last",
+            release: Arc::clone(&release),
+            detached: false,
+        }))
+        .build(context);
+    let (tx_event, mut rx_event) = mpsc::channel(32);
+    let execution = Engine::execute_tool_with_lock(
+        Arc::new(RwLock::new(())),
+        false,
+        false,
+        tx_event,
+        "exec_shell".to_string(),
+        json!({}),
+        tmp.path().to_path_buf(),
+        Some(&registry),
+        None,
+        None,
+        Some("stream-test-tool".to_string()),
+    );
+    tokio::pin!(execution);
+
+    let first_chunk = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                result = &mut execution => {
+                    panic!("shell completed before an output event arrived: {result:?}");
+                }
+                event = rx_event.recv() => {
+                    if let Some(Event::ToolCallOutput { id, stream, content }) = event
+                        && content.contains("engine-stream-first")
+                    {
+                        break (id, stream, content);
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("engine should emit stdout while the shell is still running");
+
+    assert_eq!(first_chunk.0, "stream-test-tool");
+    assert_eq!(first_chunk.1, crate::tools::spec::ToolOutputStream::Stdout);
+    release.notify_one();
+    let result = execution.await.expect("shell execution");
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("engine-stream-last"));
+}
+
+#[tokio::test]
+async fn forkguard_engine_keeps_background_shell_output_after_tool_completion() {
+    let tmp = tempdir().expect("tempdir");
+    let release = Arc::new(tokio::sync::Notify::new());
+    let context = crate::tools::ToolContext::new(tmp.path());
+    let registry = crate::tools::ToolRegistryBuilder::new()
+        .with_tool(Arc::new(ControlledStreamingTool {
+            name: "exec_shell",
+            first: None,
+            last: "engine-background-after-start",
+            release: Arc::clone(&release),
+            detached: true,
+        }))
+        .build(context);
+    let (tx_event, mut rx_event) = mpsc::channel(32);
+
+    let start_result = Engine::execute_tool_with_lock(
+        Arc::new(RwLock::new(())),
+        false,
+        false,
+        tx_event,
+        "exec_shell".to_string(),
+        json!({}),
+        tmp.path().to_path_buf(),
+        Some(&registry),
+        None,
+        None,
+        Some("background-stream-test-tool".to_string()),
+    )
+    .await
+    .expect("start background shell");
+    assert_eq!(
+        start_result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("task_id"))
+            .and_then(serde_json::Value::as_str),
+        Some("controlled-background-task")
+    );
+    release.notify_one();
+
+    let output = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(Event::ToolCallOutput {
+                id,
+                stream,
+                content,
+            }) = rx_event.recv().await
+                && content.contains("engine-background-after-start")
+            {
+                break (id, stream, content);
+            }
+        }
+    })
+    .await
+    .expect("engine should keep emitting after background exec_shell returns");
+    assert_eq!(output.0, "background-stream-test-tool");
+    assert_eq!(output.1, crate::tools::spec::ToolOutputStream::Stdout);
+}
+
+#[tokio::test]
+async fn forkguard_engine_emits_background_wait_output_before_tool_completion() {
+    let tmp = tempdir().expect("tempdir");
+    let release = Arc::new(tokio::sync::Notify::new());
+    let context = crate::tools::ToolContext::new(tmp.path());
+    let registry = crate::tools::ToolRegistryBuilder::new()
+        .with_tool(Arc::new(ControlledStreamingTool {
+            name: "exec_shell_wait",
+            first: Some("engine-wait-first"),
+            last: "engine-wait-last",
+            release: Arc::clone(&release),
+            detached: false,
+        }))
+        .build(context);
+
+    let (tx_event, mut rx_event) = mpsc::channel(32);
+    let execution = Engine::execute_tool_with_lock(
+        Arc::new(RwLock::new(())),
+        false,
+        true,
+        tx_event,
+        "exec_shell_wait".to_string(),
+        json!({}),
+        tmp.path().to_path_buf(),
+        Some(&registry),
+        None,
+        None,
+        Some("wait-stream-test-tool".to_string()),
+    );
+    tokio::pin!(execution);
+
+    let first_chunk = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                result = &mut execution => {
+                    panic!("wait completed before an output event arrived: {result:?}");
+                }
+                event = rx_event.recv() => {
+                    if let Some(Event::ToolCallOutput { id, stream, content }) = event
+                        && content.contains("engine-wait-first")
+                    {
+                        break (id, stream, content);
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("engine should emit background stdout while exec_shell_wait is waiting");
+
+    assert_eq!(first_chunk.0, "wait-stream-test-tool");
+    assert_eq!(first_chunk.1, crate::tools::spec::ToolOutputStream::Stdout);
+    release.notify_one();
+    let result = execution.await.expect("wait execution");
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("engine-wait-last"));
 }
 
 #[test]

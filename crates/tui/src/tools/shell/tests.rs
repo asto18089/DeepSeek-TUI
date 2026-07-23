@@ -20,6 +20,7 @@ fn env_lock() -> &'static Mutex<()> {
 }
 
 const BACKGROUND_COMPLETION_WAIT_MS: u64 = 30_000;
+const STREAMING_CHILD_RELEASE_ENV: &str = "CODEWHALE_SHELL_STREAMING_CHILD_RELEASE";
 
 #[cfg(windows)]
 const JOB_OBJECT_QUERY_ACCESS: u32 = 0x0004;
@@ -84,6 +85,54 @@ fn sleep_then_echo_command(seconds: u64, message: &str) -> String {
     }
 }
 
+fn echo_sleep_echo_command(first: &str, seconds: u64, last: &str) -> String {
+    let dispatcher = crate::shell_dispatcher::global_dispatcher();
+    if dispatcher.kind().is_powershell() {
+        return format!(
+            "Write-Output '{first}'; Start-Sleep -Seconds {seconds}; Write-Output '{last}'"
+        );
+    }
+    #[cfg(windows)]
+    {
+        let ping_count = seconds.saturating_add(1);
+        format!("echo {first} & ping 127.0.0.1 -n {ping_count} > NUL & echo {last}")
+    }
+    #[cfg(not(windows))]
+    {
+        format!("echo {first}; sleep {seconds}; echo {last}")
+    }
+}
+
+fn controlled_streaming_child_command(release_path: &std::path::Path) -> String {
+    let dispatcher = crate::shell_dispatcher::global_dispatcher();
+    let executable = std::env::current_exe().expect("current test executable");
+    let executable = executable.to_string_lossy();
+    let release_path = release_path.to_string_lossy();
+    let test_name = "tools::shell::tests::controlled_shell_streaming_child";
+
+    if dispatcher.kind().is_powershell() {
+        let executable = executable.replace('\'', "''");
+        let release_path = release_path.replace('\'', "''");
+        return format!(
+            "$env:{STREAMING_CHILD_RELEASE_ENV}='{release_path}'; & '{executable}' --exact '{test_name}' --nocapture"
+        );
+    }
+    #[cfg(windows)]
+    {
+        format!(
+            "set \"{STREAMING_CHILD_RELEASE_ENV}={release_path}\" && \"{executable}\" --exact {test_name} --nocapture"
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let executable = executable.replace('\'', "'\\''");
+        let release_path = release_path.replace('\'', "'\\''");
+        format!(
+            "{STREAMING_CHILD_RELEASE_ENV}='{release_path}' '{executable}' --exact '{test_name}' --nocapture"
+        )
+    }
+}
+
 fn echo_stdin_command() -> String {
     let dispatcher = crate::shell_dispatcher::global_dispatcher();
     if dispatcher.kind().is_powershell() {
@@ -97,6 +146,25 @@ fn echo_stdin_command() -> String {
     {
         "cat".to_string()
     }
+}
+
+#[test]
+fn controlled_shell_streaming_child() {
+    let Some(release_path) = std::env::var_os(STREAMING_CHILD_RELEASE_ENV) else {
+        return;
+    };
+
+    println!("stream-first");
+    std::io::Write::flush(&mut std::io::stdout()).expect("flush child stdout");
+    let deadline = Instant::now() + Duration::from_millis(BACKGROUND_COMPLETION_WAIT_MS);
+    while !std::path::Path::new(&release_path).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "parent did not release controlled streaming child"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    println!("stream-last");
 }
 
 fn network_restricted_context(tmp: &std::path::Path) -> ToolContext {
@@ -144,6 +212,96 @@ fn wait_for_completed_shell(manager: &mut ShellManager, task_id: &str) -> ShellR
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+struct FragmentedReader {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+}
+
+impl FragmentedReader {
+    fn new(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        Self {
+            chunks: chunks.into_iter().collect(),
+        }
+    }
+}
+
+impl Read for FragmentedReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let Some(chunk) = self.chunks.pop_front() else {
+            return Ok(0);
+        };
+        assert!(chunk.len() <= buffer.len());
+        buffer[..chunk.len()].copy_from_slice(&chunk);
+        Ok(chunk.len())
+    }
+}
+
+#[test]
+fn forkguard_shell_live_output_preserves_utf8_across_read_boundaries() {
+    let stdout_text = "中文输出🙂";
+    let stderr_text = "错误信息🚫";
+    let stdout_bytes = stdout_text.as_bytes();
+    let stderr_bytes = stderr_text.as_bytes();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink_events = Arc::clone(&events);
+    let sink: ToolOutputSink = Arc::new(move |stream, chunk| {
+        sink_events
+            .lock()
+            .expect("live output events")
+            .push((stream, chunk));
+    });
+
+    let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
+    let stdout_thread = spawn_reader_thread(
+        FragmentedReader::new([
+            stdout_bytes[..1].to_vec(),
+            stdout_bytes[1..4].to_vec(),
+            stdout_bytes[4..stdout_bytes.len() - 2].to_vec(),
+            stdout_bytes[stdout_bytes.len() - 2..].to_vec(),
+        ]),
+        Arc::clone(&stdout_buffer),
+        ToolOutputStream::Stdout,
+        Some(Arc::clone(&sink)),
+    );
+    let stderr_thread = spawn_reader_thread(
+        FragmentedReader::new([
+            stderr_bytes[..2].to_vec(),
+            stderr_bytes[2..stderr_bytes.len() - 1].to_vec(),
+            stderr_bytes[stderr_bytes.len() - 1..].to_vec(),
+        ]),
+        Arc::clone(&stderr_buffer),
+        ToolOutputStream::Stderr,
+        Some(sink),
+    );
+
+    stdout_thread.join().expect("stdout reader");
+    stderr_thread.join().expect("stderr reader");
+
+    let events = events.lock().expect("live output events");
+    let stdout_live = events
+        .iter()
+        .filter(|(stream, _)| *stream == ToolOutputStream::Stdout)
+        .map(|(_, chunk)| chunk.as_str())
+        .collect::<String>();
+    let stderr_live = events
+        .iter()
+        .filter(|(stream, _)| *stream == ToolOutputStream::Stderr)
+        .map(|(_, chunk)| chunk.as_str())
+        .collect::<String>();
+    assert_eq!(stdout_live, stdout_text);
+    assert_eq!(stderr_live, stderr_text);
+    assert!(!stdout_live.contains('\u{FFFD}'));
+    assert!(!stderr_live.contains('\u{FFFD}'));
+    assert_eq!(
+        stdout_buffer.lock().expect("stdout buffer").as_slice(),
+        stdout_bytes
+    );
+    assert_eq!(
+        stderr_buffer.lock().expect("stderr buffer").as_slice(),
+        stderr_bytes
+    );
 }
 
 #[test]
@@ -1042,6 +1200,197 @@ async fn test_exec_shell_metadata_includes_summaries() {
     assert!(summary.contains("hello"));
     assert!(meta.get("stdout_len").is_some());
     assert!(meta.get("stdout_truncated").is_some());
+}
+
+#[tokio::test]
+async fn forkguard_exec_shell_streams_output_before_completion() {
+    let tmp = tempdir().expect("tempdir");
+    let chunks = std::sync::Arc::new(std::sync::Mutex::new(
+        Vec::<(ToolOutputStream, String)>::new(),
+    ));
+    let observed = chunks.clone();
+    let mut ctx = ToolContext::new(tmp.path());
+    ctx.tool_output_sink = Some(std::sync::Arc::new(move |stream, content| {
+        observed
+            .lock()
+            .expect("output chunks lock")
+            .push((stream, content));
+    }));
+    let release_path = tmp.path().join("release-streaming-child");
+    let command = controlled_streaming_child_command(&release_path);
+
+    let handle = tokio::spawn(async move {
+        ExecShellTool
+            .execute(json!({"command": command, "timeout_ms": 10_000}), &ctx)
+            .await
+    });
+
+    tokio::time::timeout(
+        Duration::from_millis(BACKGROUND_COMPLETION_WAIT_MS),
+        async {
+            loop {
+                let saw_first =
+                    chunks
+                        .lock()
+                        .expect("output chunks lock")
+                        .iter()
+                        .any(|(stream, text)| {
+                            *stream == ToolOutputStream::Stdout && text.contains("stream-first")
+                        });
+                if saw_first {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+    )
+    .await
+    .expect("first stdout chunk should arrive while the process is running");
+
+    assert!(
+        !handle.is_finished(),
+        "stdout was only delivered after the process completed"
+    );
+    std::fs::write(&release_path, b"release").expect("release controlled streaming child");
+    let result = tokio::time::timeout(Duration::from_millis(BACKGROUND_COMPLETION_WAIT_MS), handle)
+        .await
+        .expect("controlled streaming child should finish after release")
+        .expect("shell task join")
+        .expect("shell execution");
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("stream-last"), "{}", result.content);
+}
+
+#[tokio::test]
+async fn forkguard_exec_shell_background_streams_after_start_returns() {
+    let tmp = tempdir().expect("tempdir");
+    let chunks = std::sync::Arc::new(std::sync::Mutex::new(
+        Vec::<(ToolOutputStream, String)>::new(),
+    ));
+    let observed = chunks.clone();
+    let mut ctx = ToolContext::new(tmp.path());
+    ctx.tool_output_sink = Some(std::sync::Arc::new(move |stream, content| {
+        observed
+            .lock()
+            .expect("output chunks lock")
+            .push((stream, content));
+    }));
+    let command = sleep_then_echo_command(1, "background-stream-after-start");
+
+    let start_result = ExecShellTool
+        .execute(json!({"command": command, "background": true}), &ctx)
+        .await
+        .expect("start background shell");
+    let task_id = start_result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("task_id"))
+        .and_then(Value::as_str)
+        .expect("background task id")
+        .to_string();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let saw_output =
+                chunks
+                    .lock()
+                    .expect("output chunks lock")
+                    .iter()
+                    .any(|(stream, text)| {
+                        *stream == ToolOutputStream::Stdout
+                            && text.contains("background-stream-after-start")
+                    });
+            if saw_output {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("background stdout should continue after exec_shell returns");
+
+    let mut cleanup_ctx = ctx.clone();
+    cleanup_ctx.tool_output_sink = None;
+    let result = ShellWaitTool::new("exec_shell_wait")
+        .execute(
+            json!({"task_id": task_id, "wait": true, "timeout_ms": 10_000}),
+            &cleanup_ctx,
+        )
+        .await
+        .expect("wait for background shell");
+    assert!(result.success, "{}", result.content);
+}
+
+#[tokio::test]
+async fn forkguard_exec_shell_wait_streams_background_output_before_completion() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path());
+    let command = echo_sleep_echo_command("wait-stream-first", 2, "wait-stream-last");
+    let start_result = ExecShellTool
+        .execute(json!({"command": command, "background": true}), &ctx)
+        .await
+        .expect("start background shell");
+    let task_id = start_result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("task_id"))
+        .and_then(Value::as_str)
+        .expect("background task id")
+        .to_string();
+
+    let chunks = std::sync::Arc::new(std::sync::Mutex::new(
+        Vec::<(ToolOutputStream, String)>::new(),
+    ));
+    let observed = chunks.clone();
+    let mut wait_ctx = ctx.clone();
+    wait_ctx.tool_output_sink = Some(std::sync::Arc::new(move |stream, content| {
+        observed
+            .lock()
+            .expect("output chunks lock")
+            .push((stream, content));
+    }));
+    let handle = tokio::spawn(async move {
+        ShellWaitTool::new("exec_shell_wait")
+            .execute(
+                json!({"task_id": task_id, "wait": true, "timeout_ms": 10_000}),
+                &wait_ctx,
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let saw_first =
+                chunks
+                    .lock()
+                    .expect("output chunks lock")
+                    .iter()
+                    .any(|(stream, text)| {
+                        *stream == ToolOutputStream::Stdout && text.contains("wait-stream-first")
+                    });
+            if saw_first {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("background stdout should arrive while exec_shell_wait is waiting");
+
+    assert!(
+        !handle.is_finished(),
+        "exec_shell_wait only delivered output after the background process completed"
+    );
+    let result = handle
+        .await
+        .expect("wait task join")
+        .expect("wait execution");
+    assert!(result.success, "{}", result.content);
+    assert!(
+        result.content.contains("wait-stream-last"),
+        "{}",
+        result.content
+    );
 }
 
 #[cfg(not(windows))]

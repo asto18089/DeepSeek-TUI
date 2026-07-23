@@ -468,12 +468,70 @@ impl StdinWriter {
     }
 }
 
+#[derive(Default)]
+struct StreamingUtf8Decoder {
+    pending: Vec<u8>,
+}
+
+impl StreamingUtf8Decoder {
+    fn push(&mut self, bytes: &[u8]) -> Option<String> {
+        self.pending.extend_from_slice(bytes);
+        let mut decoded = String::new();
+        let mut consumed = 0;
+
+        while consumed < self.pending.len() {
+            match std::str::from_utf8(&self.pending[consumed..]) {
+                Ok(valid) => {
+                    decoded.push_str(valid);
+                    consumed = self.pending.len();
+                }
+                Err(error) => {
+                    let valid_end = consumed + error.valid_up_to();
+                    if valid_end > consumed {
+                        decoded.push_str(
+                            std::str::from_utf8(&self.pending[consumed..valid_end])
+                                .expect("validated UTF-8 prefix"),
+                        );
+                    }
+                    match error.error_len() {
+                        Some(invalid_len) => {
+                            decoded.push('\u{FFFD}');
+                            consumed = valid_end + invalid_len;
+                        }
+                        None => {
+                            consumed = valid_end;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if consumed > 0 {
+            self.pending.drain(..consumed);
+        }
+        (!decoded.is_empty()).then_some(decoded)
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let decoded = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        Some(decoded)
+    }
+}
+
 fn spawn_reader_thread<R: Read + Send + 'static>(
     mut reader: R,
     buffer: Arc<Mutex<Vec<u8>>>,
+    stream: ToolOutputStream,
+    output_sink: Option<ToolOutputSink>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut chunk = [0u8; 4096];
+        let mut decoder = StreamingUtf8Decoder::default();
         loop {
             match reader.read(&mut chunk) {
                 Ok(0) => break,
@@ -481,9 +539,17 @@ fn spawn_reader_thread<R: Read + Send + 'static>(
                     if let Ok(mut guard) = buffer.lock() {
                         guard.extend_from_slice(&chunk[..n]);
                     }
+                    if let Some(sink) = output_sink.as_ref() {
+                        if let Some(decoded) = decoder.push(&chunk[..n]) {
+                            sink(stream, decoded);
+                        }
+                    }
                 }
                 Err(_) => break,
             }
+        }
+        if let (Some(sink), Some(decoded)) = (output_sink.as_ref(), decoder.finish()) {
+            sink(stream, decoded);
         }
     })
 }
@@ -1050,6 +1116,7 @@ impl ShellManager {
             policy_override,
             extra_env,
             None,
+            None,
         )
     }
 
@@ -1067,6 +1134,7 @@ impl ShellManager {
         policy_override: Option<ExecutionSandboxPolicy>,
         extra_env: HashMap<String, String>,
         owner_agent: Option<ShellJobOwner>,
+        output_sink: Option<ToolOutputSink>,
     ) -> Result<ShellResult> {
         // Log execution via ShellDispatcher when SHELL_DISPATCHER_LOG is set.
         crate::shell_dispatcher::ShellDispatcher::log_exec(command);
@@ -1093,6 +1161,7 @@ impl ShellManager {
                 stdin_data,
                 tty,
                 owner_agent,
+                output_sink,
             )
         } else {
             if tty {
@@ -1443,6 +1512,7 @@ impl ShellManager {
         stdin_data: Option<&str>,
         tty: bool,
         owner_agent: Option<ShellJobOwner>,
+        output_sink: Option<ToolOutputSink>,
     ) -> Result<ShellResult> {
         let task_id = format!("shell_{}", &Uuid::new_v4().to_string()[..8]);
         let started = Instant::now();
@@ -1503,7 +1573,12 @@ impl ShellManager {
                     .master
                     .try_clone_reader()
                     .context("Failed to clone PTY reader")?;
-                let stdout_thread = Some(spawn_reader_thread(reader, Arc::clone(&stdout_buffer)));
+                let stdout_thread = Some(spawn_reader_thread(
+                    reader,
+                    Arc::clone(&stdout_buffer),
+                    ToolOutputStream::Stdout,
+                    output_sink.clone(),
+                ));
                 let writer = pair
                     .master
                     .take_writer()
@@ -1546,10 +1621,17 @@ impl ShellManager {
             let stdout_thread = Some(spawn_reader_thread(
                 stdout_handle,
                 Arc::clone(&stdout_buffer),
+                ToolOutputStream::Stdout,
+                output_sink.clone(),
             ));
-            let stderr_thread = stderr_buffer
-                .as_ref()
-                .map(|buffer| spawn_reader_thread(stderr_handle, Arc::clone(buffer)));
+            let stderr_thread = stderr_buffer.as_ref().map(|buffer| {
+                spawn_reader_thread(
+                    stderr_handle,
+                    Arc::clone(buffer),
+                    ToolOutputStream::Stderr,
+                    output_sink.clone(),
+                )
+            });
 
             (
                 ShellChild::Process(child),
@@ -1903,8 +1985,8 @@ use crate::execpolicy::{ExecPolicyDecision, load_default_policy};
 use crate::features::Feature;
 use crate::tools::cargo_failure_summary::summarize_cargo_failure;
 use crate::tools::spec::{
-    ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
-    optional_bool, optional_u64, required_str,
+    ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolOutputSink, ToolOutputStream,
+    ToolResult, ToolSpec, optional_bool, optional_u64, required_str,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -2188,6 +2270,7 @@ async fn execute_foreground_via_background(
     tty: bool,
     policy_override: Option<ExecutionSandboxPolicy>,
     extra_env: HashMap<String, String>,
+    output_sink: Option<ToolOutputSink>,
 ) -> Result<ShellResult> {
     let timeout_ms = timeout_ms.clamp(1000, 600_000);
     let spawned = {
@@ -2196,7 +2279,7 @@ async fn execute_foreground_via_background(
             .lock()
             .map_err(|_| anyhow!("shell manager lock poisoned"))?;
         manager.clear_foreground_background_request();
-        manager.execute_with_options_env(
+        manager.execute_with_options_env_for_owner(
             command,
             None,
             timeout_ms,
@@ -2205,6 +2288,8 @@ async fn execute_foreground_via_background(
             tty,
             policy_override,
             extra_env,
+            None,
+            output_sink,
         )?
     };
     let task_id = spawned
@@ -2603,6 +2688,7 @@ impl ToolSpec for ExecShellTool {
                 policy_override,
                 extra_env,
                 shell_job_owner_from_context(context),
+                context.tool_output_sink.clone(),
             )
         } else {
             execute_foreground_via_background(
@@ -2613,6 +2699,7 @@ impl ToolSpec for ExecShellTool {
                 combined_output,
                 policy_override,
                 extra_env,
+                context.tool_output_sink.clone(),
             )
             .await
         };
@@ -2913,6 +3000,7 @@ async fn wait_for_shell_delta_cancellable(
             let delta = manager
                 .get_output_delta(task_id, false, 0)
                 .map_err(|err| ToolError::execution_failed(err.to_string()))?;
+            emit_shell_delta_output(context, &delta.result);
             append_shell_delta_output(&mut stdout_accum, &mut stderr_accum, &delta.result);
             return Ok((
                 shell_delta_with_accumulated_output(
@@ -2940,6 +3028,7 @@ async fn wait_for_shell_delta_cancellable(
         let stdout_total_len = delta.stdout_total_len;
         let stderr_total_len = delta.stderr_total_len;
         let command = delta.command.clone();
+        emit_shell_delta_output(context, &delta.result);
         append_shell_delta_output(&mut stdout_accum, &mut stderr_accum, &delta.result);
 
         let status = delta.result.status.clone();
@@ -2961,6 +3050,18 @@ async fn wait_for_shell_delta_cancellable(
         ),
         false,
     ))
+}
+
+fn emit_shell_delta_output(context: &ToolContext, result: &ShellResult) {
+    let Some(sink) = context.tool_output_sink.as_ref() else {
+        return;
+    };
+    if !result.stdout.is_empty() {
+        sink(ToolOutputStream::Stdout, result.stdout.clone());
+    }
+    if !result.stderr.is_empty() {
+        sink(ToolOutputStream::Stderr, result.stderr.clone());
+    }
 }
 
 fn append_shell_delta_output(

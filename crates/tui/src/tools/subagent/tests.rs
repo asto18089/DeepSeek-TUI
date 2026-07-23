@@ -560,7 +560,6 @@ async fn forkguard_nested_custom_cannot_widen_parent_explicit_tool_scope() {
     assert!(err.to_string().contains("not allowed"), "got: {err}");
     assert!(!tmp.path().join("scope-escape.txt").exists());
 }
-
 #[test]
 fn subagent_progress_displays_shell_tools_as_bash() {
     assert_eq!(subagent_progress_tool_display_name("exec_shell"), "Bash");

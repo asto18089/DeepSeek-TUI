@@ -2176,6 +2176,7 @@ impl Engine {
                                 registry,
                                 mcp_pool,
                                 None,
+                                Some(plan.id.clone()),
                             )
                             .await;
 
@@ -2533,6 +2534,7 @@ impl Engine {
                                     tool_registry,
                                     mcp_pool.clone(),
                                     context_override,
+                                    Some(tool_id.clone()),
                                 ) => result,
                             }
                         };
