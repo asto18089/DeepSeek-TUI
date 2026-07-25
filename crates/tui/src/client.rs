@@ -179,6 +179,9 @@ pub struct DeepSeekClient {
     request_concurrency: Option<ProviderConcurrencyLimiter>,
     path_suffix: Option<String>,
     pub(super) reasoning_stream_style: Option<String>,
+    /// [pinvou3-fork] Provider-configured override for `reasoning_content`
+    /// replay; `None` keeps the built-in provider/model heuristics.
+    pub(super) replay_reasoning_content: Option<bool>,
     pub(super) stream_idle_timeout: Duration,
 }
 
@@ -402,6 +405,7 @@ impl Clone for DeepSeekClient {
             request_concurrency: self.request_concurrency.clone(),
             path_suffix: self.path_suffix.clone(),
             reasoning_stream_style: self.reasoning_stream_style.clone(),
+            replay_reasoning_content: self.replay_reasoning_content,
             stream_idle_timeout: self.stream_idle_timeout,
         }
     }
@@ -904,6 +908,9 @@ impl DeepSeekClient {
         let reasoning_stream_style = config
             .provider_config_for(api_provider)
             .and_then(|p| p.reasoning_stream_style.clone());
+        let replay_reasoning_content = config
+            .provider_config_for(api_provider)
+            .and_then(|p| p.replay_reasoning_content);
         let request_concurrency_limit = config.provider_max_concurrency(api_provider);
 
         logging::info(format!("API provider: {}", api_provider.as_str()));
@@ -962,6 +969,7 @@ impl DeepSeekClient {
             request_concurrency: request_concurrency_limit.map(ProviderConcurrencyLimiter::new),
             path_suffix,
             reasoning_stream_style,
+            replay_reasoning_content,
             stream_idle_timeout,
         })
     }
@@ -3875,7 +3883,7 @@ mod tests {
             top_p: None,
         };
 
-        let openai = build_chat_messages_for_request_and_provider(&request, ApiProvider::Openai);
+        let openai = build_chat_messages_for_request_and_provider(&request, ApiProvider::Openai, None);
         let generic_assistant = openai
             .iter()
             .find(|value| value.get("role").and_then(Value::as_str) == Some("assistant"))
@@ -5736,6 +5744,7 @@ mod tests {
             "deepseek-v4-pro",
             Some("max"),
             ApiProvider::Deepseek,
+            None,
         )
         .expect("multi-turn thinking-mode conversation should report replay tokens");
         // ~4 chars/token; 46 bytes of reasoning -> 11 tokens.
@@ -5775,6 +5784,7 @@ mod tests {
             "deepseek-v4-flash",
             None,
             ApiProvider::Deepseek,
+            None,
         );
         // reasoning_effort is None → no thinking injection, result is None
         assert!(result.is_none());
@@ -5803,6 +5813,7 @@ mod tests {
             "deepseek-v4-pro",
             Some("max"),
             ApiProvider::Deepseek,
+            None,
         );
 
         let chars = count_reasoning_replay_chars(&body);
@@ -5833,6 +5844,7 @@ mod tests {
             "qwen3-coder",
             Some("max"),
             ApiProvider::Openai,
+            None,
         );
 
         assert!(result.is_none());
@@ -5871,6 +5883,7 @@ mod tests {
             "deepseek-v4-pro",
             Some("max"),
             ApiProvider::Deepseek,
+            None,
         );
 
         let messages = body["messages"].as_array().unwrap();

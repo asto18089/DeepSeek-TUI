@@ -2623,6 +2623,13 @@ pub struct ProviderConfig {
     pub path_suffix: Option<String>,
     #[serde(alias = "reasoningStyle", alias = "reasoningStreamStyle")]
     pub reasoning_stream_style: Option<String>,
+    /// [pinvou3-fork] Explicit override for `reasoning_content` replay on
+    /// providers outside the built-in whitelist (e.g. Doubao/MiMo/GLM routed
+    /// through the generic `openai` provider). `true` forces replay (and
+    /// placeholder substitution), `false` forces stripping; unset keeps the
+    /// built-in provider/model heuristics.
+    #[serde(default, alias = "replayReasoningContent")]
+    pub replay_reasoning_content: Option<bool>,
     #[serde(
         default,
         alias = "max-concurrency",
@@ -7274,6 +7281,9 @@ fn merge_provider_config(base: ProviderConfig, override_cfg: ProviderConfig) -> 
         reasoning_stream_style: override_cfg
             .reasoning_stream_style
             .or(base.reasoning_stream_style),
+        replay_reasoning_content: override_cfg
+            .replay_reasoning_content
+            .or(base.replay_reasoning_content),
         max_concurrency: override_cfg.max_concurrency.or(base.max_concurrency),
         auth: override_cfg.auth.or(base.auth),
         kind: override_cfg.kind.or(base.kind),
@@ -8076,6 +8086,7 @@ fn provider_config_is_explicit(entry: &ProviderConfig) -> bool {
         })
         || non_empty(entry.path_suffix.as_ref())
         || non_empty(entry.reasoning_stream_style.as_ref())
+        || entry.replay_reasoning_content.is_some()
         || entry.insecure_skip_tls_verify.is_some()
         || non_empty(entry.kind.as_ref())
         || non_empty(entry.api_key_env.as_ref())
