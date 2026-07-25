@@ -182,6 +182,9 @@ pub struct DeepSeekClient {
     /// [pinvou3-fork] Provider-configured override for `reasoning_content`
     /// replay; `None` keeps the built-in provider/model heuristics.
     pub(super) replay_reasoning_content: Option<bool>,
+    /// [pinvou3-fork] Provider-configured `parallel_tool_calls` wire flag;
+    /// `None` keeps the server default.
+    pub(super) parallel_tool_calls: Option<bool>,
     pub(super) stream_idle_timeout: Duration,
 }
 
@@ -406,6 +409,7 @@ impl Clone for DeepSeekClient {
             path_suffix: self.path_suffix.clone(),
             reasoning_stream_style: self.reasoning_stream_style.clone(),
             replay_reasoning_content: self.replay_reasoning_content,
+            parallel_tool_calls: self.parallel_tool_calls,
             stream_idle_timeout: self.stream_idle_timeout,
         }
     }
@@ -911,6 +915,9 @@ impl DeepSeekClient {
         let replay_reasoning_content = config
             .provider_config_for(api_provider)
             .and_then(|p| p.replay_reasoning_content);
+        let parallel_tool_calls = config
+            .provider_config_for(api_provider)
+            .and_then(|p| p.parallel_tool_calls);
         let request_concurrency_limit = config.provider_max_concurrency(api_provider);
 
         logging::info(format!("API provider: {}", api_provider.as_str()));
@@ -970,6 +977,7 @@ impl DeepSeekClient {
             path_suffix,
             reasoning_stream_style,
             replay_reasoning_content,
+            parallel_tool_calls,
             stream_idle_timeout,
         })
     }

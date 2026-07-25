@@ -2630,6 +2630,13 @@ pub struct ProviderConfig {
     /// built-in provider/model heuristics.
     #[serde(default, alias = "replayReasoningContent")]
     pub replay_reasoning_content: Option<bool>,
+    /// [pinvou3-fork] Explicit `parallel_tool_calls` wire flag for
+    /// chat-completions providers. The engine never sends the field on its
+    /// own, so endpoints whose server-side default is `false` (e.g. DashScope
+    /// compatible mode) stay serial unless the provider opts in. Only sent
+    /// when the request carries tools; unset keeps the server default.
+    #[serde(default, alias = "parallelToolCalls")]
+    pub parallel_tool_calls: Option<bool>,
     #[serde(
         default,
         alias = "max-concurrency",
@@ -7284,6 +7291,9 @@ fn merge_provider_config(base: ProviderConfig, override_cfg: ProviderConfig) -> 
         replay_reasoning_content: override_cfg
             .replay_reasoning_content
             .or(base.replay_reasoning_content),
+        parallel_tool_calls: override_cfg
+            .parallel_tool_calls
+            .or(base.parallel_tool_calls),
         max_concurrency: override_cfg.max_concurrency.or(base.max_concurrency),
         auth: override_cfg.auth.or(base.auth),
         kind: override_cfg.kind.or(base.kind),
@@ -8087,6 +8097,7 @@ fn provider_config_is_explicit(entry: &ProviderConfig) -> bool {
         || non_empty(entry.path_suffix.as_ref())
         || non_empty(entry.reasoning_stream_style.as_ref())
         || entry.replay_reasoning_content.is_some()
+        || entry.parallel_tool_calls.is_some()
         || entry.insecure_skip_tls_verify.is_some()
         || non_empty(entry.kind.as_ref())
         || non_empty(entry.api_key_env.as_ref())

@@ -188,6 +188,19 @@ fn mirror_minimax_reasoning_details_for_body(body: &mut Value, provider: ApiProv
     mirror_minimax_reasoning_details_for_messages(messages);
 }
 
+/// [pinvou3-fork] Send an explicit `parallel_tool_calls` flag when the
+/// provider opts in via `[providers.<name>] parallel_tool_calls`. The engine
+/// never sends the field on its own, so endpoints whose server-side default
+/// is `false` (e.g. DashScope compatible mode) stay serial unless configured.
+/// Only emitted when the request actually carries tools.
+fn apply_parallel_tool_calls(body: &mut Value, configured: Option<bool>) {
+    if let Some(enabled) = configured
+        && body.get("tools").is_some()
+    {
+        body["parallel_tool_calls"] = json!(enabled);
+    }
+}
+
 impl DeepSeekClient {
     pub(super) async fn create_message_chat(
         &self,
@@ -234,6 +247,7 @@ impl DeepSeekClient {
             }
             body["tools"] = json!(chat_tools);
         }
+        apply_parallel_tool_calls(&mut body, self.parallel_tool_calls);
         if should_send_tool_choice_for_chat(self.api_provider, request.reasoning_effort.as_deref())
             && let Some(choice) = request.tool_choice.as_ref()
             && let Some(mapped) = map_tool_choice_for_chat(choice)
@@ -372,6 +386,7 @@ impl DeepSeekClient {
             }
             body["tools"] = json!(chat_tools);
         }
+        apply_parallel_tool_calls(&mut body, self.parallel_tool_calls);
         if should_send_tool_choice_for_chat(self.api_provider, request.reasoning_effort.as_deref())
             && let Some(choice) = request.tool_choice.as_ref()
             && let Some(mapped) = map_tool_choice_for_chat(choice)
@@ -4548,10 +4563,10 @@ mod alias_thinking_detection_tests {
     //! turn. See upstream API docs:
     //! https://api-docs.deepseek.com/guides/thinking_mode
     use super::{
-        apply_inkling_reasoning_effort, apply_openai_reasoning_effort, apply_provider_token_limit,
-        is_reasoning_model_for_stream, provider_accepts_reasoning_content,
-        requires_reasoning_content, should_replay_reasoning_content,
-        should_replay_reasoning_content_for_provider,
+        apply_inkling_reasoning_effort, apply_openai_reasoning_effort, apply_parallel_tool_calls,
+        apply_provider_token_limit, is_reasoning_model_for_stream,
+        provider_accepts_reasoning_content, requires_reasoning_content,
+        should_replay_reasoning_content, should_replay_reasoning_content_for_provider,
     };
     use crate::config::ApiProvider;
     use serde_json::json;
@@ -4715,6 +4730,32 @@ mod alias_thinking_detection_tests {
             Some("off"),
             Some(true),
         ));
+    }
+
+    /// [pinvou3-fork] `[providers.<name>] parallel_tool_calls` 只在请求携带
+    /// 工具时下发显式标志；未配置时保持服务端默认（DashScope 兼容模式默认
+    /// false,OpenAI 默认 true)。
+    #[test]
+    fn forkguard_parallel_tool_calls_only_sent_with_tools_when_configured() {
+        let mut body = json!({"model": "qwen3.7-plus", "messages": []});
+        apply_parallel_tool_calls(&mut body, Some(true));
+        assert!(
+            body.get("parallel_tool_calls").is_none(),
+            "无工具时不得发送 parallel_tool_calls"
+        );
+
+        body["tools"] = json!([{"type": "function", "function": {"name": "t"}}]);
+        apply_parallel_tool_calls(&mut body, Some(true));
+        assert_eq!(body["parallel_tool_calls"], json!(true));
+        apply_parallel_tool_calls(&mut body, Some(false));
+        assert_eq!(body["parallel_tool_calls"], json!(false));
+
+        let mut body = json!({"model": "qwen3.7-plus", "messages": [], "tools": []});
+        apply_parallel_tool_calls(&mut body, None);
+        assert!(
+            body.get("parallel_tool_calls").is_none(),
+            "未配置时不得发送 parallel_tool_calls"
+        );
     }
 
     #[test]
