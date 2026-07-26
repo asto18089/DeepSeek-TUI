@@ -192,10 +192,16 @@ fn mirror_minimax_reasoning_details_for_body(body: &mut Value, provider: ApiProv
 /// provider opts in via `[providers.<name>] parallel_tool_calls`. The engine
 /// never sends the field on its own, so endpoints whose server-side default
 /// is `false` (e.g. DashScope compatible mode) stay serial unless configured.
-/// Only emitted when the request actually carries tools.
+/// Only emitted when the request actually carries at least one tool; an
+/// empty `tools: []` array is treated like a tool-less request, matching the
+/// anthropic path's non-empty guard.
 fn apply_parallel_tool_calls(body: &mut Value, configured: Option<bool>) {
+    let has_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
     if let Some(enabled) = configured
-        && body.get("tools").is_some()
+        && has_tools
     {
         body["parallel_tool_calls"] = json!(enabled);
     }
@@ -4751,6 +4757,12 @@ mod alias_thinking_detection_tests {
         assert_eq!(body["parallel_tool_calls"], json!(false));
 
         let mut body = json!({"model": "qwen3.7-plus", "messages": [], "tools": []});
+        apply_parallel_tool_calls(&mut body, Some(true));
+        assert!(
+            body.get("parallel_tool_calls").is_none(),
+            "空 tools 数组时不得发送 parallel_tool_calls"
+        );
+
         apply_parallel_tool_calls(&mut body, None);
         assert!(
             body.get("parallel_tool_calls").is_none(),
